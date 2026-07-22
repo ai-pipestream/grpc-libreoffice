@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package ai.pipestream.office.v1;
+
+option java_multiple_files = true;
+option java_outer_classname = "OfficeServiceProto";
+option java_package = "ai.pipestream.office.v1";
+
+// OfficeConvertService renders office documents to PDF through a pooled
+// headless LibreOffice, entirely in memory-backed storage. Bytes stream in,
+// PDF bytes stream out; nothing touches persistent disk.
+//
+// Error model (gRPC status codes):
+//   INVALID_ARGUMENT   - no document bytes, the stream ended without a chunk
+//                        marked complete, or the source format could not be
+//                        determined from the filename or content type.
+//   RESOURCE_EXHAUSTED - the document exceeds the configured byte cap.
+//   DEADLINE_EXCEEDED  - the conversion exceeded the per-task timeout.
+//   UNAVAILABLE        - the office process pool is not running (startup,
+//                        shutdown, or all workers recycling).
+//   INTERNAL           - the office process failed the conversion.
+service OfficeConvertService {
+  // Client streams the document as chunks, marking the last one complete.
+  // The server responds with DocumentInfo, then the PDF as a stream of
+  // PdfChunk events, then one final ConvertStatus.
+  rpc ConvertToPdf(stream ConvertRequestChunk) returns (stream ConvertEvent);
+
+  // Capability discovery: versions, limits, and the source formats the
+  // conversion engine accepts. Intended for orchestrators and tool facades.
+  rpc GetServiceInfo(GetServiceInfoRequest) returns (GetServiceInfoResponse);
+}
+
+// One chunk of the uploaded document. document_id, filename, and
+// content_type may be sent on any chunk; the first non-empty value wins.
+// The filename extension is the primary source-format hint, the content
+// type the fallback.
+message ConvertRequestChunk {
+  string document_id = 1;
+  string filename = 2;
+  string content_type = 3;
+  bytes data = 4;
+  // Set on the last chunk. A stream that ends without it is rejected.
+  bool complete = 5;
+}
+
+message ConvertEvent {
+  oneof event {
+    DocumentInfo document_info = 1;
+    PdfChunk pdf_chunk = 2;
+    ConvertStatus status = 3;
+  }
+}
+
+message DocumentInfo {
+  // Echo of the caller's document_id, unchanged.
+  string document_id = 1;
+  // The source format the engine resolved, as its canonical extension
+  // (for example "docx", "odt", "rtf").
+  string source_format = 2;
+}
+
+// One chunk of the produced PDF, in order. Concatenating every pdf_chunk
+// data field yields the complete PDF.
+message PdfChunk {
+  bytes data = 1;
+}
+
+message ConvertStatus {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_OK = 1;
+  }
+  State state = 1;
+  repeated string warnings = 2;
+  int64 input_bytes = 3;
+  int64 output_bytes = 4;
+  int64 conversion_millis = 5;
+}
+
+message GetServiceInfoRequest {}
+
+message GetServiceInfoResponse {
+  string service_version = 1;
+  // LibreOffice version string reported by the installation, when known.
+  string libreoffice_version = 2;
+  string api_version = 3;
+  // Canonical extensions of the source formats the engine accepts.
+  repeated string supported_formats = 4;
+  int64 max_document_bytes = 5;
+  // Number of pooled office processes.
+  int32 pool_size = 6;
+  // Conversions a single office process performs before it is recycled.
+  int32 max_tasks_per_process = 7;
+}
