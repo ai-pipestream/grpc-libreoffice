@@ -431,6 +431,176 @@ void verify_draw_shapes() {
           "draw extraction produced no warnings");
 }
 
+// A flat ODP with three slides: a title slide (title + subtitle
+// placeholders), a content slide (title, two-depth outline, and an embedded
+// 1x1 PNG), and a slide carrying speaker notes. Flat XML keeps the fixture
+// diskless and reviewable.
+const char kTypedFodp[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+ xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
+ xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0"
+ office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.presentation">
+ <office:automatic-styles>
+  <style:page-layout style:name="PM0">
+   <style:page-layout-properties fo:page-width="28cm" fo:page-height="21cm"
+    fo:margin-top="0cm" fo:margin-bottom="0cm" fo:margin-left="0cm" fo:margin-right="0cm"/>
+  </style:page-layout>
+  <style:style style:name="pr1" style:family="presentation"/>
+ </office:automatic-styles>
+ <office:master-styles>
+  <style:master-page style:name="Default" style:page-layout-name="PM0"/>
+ </office:master-styles>
+ <office:body><office:presentation>
+  <draw:page draw:name="TitleSlide" draw:master-page-name="Default">
+   <draw:frame presentation:style-name="pr1" presentation:class="title" presentation:placeholder="false" svg:x="2cm" svg:y="2cm" svg:width="20cm" svg:height="3cm">
+    <draw:text-box><text:p>Deck Title</text:p></draw:text-box>
+   </draw:frame>
+   <draw:frame presentation:style-name="pr1" presentation:class="subtitle" presentation:placeholder="false" svg:x="2cm" svg:y="6cm" svg:width="20cm" svg:height="3cm">
+    <draw:text-box><text:p>Deck subtitle</text:p></draw:text-box>
+   </draw:frame>
+  </draw:page>
+  <draw:page draw:name="ContentSlide" draw:master-page-name="Default">
+   <draw:frame presentation:style-name="pr1" presentation:class="title" presentation:placeholder="false" svg:x="2cm" svg:y="1cm" svg:width="20cm" svg:height="2cm">
+    <draw:text-box><text:p>Agenda</text:p></draw:text-box>
+   </draw:frame>
+   <draw:frame presentation:style-name="pr1" presentation:class="outline" presentation:placeholder="false" svg:x="2cm" svg:y="4cm" svg:width="18cm" svg:height="10cm">
+    <draw:text-box>
+     <text:list><text:list-item><text:p>First point</text:p>
+      <text:list><text:list-item><text:p>Nested detail</text:p></text:list-item></text:list>
+     </text:list-item></text:list>
+    </draw:text-box>
+   </draw:frame>
+   <draw:frame draw:name="Pic1" svg:x="24cm" svg:y="4cm" svg:width="1cm" svg:height="1cm">
+    <draw:image><office:binary-data>iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==</office:binary-data></draw:image>
+   </draw:frame>
+  </draw:page>
+  <draw:page draw:name="NotesSlide" draw:master-page-name="Default">
+   <draw:frame presentation:style-name="pr1" presentation:class="title" presentation:placeholder="false" svg:x="2cm" svg:y="1cm" svg:width="20cm" svg:height="2cm">
+    <draw:text-box><text:p>Wrap up</text:p></draw:text-box>
+   </draw:frame>
+   <presentation:notes>
+    <draw:frame presentation:style-name="pr1" presentation:class="notes" presentation:placeholder="false" svg:x="2cm" svg:y="12cm" svg:width="16cm" svg:height="8cm">
+     <draw:text-box><text:p>Remember the demo.</text:p></draw:text-box>
+    </draw:frame>
+   </presentation:notes>
+  </draw:page>
+ </office:presentation></office:body>
+</office:document>
+)";
+
+std::map<int, int> run_selection(const std::string& extension,
+                                 const std::string& document,
+                                 const std::string& parts_token,
+                                 const std::string& what);
+
+void verify_typed_presentation() {
+  std::vector<std::string> payloads;
+  auto outcome = run("pages", "fodp", kTypedFodp, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "typed fodp renders ok: " + outcome.detail);
+  officev1::StreamPagesResponse first;
+  require(first.ParseFromString(payloads.front()), "fodp info parses");
+  require(first.document_info().document_type() == "presentation",
+          "fodp is a presentation");
+  require(first.document_info().page_count() == 3, "three slides painted");
+  std::vector<officev1::Slide> slides;
+  std::vector<officev1::SlideShape> shapes;
+  officev1::StreamPagesResponse event;
+  for (const std::string& payload : payloads) {
+    require(event.ParseFromString(payload), "fodp event parses");
+    if (event.has_slide()) slides.push_back(event.slide());
+    if (event.has_slide_shape()) shapes.push_back(event.slide_shape());
+  }
+  require(slides.size() == 3, "one Slide header per slide");
+  for (int i = 0; i < 3; i++) {
+    require(slides[i].index() == i, "slide indexes are in slide order");
+    require(!slides[i].name().empty(), "slide keeps its name");
+    require(!slides[i].master_page_name().empty(),
+            "slide resolves its master page");
+  }
+  bool title_ok = false;
+  bool subtitle_ok = false;
+  bool outline_ok = false;
+  bool graphic_ok = false;
+  bool notes_ok = false;
+  for (const officev1::SlideShape& shape : shapes) {
+    if (!shape.notes()) {
+      require(shape.width_twips() > 0 && shape.height_twips() > 0,
+              "slide shape has real geometry");
+    }
+    if (shape.slide_index() == 0 &&
+        shape.placeholder_role() == officev1::PLACEHOLDER_ROLE_TITLE) {
+      std::string text;
+      for (const officev1::SlideTextParagraph& para : shape.paragraphs()) {
+        for (const officev1::TextRun& text_run : para.runs()) {
+          text += text_run.text();
+          require(text_run.char_offset() == -1,
+                  "slide runs are outside the annotation space");
+        }
+      }
+      title_ok = shape.is_placeholder() && text == "Deck Title";
+    }
+    if (shape.slide_index() == 0 &&
+        shape.placeholder_role() == officev1::PLACEHOLDER_ROLE_SUBTITLE) {
+      subtitle_ok = shape.is_placeholder();
+    }
+    if (shape.slide_index() == 1 &&
+        shape.placeholder_role() == officev1::PLACEHOLDER_ROLE_OUTLINE) {
+      outline_ok = shape.paragraphs_size() == 2 &&
+                   shape.paragraphs(0).outline_depth() == 0 &&
+                   shape.paragraphs(1).outline_depth() == 1 &&
+                   !shape.paragraphs(0).runs().empty() &&
+                   shape.paragraphs(0).runs(0).text() == "First point" &&
+                   !shape.paragraphs(1).runs().empty() &&
+                   shape.paragraphs(1).runs(0).text() == "Nested detail";
+    }
+    if (shape.slide_index() == 1 &&
+        shape.shape_type() == "com.sun.star.drawing.GraphicObjectShape") {
+      // Header only: image bytes for slide shapes belong to the
+      // embedded-objects work.
+      graphic_ok = shape.width_twips() > 0;
+    }
+    if (shape.notes()) {
+      std::string text;
+      for (const officev1::SlideTextParagraph& para : shape.paragraphs()) {
+        for (const officev1::TextRun& text_run : para.runs()) {
+          text += text_run.text();
+        }
+      }
+      notes_ok = shape.slide_index() == 2 &&
+                 shape.placeholder_role() == officev1::PLACEHOLDER_ROLE_NOTES &&
+                 text == "Remember the demo.";
+    }
+  }
+  require(title_ok, "title placeholder with role and text");
+  require(subtitle_ok, "subtitle placeholder with role");
+  require(outline_ok, "outline placeholder keeps outline depths");
+  require(graphic_ok, "graphic shape header emitted with geometry");
+  require(notes_ok, "speaker notes extracted from the notes page");
+  officev1::StreamPagesResponse last;
+  require(last.ParseFromString(payloads.back()), "fodp last event parses");
+  require(last.has_status(), "fodp stream ends with status");
+  require(last.status().state() == officev1::RenderStatus::STATE_OK,
+          "fodp status ok");
+  require(last.status().warnings().empty(),
+          "fodp extraction produced no warnings");
+
+  // Born gated: SLIDES only emits slide events and nothing else.
+  std::map<int, int> counts =
+      run_selection("fodp", kTypedFodp, "11", "slides-only");
+  require(counts[officev1::StreamPagesResponse::kSlide] == 3,
+          "slides-only emits slide headers");
+  require(counts[officev1::StreamPagesResponse::kSlideShape] > 0,
+          "slides-only emits slide shapes");
+  require(counts[officev1::StreamPagesResponse::kPageImage] == 0 &&
+              counts[officev1::StreamPagesResponse::kMetadata] == 0,
+          "slides-only emits no pages or metadata");
+}
+
 // Counts events by case for one selection run and checks the envelope:
 // DocumentInfo first, RenderStatus STATE_OK last, no warnings.
 std::map<int, int> run_selection(const std::string& extension,
@@ -567,6 +737,7 @@ int main() {
   verify_pdf_mode();
   verify_typed_content();
   verify_draw_shapes();
+  verify_typed_presentation();
   verify_part_selection();
   verify_corrupt_zip_is_load_failure();
   std::cout << "worker-render-test passed\n";

@@ -23,12 +23,15 @@
 #include <com/sun/star/container/XNamed.hpp>
 #include <com/sun/star/document/XDocumentProperties.hpp>
 #include <com/sun/star/document/XDocumentPropertiesSupplier.hpp>
+#include <com/sun/star/drawing/XDrawPage.hpp>
 #include <com/sun/star/drawing/XDrawPageSupplier.hpp>
 #include <com/sun/star/drawing/XDrawPages.hpp>
 #include <com/sun/star/drawing/XDrawPagesSupplier.hpp>
+#include <com/sun/star/drawing/XMasterPageTarget.hpp>
 #include <com/sun/star/drawing/XShape.hpp>
 #include <com/sun/star/drawing/XShapes.hpp>
 #include <com/sun/star/frame/Desktop.hpp>
+#include <com/sun/star/presentation/XPresentationPage.hpp>
 #include <com/sun/star/style/XStyle.hpp>
 #include <com/sun/star/style/XStyleFamiliesSupplier.hpp>
 #include <com/sun/star/frame/XModel.hpp>
@@ -796,6 +799,253 @@ bool emit_drawing_content(
   return true;
 }
 
+bool ends_with(const std::string& value, const std::string& suffix) {
+  return value.size() >= suffix.size() &&
+         value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+// Maps the office core's shape type string to the placeholder role. The
+// type string is the reliable discriminator: SdXShape does not advertise
+// SubtitleShape or NotesShape through supportsService.
+officev1::PlaceholderRole placeholder_role_for(const std::string& shape_type) {
+  if (ends_with(shape_type, ".TitleTextShape")) {
+    return officev1::PLACEHOLDER_ROLE_TITLE;
+  }
+  if (ends_with(shape_type, ".OutlinerShape")) {
+    return officev1::PLACEHOLDER_ROLE_OUTLINE;
+  }
+  if (ends_with(shape_type, ".SubtitleShape")) {
+    return officev1::PLACEHOLDER_ROLE_SUBTITLE;
+  }
+  if (ends_with(shape_type, ".NotesShape")) {
+    return officev1::PLACEHOLDER_ROLE_NOTES;
+  }
+  return officev1::PLACEHOLDER_ROLE_NONE;
+}
+
+// Emits one SlideShape for a slide or notes-page shape and recurses through
+// groups so nested placeholders keep their paint order. Graphic, OLE, chart,
+// and table shapes emit only this header; their heavy content (image bytes,
+// chart data, table grid) belongs to the embedded-objects work.
+bool emit_slide_shape(const Reference<css::drawing::XShape>& shape,
+                      int32_t slide_index, int32_t z_order, bool notes,
+                      const EmitFn& emit_fn, Warner& warner) {
+  std::string shape_type = utf8(shape->getShapeType());
+  std::string label = "slide " + std::to_string(slide_index) +
+                      (notes ? " notes shape " : " shape ") +
+                      std::to_string(z_order);
+  officev1::StreamPagesResponse event;
+  officev1::SlideShape* out = event.mutable_slide_shape();
+  out->set_slide_index(slide_index);
+  out->set_z_order(z_order);
+  out->set_shape_type(shape_type);
+  out->set_placeholder_role(placeholder_role_for(shape_type));
+  out->set_notes(notes);
+  Reference<css::beans::XPropertySet> props(shape, UNO_QUERY);
+  if (props.is()) {
+    try {
+      sal_Bool is_placeholder = false;
+      props->getPropertyValue("IsPresentationObject") >>= is_placeholder;
+      out->set_is_placeholder(is_placeholder);
+      sal_Bool is_empty = false;
+      props->getPropertyValue("IsEmptyPresentationObject") >>= is_empty;
+      out->set_is_empty_placeholder(is_empty);
+    } catch (const css::beans::UnknownPropertyException&) {
+      // Expected probe result: plain draw shapes carry no presentation
+      // placeholder properties.
+    } catch (const css::uno::Exception& error) {
+      warner.warn(label + " placeholder query failed", error);
+    }
+  }
+  try {
+    css::awt::Point position = shape->getPosition();
+    css::awt::Size size = shape->getSize();
+    out->mutable_position()->set_x(hundredth_mm_to_twips(position.X));
+    out->mutable_position()->set_y(hundredth_mm_to_twips(position.Y));
+    out->set_width_twips(hundredth_mm_to_twips(size.Width));
+    out->set_height_twips(hundredth_mm_to_twips(size.Height));
+  } catch (const css::uno::Exception& error) {
+    warner.warn(label + " geometry query failed", error);
+  }
+  Reference<css::text::XText> text(shape, UNO_QUERY);
+  Reference<css::container::XEnumerationAccess> access(text, UNO_QUERY);
+  if (access.is()) {
+    Reference<css::container::XEnumeration> paragraphs =
+        access->createEnumeration();
+    int paragraph_index = 0;
+    while (paragraphs->hasMoreElements()) {
+      css::uno::Any element = paragraphs->nextElement();
+      Reference<css::container::XEnumerationAccess> paragraph(element, UNO_QUERY);
+      if (!paragraph.is()) continue;
+      officev1::SlideTextParagraph* para = out->add_paragraphs();
+      Reference<css::beans::XPropertySet> para_props(element, UNO_QUERY);
+      if (para_props.is()) {
+        try {
+          sal_Int16 level = 0;
+          para_props->getPropertyValue("NumberingLevel") >>= level;
+          // The editeng outline-level pool default is -1; normalize unset
+          // and negative depths to 0.
+          para->set_outline_depth(std::max<sal_Int16>(0, level));
+        } catch (const css::beans::UnknownPropertyException&) {
+          // Expected probe result: NumberingLevel is an optional paragraph
+          // property.
+        } catch (const css::uno::Exception& error) {
+          warner.warn(label + " paragraph " + std::to_string(paragraph_index) +
+                          " outline depth query failed",
+                      error);
+        }
+      }
+      fill_runs(paragraph,
+                label + " paragraph " + std::to_string(paragraph_index),
+                para->mutable_runs(), nullptr, warner);
+      paragraph_index++;
+    }
+  }
+  if (!emit_fn(event)) return false;
+  Reference<css::drawing::XShapes> children;
+  if (ends_with(shape_type, ".GroupShape")) {
+    children = Reference<css::drawing::XShapes>(shape, UNO_QUERY);
+  }
+  if (children.is()) {
+    for (sal_Int32 i = 0; i < children->getCount(); i++) {
+      Reference<css::drawing::XShape> child;
+      try {
+        child = Reference<css::drawing::XShape>(children->getByIndex(i),
+                                                UNO_QUERY);
+      } catch (const css::uno::Exception& error) {
+        warner.warn(label + " group child " + std::to_string(i) +
+                        " is not reachable",
+                    error);
+        continue;
+      }
+      if (!child.is()) continue;
+      if (!emit_slide_shape(child, slide_index, static_cast<int32_t>(i), notes,
+                            emit_fn, warner)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// Emits every slide of a presentation document in slide order: one Slide
+// header, then its shapes in paint order, then the speaker-notes shape of
+// its notes page. Slide.index matches the LibreOfficeKit part index and
+// PageImage.index, so no correlation logic is needed.
+bool emit_presentation_content(
+    const Reference<css::drawing::XDrawPagesSupplier>& supplier,
+    const EmitFn& emit_fn, Warner& warner) {
+  Reference<css::drawing::XDrawPages> pages = supplier->getDrawPages();
+  if (!pages.is()) {
+    warner.warn("presentation document has no slides");
+    return true;
+  }
+  for (sal_Int32 i = 0; i < pages->getCount(); i++) {
+    std::string label = "slide " + std::to_string(i);
+    Reference<css::drawing::XDrawPage> slide;
+    try {
+      slide = Reference<css::drawing::XDrawPage>(pages->getByIndex(i),
+                                                 UNO_QUERY);
+    } catch (const css::uno::Exception& error) {
+      warner.warn(label + " is not reachable", error);
+      continue;
+    }
+    if (!slide.is()) continue;
+
+    officev1::StreamPagesResponse slide_event;
+    officev1::Slide* out = slide_event.mutable_slide();
+    out->set_index(static_cast<int32_t>(i));
+    Reference<css::container::XNamed> named(slide, UNO_QUERY);
+    if (named.is()) out->set_name(utf8(named->getName()));
+    Reference<css::beans::XPropertySet> props(slide, UNO_QUERY);
+    if (props.is()) {
+      try {
+        sal_Int16 layout = 0;
+        props->getPropertyValue("Layout") >>= layout;
+        out->set_layout(layout);
+      } catch (const css::beans::UnknownPropertyException&) {
+        // Expected probe result: Layout is an optional slide property.
+      } catch (const css::uno::Exception& error) {
+        warner.warn(label + " layout query failed", error);
+      }
+    }
+    try {
+      Reference<css::drawing::XMasterPageTarget> target(slide, UNO_QUERY);
+      if (target.is()) {
+        Reference<css::container::XNamed> master(target->getMasterPage(),
+                                                 UNO_QUERY);
+        if (master.is()) out->set_master_page_name(utf8(master->getName()));
+      }
+    } catch (const css::uno::Exception& error) {
+      warner.warn(label + " master page query failed", error);
+    }
+    if (!emit_fn(slide_event)) return false;
+
+    Reference<css::drawing::XShapes> shapes(slide, UNO_QUERY);
+    if (shapes.is()) {
+      for (sal_Int32 z = 0; z < shapes->getCount(); z++) {
+        Reference<css::drawing::XShape> shape;
+        try {
+          shape = Reference<css::drawing::XShape>(shapes->getByIndex(z),
+                                                  UNO_QUERY);
+        } catch (const css::uno::Exception& error) {
+          warner.warn(label + " shape " + std::to_string(z) +
+                          " is not reachable",
+                      error);
+          continue;
+        }
+        if (!shape.is()) continue;
+        if (!emit_slide_shape(shape, static_cast<int32_t>(i),
+                              static_cast<int32_t>(z), false, emit_fn,
+                              warner)) {
+          return false;
+        }
+      }
+    }
+
+    // The notes page carries the speaker notes. Only the NotesShape is
+    // emitted: the PageShape slide thumbnail and unfilled placeholders say
+    // nothing.
+    try {
+      Reference<css::presentation::XPresentationPage> presentation(slide,
+                                                                   UNO_QUERY);
+      if (presentation.is()) {
+        Reference<css::drawing::XShapes> notes_shapes(
+            presentation->getNotesPage(), UNO_QUERY);
+        if (notes_shapes.is()) {
+          for (sal_Int32 z = 0; z < notes_shapes->getCount(); z++) {
+            Reference<css::drawing::XShape> shape(notes_shapes->getByIndex(z),
+                                                  UNO_QUERY);
+            if (!shape.is()) continue;
+            if (!ends_with(utf8(shape->getShapeType()), ".NotesShape")) {
+              continue;
+            }
+            Reference<css::beans::XPropertySet> note_props(shape, UNO_QUERY);
+            if (note_props.is()) {
+              try {
+                sal_Bool empty = false;
+                note_props->getPropertyValue("IsEmptyPresentationObject") >>=
+                    empty;
+                if (empty) continue;
+              } catch (const css::beans::UnknownPropertyException&) {
+                // Expected probe result: not a placeholder object.
+              }
+            }
+            if (!emit_slide_shape(shape, static_cast<int32_t>(i),
+                                  static_cast<int32_t>(z), true, emit_fn,
+                                  warner)) {
+              return false;
+            }
+          }
+        }
+      }
+    } catch (const css::uno::Exception& error) {
+      warner.warn(label + " notes page walk failed", error);
+    }
+  }
+  return true;
+}
+
 bool emit_notes(const Reference<css::text::XTextDocument>& text_doc,
                 const Reference<css::text::XTextViewCursor>& cursor,
                 bool endnotes, const EmitFn& emit_fn, Warner& warner) {
@@ -1114,13 +1364,25 @@ bool emit_typed_content(const PartSelection& parts, const EmitFn& emit_fn,
       if (!wants_text_part) return true;
       return emit_text_content(text_doc, context, parts, emit_fn, warner);
     }
-    // Draw, Impress, and Calc models all supply draw pages, so gate on the
+    Reference<css::lang::XServiceInfo> info(model, UNO_QUERY);
+    // Impress models also supply draw pages, so the presentation branch is
+    // decided by the PresentationDocument service, which the office core
+    // reports only for Impress.
+    if (info.is() && info->supportsService(
+                         "com.sun.star.presentation.PresentationDocument")) {
+      if (!parts.wants(officev1::DOCUMENT_PART_SLIDES)) return true;
+      Reference<css::drawing::XDrawPagesSupplier> slides(model, UNO_QUERY);
+      if (slides.is()) {
+        return emit_presentation_content(slides, emit_fn, warner);
+      }
+      return true;
+    }
+    // Draw and Calc models both supply draw pages too, so gate on the
     // DrawingDocument service, which the office core reports only for Draw.
     if (!parts.wants(officev1::DOCUMENT_PART_SHAPES) &&
         !parts.wants(officev1::DOCUMENT_PART_IMAGES)) {
       return true;
     }
-    Reference<css::lang::XServiceInfo> info(model, UNO_QUERY);
     if (info.is() &&
         info->supportsService("com.sun.star.drawing.DrawingDocument")) {
       Reference<css::drawing::XDrawPagesSupplier> draw(model, UNO_QUERY);

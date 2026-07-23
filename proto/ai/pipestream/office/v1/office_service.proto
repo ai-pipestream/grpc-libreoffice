@@ -131,7 +131,9 @@ message StreamPagesRequest {
 // RenderStatus. For text documents the typed content events are Paragraph,
 // TableData, EmbeddedImage, Footnote, HeaderFooter, PageStyleInfo, and
 // DocumentIndex. For drawing documents they are DrawingShape events in
-// page-then-paint order, plus EmbeddedImage events for image shapes. Every
+// page-then-paint order, plus EmbeddedImage events for image shapes. For
+// presentation documents they are one Slide header per slide followed by its
+// SlideShape events in paint order. Every
 // event between DocumentInfo and RenderStatus is subject to the request's
 // StreamOptions part selection. Every event is emitted the moment it exists:
 // pages stream while later pages are still painting, and the caller can
@@ -170,6 +172,12 @@ message StreamPagesResponse {
     // One drawing shape from a Draw page, in paint order. Currently emitted
     // for drawing documents.
     DrawingShape drawing_shape = 12;
+    // One presentation slide header. Emitted for presentation documents,
+    // one per slide in slide order, before that slide's shapes.
+    Slide slide = 13;
+    // One shape on a slide or its notes page. Emitted for presentation
+    // documents in paint order after the slide it belongs to.
+    SlideShape slide_shape = 14;
   }
 }
 
@@ -490,6 +498,85 @@ message EmbeddedImage {
   int64 height_twips = 8;
 }
 
+// PlaceholderRole is the presentation role of a slide shape, derived from
+// the office core's shape type. Non-placeholder shapes report
+// PLACEHOLDER_ROLE_NONE. New roles (header, footer, slide number, date and
+// time) may be added later without renumbering.
+enum PlaceholderRole {
+  // Unset; never emitted by the server.
+  PLACEHOLDER_ROLE_UNSPECIFIED = 0;
+  // The shape is not a presentation placeholder.
+  PLACEHOLDER_ROLE_NONE = 1;
+  // The slide's title placeholder (shape type TitleTextShape).
+  PLACEHOLDER_ROLE_TITLE = 2;
+  // The slide's outline or body placeholder (shape type OutlinerShape).
+  PLACEHOLDER_ROLE_OUTLINE = 3;
+  // The slide's subtitle placeholder (shape type SubtitleShape).
+  PLACEHOLDER_ROLE_SUBTITLE = 4;
+  // The notes-page speaker-notes placeholder (shape type NotesShape).
+  PLACEHOLDER_ROLE_NOTES = 5;
+}
+
+// Slide is one presentation slide, emitted before its shapes. index matches
+// PageImage.index for the same slide.
+message Slide {
+  // Zero-based slide index in slide order; matches PageImage.index.
+  int32 index = 1;
+  // The slide's name from the document, for example "Slide 1".
+  string name = 2;
+  // The presentation autolayout id of the slide; 0 when the slide uses no
+  // autolayout. Numeric as the office core reports it.
+  int32 layout = 3;
+  // Name of the master page the slide is based on; empty when unresolved.
+  string master_page_name = 4;
+}
+
+// SlideTextParagraph is one paragraph of a slide shape's text, keeping its
+// outline depth so the consumer can rebuild the outline hierarchy.
+message SlideTextParagraph {
+  // Zero-based outline depth of the paragraph; 0 for a top-level line.
+  int32 outline_depth = 1;
+  // The paragraph's styled runs, in order. Each run's char_offset is -1
+  // because slide text sits outside the body annotation text space.
+  repeated TextRun runs = 2;
+}
+
+// SlideShape is one shape on a slide or its notes page, in paint order.
+// shape_type keeps the office core's raw type string so shapes whose content
+// is extracted by a later feature stay addressable. A group container is
+// emitted as its own event directly before the events for its child shapes.
+message SlideShape {
+  // Zero-based index of the slide the shape belongs to; matches Slide.index
+  // and PageImage.index.
+  int32 slide_index = 1;
+  // Paint order of the shape within its immediate container, zero-based; a
+  // group's children restart at 0.
+  int32 z_order = 2;
+  // The office core's shape type, for example
+  // "com.sun.star.presentation.TitleTextShape" or
+  // "com.sun.star.drawing.GraphicObjectShape".
+  string shape_type = 3;
+  // The shape's presentation placeholder role, derived from shape_type.
+  PlaceholderRole placeholder_role = 4;
+  // True when the shape is a presentation placeholder object.
+  bool is_placeholder = 5;
+  // True when the shape is an unfilled (empty) placeholder object.
+  bool is_empty_placeholder = 6;
+  // Shape top-left corner on its page, in twips. In slide-page space for
+  // slide shapes; in notes-page space when notes is true.
+  TwipsPoint position = 7;
+  // Shape width in twips.
+  int64 width_twips = 8;
+  // Shape height in twips.
+  int64 height_twips = 9;
+  // The shape's text paragraphs, in order; empty for shapes with no text.
+  repeated SlideTextParagraph paragraphs = 10;
+  // True when the shape is on the slide's notes page rather than the
+  // painted slide; its geometry is in notes-page space and has no
+  // PageImage.
+  bool notes = 11;
+}
+
 // DrawingShape is one shape from a drawing page, in paint order. A group
 // container is emitted as its own event with is_group true, directly before
 // the events for its child shapes; each child names its ancestor chain
@@ -587,7 +674,7 @@ message GetServiceInfoResponse {
   // Requested render DPI for StreamPages.
   int32 render_dpi = 9;
   // True when StreamPages emits typed content events (DocumentMetadata,
-  // Paragraph, TableData, EmbeddedImage, DrawingShape) alongside page
-  // images, selectable per request through StreamOptions.
+  // Paragraph, TableData, EmbeddedImage, DrawingShape, Slide, SlideShape)
+  // alongside page images, selectable per request through StreamOptions.
   bool typed_content = 10;
 }
