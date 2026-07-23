@@ -43,7 +43,11 @@ at STANDARD plus COMMENTS):
   and `DocumentIndex` events (tables of contents and other generated
   indexes). Drawing documents emit `DrawingShape` events (shape type, name,
   position and size in twips, rotation, group nesting, text runs) in
-  page-then-paint order, plus `EmbeddedImage` events for image shapes. Body
+  page-then-paint order, plus `EmbeddedImage` events for image shapes.
+  Presentations emit one `Slide` header per slide (name, autolayout,
+  master page) followed by `SlideShape` events in paint order, each with
+  its placeholder role, geometry in twips, and text paragraphs carrying
+  outline depth, plus the speaker-notes shape of each notes page. Body
   runs carry character offsets in a documented annotation text space, so
   standoff annotations (NLP spans) anchor to the stream directly.
   Every event is emitted the moment it exists, so a caller can process page
