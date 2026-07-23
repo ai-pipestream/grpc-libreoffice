@@ -256,6 +256,13 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
   info.set_source_format(options.extension);
   info.set_page_count(static_cast<int>(pages.size()));
   info.set_document_type(doc_type_name(type));
+  for (const PageRect& page : pages) {
+    officev1::PageRect* rect = info.add_page_rects();
+    rect->set_x_twips(page.x);
+    rect->set_y_twips(page.y);
+    rect->set_width_twips(page.width);
+    rect->set_height_twips(page.height);
+  }
 
   long output_bytes = 0;
   bool ok = true;

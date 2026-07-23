@@ -76,6 +76,9 @@ at STANDARD plus COMMENTS):
   (`DocumentPart` values, page images included). An empty selection means
   every part, and the work behind an unselected part is skipped, not just
   its emission. `DocumentInfo` and `RenderStatus` are always sent.
+  `DocumentInfo` also carries the layout rectangle of every page in the
+  same twips space the typed positions use, so a consumer can map any
+  document-absolute position to page-local coordinates.
 - `ConvertToPdf`: same upload contract; the response streams the PDF as
   ordered chunks instead of page images.
 - `GetServiceInfo`: versions, limits, and accepted source formats, for
@@ -97,9 +100,14 @@ PDF pages rasterize like any other document and, because the import
 produces a drawing model, emit `DrawingShape` typed content.
 
 The repo also carries `ai.pipestream.document.v1`, the typed document
-structure schema (tracking docling-core v2 for interoperability). A mapper
-from the typed content stream to that shape is planned; the stream carries
-everything the mapping needs.
+structure schema (tracking docling-core v2 for interoperability), and a
+consumer-side mapper (`src/docling_map.h`, built into the server library)
+that folds a `StreamPages` event stream into one such `Document`: items in
+typed arenas linked by JSON Pointer refs, groups per sheet, slide, frame,
+and drawing group, headers and footers as furniture, speaker notes on the
+notes layer, and per-line page-local bounding boxes as provenance. The
+mapper never touches LibreOffice and builds a valid document from any part
+selection.
 
 ## Process model
 

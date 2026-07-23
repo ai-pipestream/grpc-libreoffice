@@ -234,6 +234,22 @@ message ConvertToPdfResponse {
   }
 }
 
+// PageRect is the layout rectangle of one page in the document-absolute
+// twips space of TwipsPoint and LineBox. Subtracting a page's origin from a
+// document-absolute coordinate yields page-local coordinates. For document
+// classes whose typed positions are already page-local (spreadsheets,
+// presentations, drawings) the origin is 0,0 per part.
+message PageRect {
+  // Left edge of the page in document-absolute twips.
+  int64 x_twips = 1;
+  // Top edge of the page in document-absolute twips.
+  int64 y_twips = 2;
+  // Page width in twips.
+  int64 width_twips = 3;
+  // Page height in twips.
+  int64 height_twips = 4;
+}
+
 // DocumentInfo describes the document the render core loaded; always the
 // first response event.
 message DocumentInfo {
@@ -247,6 +263,11 @@ message DocumentInfo {
   // The office core's document class: "text", "spreadsheet", "presentation",
   // "drawing", or "other".
   string document_type = 4;
+  // The layout rectangle of every page, in page order, from the same layout
+  // every typed position was measured in. One entry per page_count; a
+  // consumer maps any document-absolute position to its page-local
+  // equivalent by subtracting the containing page's origin.
+  repeated PageRect page_rects = 5;
 }
 
 // PageImage is one rendered page. Pages arrive in page order, one event per
