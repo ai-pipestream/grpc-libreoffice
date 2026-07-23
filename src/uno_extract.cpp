@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <ctime>
 #include <map>
+#include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -39,11 +41,18 @@
 #include <com/sun/star/chart2/data/XLabeledDataSequence.hpp>
 #include <com/sun/star/chart2/data/XNumericalDataSequence.hpp>
 #include <com/sun/star/chart2/data/XTextualDataSequence.hpp>
+#include <com/sun/star/awt/XControlModel.hpp>
 #include <com/sun/star/document/XEmbeddedObjectSupplier2.hpp>
+#include <com/sun/star/document/XRedlinesSupplier.hpp>
 #include <com/sun/star/container/XEnumerationAccess.hpp>
 #include <com/sun/star/container/XNameAccess.hpp>
+#include <com/sun/star/container/XNameContainer.hpp>
 #include <com/sun/star/container/XIndexAccess.hpp>
 #include <com/sun/star/container/XNamed.hpp>
+#include <com/sun/star/drawing/XControlShape.hpp>
+#include <com/sun/star/office/XAnnotation.hpp>
+#include <com/sun/star/office/XAnnotationAccess.hpp>
+#include <com/sun/star/office/XAnnotationEnumeration.hpp>
 #include <com/sun/star/document/XDocumentProperties.hpp>
 #include <com/sun/star/document/XDocumentPropertiesSupplier.hpp>
 #include <com/sun/star/drawing/XDrawPage.hpp>
@@ -98,11 +107,15 @@
 #include <com/sun/star/util/XMergeable.hpp>
 #include <com/sun/star/util/XNumberFormats.hpp>
 #include <com/sun/star/util/XNumberFormatsSupplier.hpp>
+#include <com/sun/star/text/XBookmarksSupplier.hpp>
 #include <com/sun/star/text/XDocumentIndex.hpp>
 #include <com/sun/star/text/XDocumentIndexesSupplier.hpp>
 #include <com/sun/star/text/XEndnotesSupplier.hpp>
 #include <com/sun/star/text/XFootnote.hpp>
 #include <com/sun/star/text/XFootnotesSupplier.hpp>
+#include <com/sun/star/text/XFormField.hpp>
+#include <com/sun/star/text/XTextField.hpp>
+#include <com/sun/star/text/XTextFieldsSupplier.hpp>
 #include <com/sun/star/text/XPageCursor.hpp>
 #include <com/sun/star/text/XText.hpp>
 #include <com/sun/star/text/XTextContent.hpp>
@@ -517,6 +530,748 @@ int64_t codepoints(const std::string& utf8_text) {
   return count;
 }
 
+class MarkerCollector;
+
+void fill_runs(const Reference<css::container::XEnumerationAccess>& paragraph,
+               const std::string& label,
+               google::protobuf::RepeatedPtrField<officev1::TextRun>* runs,
+               int64_t* offset, MarkerCollector* marks, Warner& warner);
+
+// Maps the office core's redline type name to the wire enum; unmatched
+// types stay UNSPECIFIED with the verbatim name on the wire.
+officev1::TrackedChangeKind tracked_change_kind(const std::string& type) {
+  if (type == "Insert") return officev1::TRACKED_CHANGE_KIND_INSERT;
+  if (type == "Delete") return officev1::TRACKED_CHANGE_KIND_DELETE;
+  if (type == "Format") return officev1::TRACKED_CHANGE_KIND_FORMAT;
+  if (type == "ParagraphFormat") {
+    return officev1::TRACKED_CHANGE_KIND_PARAGRAPH_FORMAT;
+  }
+  if (type == "TextTable") return officev1::TRACKED_CHANGE_KIND_TABLE_CHANGE;
+  if (type == "Style") return officev1::TRACKED_CHANGE_KIND_STYLE;
+  return officev1::TRACKED_CHANGE_KIND_UNSPECIFIED;
+}
+
+// Classifies a form field from the office core's type string: the fieldmark
+// type for in-text fields, the control model's service name for draw-page
+// controls. Unmatched types stay UNSPECIFIED with the verbatim type on the
+// wire.
+officev1::FormFieldKind form_field_kind(const std::string& type) {
+  if (type.find("FORMTEXT") != std::string::npos ||
+      type.find("component.TextField") != std::string::npos) {
+    return officev1::FORM_FIELD_KIND_TEXT;
+  }
+  if (type.find("FORMCHECKBOX") != std::string::npos ||
+      type.find("component.CheckBox") != std::string::npos) {
+    return officev1::FORM_FIELD_KIND_CHECKBOX;
+  }
+  if (type.find("FORMDROPDOWN") != std::string::npos ||
+      type.find("component.ListBox") != std::string::npos ||
+      type.find("component.ComboBox") != std::string::npos) {
+    return officev1::FORM_FIELD_KIND_DROPDOWN;
+  }
+  return officev1::FORM_FIELD_KIND_UNSPECIFIED;
+}
+
+// Reads one fieldmark parameter value in its stored type. Sequence-of-text
+// values land in string_list; scalars in the value oneof. Unmatched types
+// are dropped silently (the parameter name still records that it exists).
+void fill_parameter(const css::uno::Any& value, officev1::FormFieldParameter* out) {
+  css::uno::Sequence<rtl::OUString> texts;
+  if (value >>= texts) {
+    for (const rtl::OUString& text : texts) out->add_string_list(utf8(text));
+    return;
+  }
+  bool flag = false;
+  if (value >>= flag) {
+    out->set_bool_value(flag);
+    return;
+  }
+  sal_Int64 integer = 0;
+  if (value >>= integer) {
+    out->set_int_value(integer);
+    return;
+  }
+  double number = 0;
+  if (value >>= number) {
+    out->set_double_value(number);
+    return;
+  }
+  rtl::OUString text;
+  if (value >>= text) out->set_string_value(utf8(text));
+}
+
+// Collects comment, tracked-change, bookmark, and form-field marks from the
+// text portion walks, pairs their start and end sightings, and emits one
+// typed event per mark. Marks in the body flow carry exact annotation-space
+// offsets because the observation rides the same walk that counts them;
+// marks in out-of-body text (table cells, headers, footnotes, frames) are
+// still collected, with offsets -1. While a ranged mark is open, the run
+// text walked past accumulates as its covered text; the covered text is
+// only attached when the closing mark was actually seen, so an unclosed
+// mark never claims text it may not cover.
+class MarkerCollector {
+ public:
+  MarkerCollector(const PartSelection& parts,
+                  const Reference<css::text::XTextViewCursor>& cursor,
+                  CaretSpace* space, const EmitFn& emit_fn, Warner& warner)
+      : want_comments_(parts.wants(officev1::DOCUMENT_PART_COMMENTS)),
+        want_changes_(parts.wants(officev1::DOCUMENT_PART_TRACKED_CHANGES)),
+        want_bookmarks_(parts.wants(officev1::DOCUMENT_PART_BOOKMARKS)),
+        want_form_fields_(parts.wants(officev1::DOCUMENT_PART_FORM_FIELDS)),
+        cursor_(cursor),
+        space_(space),
+        emit_fn_(emit_fn),
+        warner_(warner) {}
+
+  // True when emit_fn reported a gone parent; the walks should unwind.
+  bool failed() const { return failed_; }
+
+  // Observes one non-Text portion from a portion walk. offset is the
+  // current annotation-space position, null outside the body flow.
+  void on_portion(const rtl::OUString& type,
+                  const Reference<css::text::XTextRange>& range,
+                  const Reference<css::beans::XPropertySet>& props,
+                  const int64_t* offset) {
+    try {
+      if (type == "Annotation" || type == "AnnotationEnd") {
+        if (want_comments_) on_annotation(range, props, offset);
+      } else if (type == "Bookmark") {
+        if (want_bookmarks_) on_bookmark(range, props, offset);
+      } else if (type == "Redline") {
+        if (want_changes_) on_redline(range, props, offset);
+      } else if (type == "TextFieldStart" || type == "TextFieldEnd" ||
+                 type == "TextFieldStartEnd") {
+        if (want_form_fields_) on_fieldmark(utf8(type), range, props, offset);
+      }
+    } catch (const css::uno::Exception& error) {
+      warner_.warn("marker portion (" + utf8(type) + ") failed", error);
+    }
+  }
+
+  // Accumulates walked run text into every open ranged mark.
+  void on_run_text(const std::string& text) {
+    for (auto& entry : open_comments_) entry.second.covered += text;
+    for (auto& entry : open_changes_) entry.second.covered += text;
+    for (auto& entry : open_bookmarks_) entry.second.covered += text;
+    for (auto& entry : open_fields_) entry.second.covered += text;
+  }
+
+  // The newline the annotation text space appends after each body
+  // paragraph, mirrored into open covered text.
+  void on_paragraph_break() { on_run_text("\n"); }
+
+  // Emits one draw-page form control as a FormField, sharing the emission
+  // index with fieldmarks.
+  void emit_form_control(officev1::FormField&& field) {
+    officev1::StreamPagesResponse event;
+    *event.mutable_form_field() = std::move(field);
+    event.mutable_form_field()->set_index(field_index_++);
+    emit(event);
+  }
+
+  // Emits every mark still open (a point comment, or a range whose end was
+  // never walked), then sweeps the document-level suppliers for marks the
+  // portion walks never met (bookmarks and comments in exotic locations,
+  // hidden tracked changes). Returns false when the parent is gone.
+  bool finish(const Reference<css::text::XTextDocument>& text_doc,
+              const Reference<css::frame::XModel>& model) {
+    flush_open();
+    if (want_bookmarks_) sweep_bookmarks(text_doc);
+    if (want_comments_) sweep_comments(text_doc);
+    if (want_changes_) sweep_redlines(model);
+    return !failed_;
+  }
+
+ private:
+  // One open ranged mark: the partially built event plus the covered-text
+  // accumulator, attached only when the closing mark is seen.
+  template <typename Event>
+  struct Open {
+    Event event;
+    std::string covered;
+  };
+
+  void emit(const officev1::StreamPagesResponse& event) {
+    if (failed_) return;
+    if (!emit_fn_(event)) failed_ = true;
+  }
+
+  // Positions the anchor caret and page for a mark's first sighting.
+  void anchor_at(const Reference<css::text::XTextRange>& range,
+                 const std::string& what, officev1::TwipsPoint* point,
+                 int32_t* page_index) {
+    *page_index = -1;
+    caret_at(cursor_, range.is() ? range->getStart() : range, what, space_,
+             point, page_index, warner_);
+  }
+
+  void on_annotation(const Reference<css::text::XTextRange>& range,
+                     const Reference<css::beans::XPropertySet>& props,
+                     const int64_t* offset) {
+    Reference<css::text::XTextField> field;
+    try {
+      props->getPropertyValue("TextField") >>= field;
+    } catch (const css::beans::UnknownPropertyException&) {
+      // Expected probe result: the range-end portion may not carry the
+      // field.
+    }
+    std::string name;
+    Reference<css::beans::XPropertySet> field_props(field, UNO_QUERY);
+    if (field_props.is()) {
+      rtl::OUString value;
+      field_props->getPropertyValue("Name") >>= value;
+      name = utf8(value);
+    }
+    if (!name.empty()) {
+      auto found = open_comments_.find(name);
+      if (found != open_comments_.end()) {
+        close_comment(&found->second, offset);
+        open_comments_.erase(found);
+        return;
+      }
+    }
+    if (!field_props.is()) {
+      // A boundary portion without the field: close the most recent open
+      // comment, or hold an anonymous span start until the field arrives.
+      if (!open_comments_.empty()) {
+        auto last = std::prev(open_comments_.end());
+        close_comment(&last->second, offset);
+        open_comments_.erase(last);
+        return;
+      }
+      Open<officev1::Comment>& open =
+          open_comments_["\nanon" + std::to_string(comment_index_)];
+      open.event.set_char_start(offset != nullptr ? *offset : -1);
+      int32_t page_index = -1;
+      anchor_at(range, "comment anchor", open.event.mutable_anchor(),
+                &page_index);
+      open.event.set_page_index(page_index);
+      return;
+    }
+    seen_comment_names_.insert(name);
+    // A named sighting with no open partner: adopt a pending anonymous
+    // span start when one exists, else open a new mark.
+    officev1::Comment event;
+    bool had_anonymous = false;
+    for (auto it = open_comments_.begin(); it != open_comments_.end(); ++it) {
+      if (it->first.rfind("\nanon", 0) == 0) {
+        event = std::move(it->second.event);
+        // The covered text accumulated between the two boundary portions.
+        event.set_anchored_text(it->second.covered);
+        open_comments_.erase(it);
+        had_anonymous = true;
+        break;
+      }
+    }
+    fill_comment_field(field, field_props, name, &event);
+    if (had_anonymous) {
+      event.set_char_end(offset != nullptr ? *offset : -1);
+      event.set_index(comment_index_++);
+      officev1::StreamPagesResponse response;
+      *response.mutable_comment() = std::move(event);
+      emit(response);
+      return;
+    }
+    Open<officev1::Comment>& open = open_comments_[name];
+    open.event = std::move(event);
+    open.event.set_char_start(offset != nullptr ? *offset : -1);
+    int32_t page_index = -1;
+    anchor_at(range, "comment " + name + " anchor",
+              open.event.mutable_anchor(), &page_index);
+    open.event.set_page_index(page_index);
+  }
+
+  // Fills a comment's identity and content from its annotation field.
+  void fill_comment_field(const Reference<css::text::XTextField>& field,
+                          const Reference<css::beans::XPropertySet>& props,
+                          const std::string& name, officev1::Comment* out) {
+    out->set_name(name);
+    rtl::OUString text;
+    props->getPropertyValue("Author") >>= text;
+    out->set_author(utf8(text));
+    text = rtl::OUString();
+    props->getPropertyValue("Content") >>= text;
+    out->set_text(utf8(text));
+    try {
+      text = rtl::OUString();
+      props->getPropertyValue("Initials") >>= text;
+      out->set_initials(utf8(text));
+      css::util::DateTime when;
+      props->getPropertyValue("DateTimeValue") >>= when;
+      out->set_epoch_ms(datetime_epoch_ms(when));
+    } catch (const css::beans::UnknownPropertyException&) {
+      // Expected probe result: initials and creation time are optional.
+    }
+    try {
+      bool resolved = false;
+      props->getPropertyValue("Resolved") >>= resolved;
+      out->set_resolved(resolved);
+    } catch (const css::beans::UnknownPropertyException&) {
+      // Expected probe result: older office cores have no resolved state.
+    }
+    try {
+      rtl::OUString parent;
+      props->getPropertyValue("ParentName") >>= parent;
+      out->set_parent_name(utf8(parent));
+    } catch (const css::beans::UnknownPropertyException&) {
+      // Expected probe result: older office cores have no reply threading.
+    }
+    // Rich content when the field exposes its text; the plain Content
+    // string already carries the content either way.
+    Reference<css::text::XText> rich_text(field, UNO_QUERY);
+    if (rich_text.is()) {
+      Reference<css::container::XEnumerationAccess> access(rich_text, UNO_QUERY);
+      if (access.is()) {
+        Reference<css::container::XEnumeration> paragraphs =
+            access->createEnumeration();
+        while (paragraphs->hasMoreElements()) {
+          Reference<css::container::XEnumerationAccess> paragraph(
+              paragraphs->nextElement(), UNO_QUERY);
+          if (paragraph.is()) {
+            fill_runs(paragraph, "comment " + name + " content",
+                      out->mutable_runs(), nullptr, nullptr, warner_);
+          }
+        }
+      }
+    }
+  }
+
+  void close_comment(Open<officev1::Comment>* open, const int64_t* offset) {
+    open->event.set_char_end(offset != nullptr ? *offset : -1);
+    open->event.set_anchored_text(open->covered);
+    open->event.set_index(comment_index_++);
+    officev1::StreamPagesResponse response;
+    *response.mutable_comment() = std::move(open->event);
+    emit(response);
+  }
+
+  void on_bookmark(const Reference<css::text::XTextRange>& range,
+                   const Reference<css::beans::XPropertySet>& props,
+                   const int64_t* offset) {
+    Reference<css::container::XNamed> named;
+    props->getPropertyValue("Bookmark") >>= named;
+    if (!named.is()) return;
+    std::string name = utf8(named->getName());
+    seen_bookmark_names_.insert(name);
+    bool collapsed = false;
+    props->getPropertyValue("IsCollapsed") >>= collapsed;
+    bool is_start = false;
+    props->getPropertyValue("IsStart") >>= is_start;
+    if (collapsed) {
+      officev1::StreamPagesResponse response;
+      officev1::Bookmark* out = response.mutable_bookmark();
+      out->set_index(bookmark_index_++);
+      out->set_name(name);
+      out->set_char_start(offset != nullptr ? *offset : -1);
+      out->set_char_end(offset != nullptr ? *offset : -1);
+      int32_t page_index = -1;
+      anchor_at(range, "bookmark " + name, out->mutable_anchor(), &page_index);
+      out->set_page_index(page_index);
+      emit(response);
+      return;
+    }
+    auto found = open_bookmarks_.find(name);
+    if (is_start && found == open_bookmarks_.end()) {
+      Open<officev1::Bookmark>& open = open_bookmarks_[name];
+      open.event.set_name(name);
+      open.event.set_char_start(offset != nullptr ? *offset : -1);
+      int32_t page_index = -1;
+      anchor_at(range, "bookmark " + name, open.event.mutable_anchor(),
+                &page_index);
+      open.event.set_page_index(page_index);
+      return;
+    }
+    if (found == open_bookmarks_.end()) {
+      // An end mark with no open partner: a bookmark whose start sits in
+      // text the walk has not covered. Emit what is known.
+      officev1::StreamPagesResponse response;
+      officev1::Bookmark* out = response.mutable_bookmark();
+      out->set_index(bookmark_index_++);
+      out->set_name(name);
+      out->set_char_start(-1);
+      out->set_char_end(offset != nullptr ? *offset : -1);
+      int32_t page_index = -1;
+      anchor_at(range, "bookmark " + name, out->mutable_anchor(), &page_index);
+      out->set_page_index(page_index);
+      emit(response);
+      return;
+    }
+    found->second.event.set_char_end(offset != nullptr ? *offset : -1);
+    found->second.event.set_covered_text(found->second.covered);
+    found->second.event.set_index(bookmark_index_++);
+    officev1::StreamPagesResponse response;
+    *response.mutable_bookmark() = std::move(found->second.event);
+    open_bookmarks_.erase(found);
+    emit(response);
+  }
+
+  void on_redline(const Reference<css::text::XTextRange>& range,
+                  const Reference<css::beans::XPropertySet>& props,
+                  const int64_t* offset) {
+    rtl::OUString value;
+    props->getPropertyValue("RedlineIdentifier") >>= value;
+    std::string identifier = utf8(value);
+    bool is_start = false;
+    props->getPropertyValue("IsStart") >>= is_start;
+    auto found = open_changes_.find(identifier);
+    if (found != open_changes_.end() && !is_start) {
+      found->second.event.set_char_end(offset != nullptr ? *offset : -1);
+      found->second.event.set_changed_text(found->second.covered);
+      found->second.event.set_index(change_index_++);
+      officev1::StreamPagesResponse response;
+      *response.mutable_tracked_change() = std::move(found->second.event);
+      open_changes_.erase(found);
+      emit(response);
+      return;
+    }
+    if (found != open_changes_.end()) return;  // A duplicate start mark.
+    seen_change_ids_.insert(identifier);
+    Open<officev1::TrackedChange>& open = open_changes_[identifier];
+    fill_redline(props, identifier, &open.event);
+    open.event.set_char_start(offset != nullptr ? *offset : -1);
+    int32_t page_index = -1;
+    anchor_at(range, "tracked change " + identifier,
+              open.event.mutable_anchor(), &page_index);
+    open.event.set_page_index(page_index);
+    if (!is_start) {
+      // An end mark with no open partner: a change whose start sits in text
+      // the walk has not covered. Emit what is known.
+      open.event.set_char_end(offset != nullptr ? *offset : -1);
+      open.event.set_char_start(-1);
+      open.event.set_index(change_index_++);
+      officev1::StreamPagesResponse response;
+      *response.mutable_tracked_change() = std::move(open.event);
+      open_changes_.erase(identifier);
+      emit(response);
+    }
+  }
+
+  // Fills a tracked change's identity from a redline portion's (or a
+  // document-level redline's) properties.
+  void fill_redline(const Reference<css::beans::XPropertySet>& props,
+                    const std::string& identifier,
+                    officev1::TrackedChange* out) {
+    out->set_identifier(identifier);
+    rtl::OUString text;
+    props->getPropertyValue("RedlineType") >>= text;
+    out->set_kind_name(utf8(text));
+    out->set_kind(tracked_change_kind(out->kind_name()));
+    text = rtl::OUString();
+    props->getPropertyValue("RedlineAuthor") >>= text;
+    out->set_author(utf8(text));
+    text = rtl::OUString();
+    props->getPropertyValue("RedlineComment") >>= text;
+    out->set_comment(utf8(text));
+    css::util::DateTime when;
+    props->getPropertyValue("RedlineDateTime") >>= when;
+    out->set_epoch_ms(datetime_epoch_ms(when));
+    try {
+      css::uno::Sequence<css::beans::PropertyValue> successor;
+      props->getPropertyValue("RedlineSuccessorData") >>= successor;
+      for (const css::beans::PropertyValue& entry : successor) {
+        officev1::TrackedChangeSuccessor* under = out->mutable_successor();
+        if (entry.Name == "RedlineType") {
+          rtl::OUString kind;
+          entry.Value >>= kind;
+          under->set_kind_name(utf8(kind));
+          under->set_kind(tracked_change_kind(under->kind_name()));
+        } else if (entry.Name == "RedlineAuthor") {
+          rtl::OUString author;
+          entry.Value >>= author;
+          under->set_author(utf8(author));
+        } else if (entry.Name == "RedlineComment") {
+          rtl::OUString comment;
+          entry.Value >>= comment;
+          under->set_comment(utf8(comment));
+        } else if (entry.Name == "RedlineDateTime") {
+          css::util::DateTime under_when;
+          entry.Value >>= under_when;
+          under->set_epoch_ms(datetime_epoch_ms(under_when));
+        }
+      }
+      // A successor block whose fields were all empty is no successor.
+      if (out->has_successor() && out->successor().kind_name().empty() &&
+          out->successor().author().empty()) {
+        out->clear_successor();
+      }
+    } catch (const css::beans::UnknownPropertyException&) {
+      // Expected probe result: not every office core exposes nesting data.
+    }
+  }
+
+  void on_fieldmark(const std::string& type,
+                    const Reference<css::text::XTextRange>& range,
+                    const Reference<css::beans::XPropertySet>& props,
+                    const int64_t* offset) {
+    Reference<css::text::XFormField> fieldmark;
+    try {
+      props->getPropertyValue("Bookmark") >>= fieldmark;
+    } catch (const css::beans::UnknownPropertyException&) {
+      // Expected probe result: the end portion may not carry the mark.
+    }
+    std::string name;
+    Reference<css::container::XNamed> named(fieldmark, UNO_QUERY);
+    if (named.is()) name = utf8(named->getName());
+    if (type == "TextFieldEnd") {
+      auto found = name.empty() && !open_fields_.empty()
+                       ? std::prev(open_fields_.end())
+                       : open_fields_.find(name);
+      if (found == open_fields_.end()) return;  // A stray end mark.
+      found->second.event.set_char_end(offset != nullptr ? *offset : -1);
+      found->second.event.set_text(found->second.covered);
+      found->second.event.set_index(field_index_++);
+      officev1::StreamPagesResponse response;
+      *response.mutable_form_field() = std::move(found->second.event);
+      open_fields_.erase(found);
+      emit(response);
+      return;
+    }
+    if (!fieldmark.is()) return;
+    officev1::FormField event;
+    fill_fieldmark(fieldmark, name, &event);
+    event.set_char_start(offset != nullptr ? *offset : -1);
+    int32_t page_index = -1;
+    anchor_at(range, "form field " + name, event.mutable_anchor(),
+              &page_index);
+    event.set_page_index(page_index);
+    if (type == "TextFieldStartEnd") {
+      event.set_char_end(event.char_start());
+      event.set_index(field_index_++);
+      officev1::StreamPagesResponse response;
+      *response.mutable_form_field() = std::move(event);
+      emit(response);
+      return;
+    }
+    open_fields_[name].event = std::move(event);
+  }
+
+  // Fills a fieldmark's type, name, and parameters, projecting the
+  // well-known checkbox and dropdown parameters into their typed fields.
+  void fill_fieldmark(const Reference<css::text::XFormField>& fieldmark,
+                      const std::string& name, officev1::FormField* out) {
+    out->set_name(name);
+    out->set_selected_index(-1);
+    std::string field_type = utf8(fieldmark->getFieldType());
+    out->set_field_type(field_type);
+    out->set_kind(form_field_kind(field_type));
+    Reference<css::container::XNameContainer> parameters =
+        fieldmark->getParameters();
+    if (!parameters.is()) return;
+    css::uno::Sequence<rtl::OUString> names = parameters->getElementNames();
+    for (const rtl::OUString& parameter_name : names) {
+      officev1::FormFieldParameter* parameter = out->add_parameters();
+      parameter->set_name(utf8(parameter_name));
+      css::uno::Any value = parameters->getByName(parameter_name);
+      fill_parameter(value, parameter);
+      if (parameter->name() == "Checkbox_Checked") {
+        out->set_checked(parameter->bool_value());
+      } else if (parameter->name() == "Dropdown_ListEntry") {
+        for (const std::string& entry : parameter->string_list()) {
+          out->add_list_entries(entry);
+        }
+      } else if (parameter->name() == "Dropdown_Selected") {
+        out->set_selected_index(static_cast<int32_t>(parameter->int_value()));
+      }
+    }
+    if (out->kind() == officev1::FORM_FIELD_KIND_DROPDOWN &&
+        out->selected_index() >= 0 &&
+        out->selected_index() < out->list_entries_size()) {
+      out->set_text(out->list_entries(out->selected_index()));
+    }
+  }
+
+  // Emits every still-open mark. A comment with no end sighting is a point
+  // comment; ranged marks whose end was never walked keep char_end -1 and
+  // no covered text, so a partial walk never fabricates a span.
+  void flush_open() {
+    for (auto& entry : open_comments_) {
+      officev1::Comment& event = entry.second.event;
+      event.set_char_end(event.char_start());
+      event.set_index(comment_index_++);
+      officev1::StreamPagesResponse response;
+      *response.mutable_comment() = std::move(event);
+      emit(response);
+    }
+    open_comments_.clear();
+    for (auto& entry : open_bookmarks_) {
+      officev1::Bookmark& event = entry.second.event;
+      event.set_char_end(-1);
+      event.set_index(bookmark_index_++);
+      officev1::StreamPagesResponse response;
+      *response.mutable_bookmark() = std::move(event);
+      emit(response);
+    }
+    open_bookmarks_.clear();
+    for (auto& entry : open_changes_) {
+      officev1::TrackedChange& event = entry.second.event;
+      event.set_char_end(-1);
+      event.set_index(change_index_++);
+      officev1::StreamPagesResponse response;
+      *response.mutable_tracked_change() = std::move(event);
+      emit(response);
+    }
+    open_changes_.clear();
+    for (auto& entry : open_fields_) {
+      officev1::FormField& event = entry.second.event;
+      event.set_char_end(-1);
+      event.set_index(field_index_++);
+      officev1::StreamPagesResponse response;
+      *response.mutable_form_field() = std::move(event);
+      emit(response);
+    }
+    open_fields_.clear();
+  }
+
+  // Emits bookmarks the portion walks never met (nested tables, exotic
+  // containers) from the document's bookmark list, with no span.
+  void sweep_bookmarks(const Reference<css::text::XTextDocument>& text_doc) {
+    try {
+      Reference<css::text::XBookmarksSupplier> supplier(text_doc, UNO_QUERY);
+      if (!supplier.is()) return;
+      Reference<css::container::XNameAccess> bookmarks =
+          supplier->getBookmarks();
+      if (!bookmarks.is()) return;
+      for (const rtl::OUString& name : bookmarks->getElementNames()) {
+        std::string bookmark_name = utf8(name);
+        if (seen_bookmark_names_.count(bookmark_name) != 0) continue;
+        officev1::StreamPagesResponse response;
+        officev1::Bookmark* out = response.mutable_bookmark();
+        out->set_index(bookmark_index_++);
+        out->set_name(bookmark_name);
+        out->set_char_start(-1);
+        out->set_char_end(-1);
+        Reference<css::text::XTextContent> content;
+        bookmarks->getByName(name) >>= content;
+        int32_t page_index = -1;
+        if (content.is()) {
+          anchor_at(content->getAnchor(), "bookmark " + bookmark_name,
+                    out->mutable_anchor(), &page_index);
+        }
+        out->set_page_index(page_index);
+        emit(response);
+      }
+    } catch (const css::uno::Exception& error) {
+      warner_.warn("bookmark sweep failed", error);
+    }
+  }
+
+  // Emits comments the portion walks never met from the document's text
+  // field list, with no span.
+  void sweep_comments(const Reference<css::text::XTextDocument>& text_doc) {
+    try {
+      Reference<css::text::XTextFieldsSupplier> supplier(text_doc, UNO_QUERY);
+      if (!supplier.is()) return;
+      Reference<css::container::XEnumerationAccess> fields(
+          supplier->getTextFields(), UNO_QUERY);
+      if (!fields.is()) return;
+      Reference<css::container::XEnumeration> it = fields->createEnumeration();
+      while (it->hasMoreElements()) {
+        Reference<css::text::XTextField> field(it->nextElement(), UNO_QUERY);
+        Reference<css::lang::XServiceInfo> services(field, UNO_QUERY);
+        if (!services.is() ||
+            !services->supportsService(
+                "com.sun.star.text.textfield.Annotation")) {
+          continue;
+        }
+        Reference<css::beans::XPropertySet> props(field, UNO_QUERY);
+        if (!props.is()) continue;
+        rtl::OUString value;
+        props->getPropertyValue("Name") >>= value;
+        std::string name = utf8(value);
+        if (seen_comment_names_.count(name) != 0) continue;
+        seen_comment_names_.insert(name);
+        officev1::StreamPagesResponse response;
+        officev1::Comment* out = response.mutable_comment();
+        fill_comment_field(field, props, name, out);
+        out->set_index(comment_index_++);
+        out->set_char_start(-1);
+        out->set_char_end(-1);
+        int32_t page_index = -1;
+        anchor_at(field->getAnchor(), "comment " + name,
+                  out->mutable_anchor(), &page_index);
+        out->set_page_index(page_index);
+        emit(response);
+      }
+    } catch (const css::uno::Exception& error) {
+      warner_.warn("comment sweep failed", error);
+    }
+  }
+
+  // Emits tracked changes the portion walks never met (a deletion while
+  // deletions are hidden, a change inside a nested table) from the
+  // document's redline list, with no span. The hidden deleted text rides
+  // changed_text from the redline's stored content.
+  void sweep_redlines(const Reference<css::frame::XModel>& model) {
+    try {
+      Reference<css::document::XRedlinesSupplier> supplier(model, UNO_QUERY);
+      if (!supplier.is()) return;
+      Reference<css::container::XEnumerationAccess> redlines(
+          supplier->getRedlines(), UNO_QUERY);
+      if (!redlines.is()) return;
+      Reference<css::container::XEnumeration> it = redlines->createEnumeration();
+      while (it->hasMoreElements()) {
+        Reference<css::beans::XPropertySet> props(it->nextElement(), UNO_QUERY);
+        if (!props.is()) continue;
+        rtl::OUString value;
+        props->getPropertyValue("RedlineIdentifier") >>= value;
+        std::string identifier = utf8(value);
+        if (seen_change_ids_.count(identifier) != 0) continue;
+        seen_change_ids_.insert(identifier);
+        officev1::StreamPagesResponse response;
+        officev1::TrackedChange* out = response.mutable_tracked_change();
+        fill_redline(props, identifier, out);
+        out->set_index(change_index_++);
+        out->set_char_start(-1);
+        out->set_char_end(-1);
+        out->set_page_index(-1);
+        try {
+          Reference<css::text::XText> hidden;
+          props->getPropertyValue("RedlineText") >>= hidden;
+          if (hidden.is()) out->set_changed_text(utf8(hidden->getString()));
+        } catch (const css::beans::UnknownPropertyException&) {
+          // Expected probe result: only deletions carry stored text.
+        }
+        try {
+          Reference<css::text::XTextRange> start;
+          props->getPropertyValue("RedlineStart") >>= start;
+          if (start.is()) {
+            int32_t page_index = -1;
+            anchor_at(start, "tracked change " + identifier,
+                      out->mutable_anchor(), &page_index);
+            out->set_page_index(page_index);
+          }
+        } catch (const css::beans::UnknownPropertyException&) {
+          // Expected probe result: a fully hidden change has no live range.
+        }
+        emit(response);
+      }
+    } catch (const css::uno::Exception& error) {
+      warner_.warn("tracked change sweep failed", error);
+    }
+  }
+
+  bool want_comments_ = false;
+  bool want_changes_ = false;
+  bool want_bookmarks_ = false;
+  bool want_form_fields_ = false;
+  Reference<css::text::XTextViewCursor> cursor_;
+  CaretSpace* space_ = nullptr;
+  EmitFn emit_fn_;
+  Warner& warner_;
+  bool failed_ = false;
+  std::map<std::string, Open<officev1::Comment>> open_comments_;
+  std::map<std::string, Open<officev1::TrackedChange>> open_changes_;
+  std::map<std::string, Open<officev1::Bookmark>> open_bookmarks_;
+  std::map<std::string, Open<officev1::FormField>> open_fields_;
+  std::set<std::string> seen_comment_names_;
+  std::set<std::string> seen_bookmark_names_;
+  std::set<std::string> seen_change_ids_;
+  int32_t comment_index_ = 0;
+  int32_t change_index_ = 0;
+  int32_t bookmark_index_ = 0;
+  int32_t field_index_ = 0;
+};
+
 // Attributes item-local [char_start, char_end) code-point offsets to the
 // measured line rectangles by walking the layout's visual lines: the view
 // cursor answers XLineCursor (start and end of the current line) and
@@ -620,11 +1375,13 @@ void measure_line_boundaries(
 // Appends one run per uniformly formatted text portion. When offset is null
 // the runs are outside the body flow and carry char_offset -1; otherwise
 // *offset is the running position in the annotation text space and advances
-// by each run's length.
+// by each run's length. marks, when non-null, observes the non-Text
+// portions (comment, bookmark, tracked-change, and form-field boundaries)
+// and the walked run text.
 void fill_runs(const Reference<css::container::XEnumerationAccess>& paragraph,
                const std::string& label,
                google::protobuf::RepeatedPtrField<officev1::TextRun>* runs,
-               int64_t* offset, Warner& warner) {
+               int64_t* offset, MarkerCollector* marks, Warner& warner) {
   Reference<css::container::XEnumeration> portions = paragraph->createEnumeration();
   int portion_index = 0;
   while (portions->hasMoreElements()) {
@@ -636,7 +1393,12 @@ void fill_runs(const Reference<css::container::XEnumerationAccess>& paragraph,
     try {
       rtl::OUString portion_type;
       props->getPropertyValue("TextPortionType") >>= portion_type;
-      if (portion_type != "Text") continue;
+      if (portion_type != "Text") {
+        if (marks != nullptr) {
+          marks->on_portion(portion_type, range, props, offset);
+        }
+        continue;
+      }
       officev1::TextRun* run = runs->Add();
       run->set_text(utf8(range->getString()));
       int64_t length = codepoints(run->text());
@@ -669,6 +1431,23 @@ void fill_runs(const Reference<css::container::XEnumerationAccess>& paragraph,
       sal_Int32 color = 0;
       props->getPropertyValue("CharColor") >>= color;
       run->set_color_rgb(color >= 0 ? static_cast<uint32_t>(color) : 0);
+      try {
+        rtl::OUString url;
+        props->getPropertyValue("HyperLinkURL") >>= url;
+        if (!url.isEmpty()) {
+          run->set_hyperlink_url(utf8(url));
+          rtl::OUString target;
+          props->getPropertyValue("HyperLinkTarget") >>= target;
+          run->set_hyperlink_target(utf8(target));
+          rtl::OUString link_name;
+          props->getPropertyValue("HyperLinkName") >>= link_name;
+          run->set_hyperlink_name(utf8(link_name));
+        }
+      } catch (const css::beans::UnknownPropertyException&) {
+        // Expected probe result: not every text model carries hyperlink
+        // character properties.
+      }
+      if (marks != nullptr) marks->on_run_text(run->text());
     } catch (const css::uno::Exception& error) {
       warner.warn(label + " portion " + std::to_string(portion_index - 1) +
                       " lost its run",
@@ -680,11 +1459,13 @@ void fill_runs(const Reference<css::container::XEnumerationAccess>& paragraph,
 // Fills one Paragraph event from a body or header/footer text element.
 // Returns false when the element is not a paragraph. Geometry and offsets
 // are only attached when the paragraph is in the body flow (cursor and
-// offset non-null).
+// offset non-null). marks, when non-null, observes the paragraph's marker
+// portions.
 bool fill_paragraph(const css::uno::Any& element, int32_t index,
                     const Reference<css::text::XTextViewCursor>& cursor,
                     CaretSpace* space, int64_t* offset, SelectionProbe* probe,
-                    officev1::Paragraph* out, Warner& warner) {
+                    MarkerCollector* marks, officev1::Paragraph* out,
+                    Warner& warner) {
   Reference<css::container::XEnumerationAccess> paragraph(element, UNO_QUERY);
   Reference<css::text::XTextRange> range(element, UNO_QUERY);
   if (!paragraph.is() || !range.is()) return false;
@@ -737,8 +1518,11 @@ bool fill_paragraph(const css::uno::Any& element, int32_t index,
     measure_line_boundaries(cursor, range->getStart(), range->getEnd(), space,
                             label, out->mutable_line_rects(), warner);
   }
-  fill_runs(paragraph, label, out->mutable_runs(), offset, warner);
-  if (offset != nullptr) *offset += 1;  // The newline after each body paragraph.
+  fill_runs(paragraph, label, out->mutable_runs(), offset, marks, warner);
+  if (offset != nullptr) {
+    *offset += 1;  // The newline after each body paragraph.
+    if (marks != nullptr) marks->on_paragraph_break();
+  }
   return true;
 }
 
@@ -838,19 +1622,49 @@ bool emit_table(const Reference<css::text::XTextTable>& table, int32_t index,
   return emit_fn(event);
 }
 
+// Walks a table's cell paragraphs for marker portions only. Cell text is
+// outside the annotation space, so the marks carry no offsets; the walk
+// still pairs range boundaries and accumulates covered text.
+void walk_table_marks(const Reference<css::text::XTextTable>& table,
+                      const std::string& label, MarkerCollector* marks,
+                      Warner& warner) {
+  try {
+    css::uno::Sequence<rtl::OUString> names = table->getCellNames();
+    for (const rtl::OUString& name : names) {
+      Reference<css::container::XEnumerationAccess> cell(
+          table->getCellByName(name), UNO_QUERY);
+      if (!cell.is()) continue;
+      Reference<css::container::XEnumeration> paragraphs =
+          cell->createEnumeration();
+      while (paragraphs->hasMoreElements()) {
+        Reference<css::container::XEnumerationAccess> paragraph(
+            paragraphs->nextElement(), UNO_QUERY);
+        if (!paragraph.is()) continue;  // A nested table; the sweeps cover it.
+        google::protobuf::RepeatedPtrField<officev1::TextRun> scratch;
+        fill_runs(paragraph, label + " cell " + utf8(name), &scratch, nullptr,
+                  marks, warner);
+      }
+    }
+  } catch (const css::uno::Exception& error) {
+    warner.warn(label + " marker walk failed", error);
+  }
+}
+
 // Flattens the paragraphs of an arbitrary text (footnote body, generated
 // index, frame or shape text) into runs outside the annotation space.
+// marks, when non-null, observes the walked marker portions with no
+// offsets.
 void flatten_text_runs(const Reference<css::text::XText>& text,
                        const std::string& label,
                        google::protobuf::RepeatedPtrField<officev1::TextRun>* runs,
-                       Warner& warner) {
+                       MarkerCollector* marks, Warner& warner) {
   Reference<css::container::XEnumerationAccess> access(text, UNO_QUERY);
   if (!access.is()) return;
   Reference<css::container::XEnumeration> paragraphs = access->createEnumeration();
   while (paragraphs->hasMoreElements()) {
     Reference<css::container::XEnumerationAccess> paragraph(
         paragraphs->nextElement(), UNO_QUERY);
-    if (paragraph.is()) fill_runs(paragraph, label, runs, nullptr, warner);
+    if (paragraph.is()) fill_runs(paragraph, label, runs, nullptr, marks, warner);
   }
 }
 
@@ -927,6 +1741,8 @@ struct WriterShapeWalk {
   Reference<css::graphic::XGraphicProvider> provider;
   bool want_images = false;
   bool want_shapes = false;
+  bool want_form_fields = false;
+  MarkerCollector* marks = nullptr;
   int32_t image_index = 0;
   int32_t shape_index = 0;
 };
@@ -944,6 +1760,107 @@ void fill_shape_position(const Reference<css::drawing::XShape>& shape,
     out->set_y(hundredth_mm_to_twips(position.Y));
   } catch (const css::uno::Exception& error) {
     warner.warn(label + " position query failed", error);
+  }
+}
+
+// Emits one draw-page form control (a legacy Writer form checkbox, text
+// field, or list box) as a FormField with geometry instead of a character
+// span. The control's semantic kind comes from its model's form component
+// service; unrecognized components still emit with the service name.
+void emit_form_control(const Reference<css::beans::XPropertySet>& shape_props,
+                       const std::string& label, WriterShapeWalk* walk,
+                       Warner& warner) {
+  try {
+    Reference<css::drawing::XControlShape> control_shape(shape_props, UNO_QUERY);
+    if (!control_shape.is()) return;
+    Reference<css::awt::XControlModel> model = control_shape->getControl();
+    Reference<css::beans::XPropertySet> model_props(model, UNO_QUERY);
+    if (!model_props.is()) return;
+    officev1::FormField field;
+    field.set_control(true);
+    field.set_char_start(-1);
+    field.set_char_end(-1);
+    field.set_selected_index(-1);
+    Reference<css::lang::XServiceInfo> services(model, UNO_QUERY);
+    if (services.is()) {
+      for (const rtl::OUString& service : services->getSupportedServiceNames()) {
+        std::string name = utf8(service);
+        if (name.rfind("com.sun.star.form.component.", 0) == 0) {
+          field.set_field_type(name);
+          break;
+        }
+      }
+    }
+    field.set_kind(form_field_kind(field.field_type()));
+    Reference<css::beans::XPropertySetInfo> info =
+        model_props->getPropertySetInfo();
+    auto has_property = [&](const char* name) {
+      return info.is() && info->hasPropertyByName(
+                              rtl::OUString::createFromAscii(name));
+    };
+    rtl::OUString text;
+    if (has_property("Name")) {
+      model_props->getPropertyValue("Name") >>= text;
+      field.set_name(utf8(text));
+    }
+    if (has_property("Label")) {
+      text = rtl::OUString();
+      model_props->getPropertyValue("Label") >>= text;
+      field.set_label(utf8(text));
+    }
+    if (has_property("Text")) {
+      text = rtl::OUString();
+      model_props->getPropertyValue("Text") >>= text;
+      field.set_text(utf8(text));
+    }
+    if (has_property("State")) {
+      sal_Int16 state = 0;
+      model_props->getPropertyValue("State") >>= state;
+      field.set_checked(state == 1);
+    }
+    if (has_property("StringItemList")) {
+      css::uno::Sequence<rtl::OUString> entries;
+      model_props->getPropertyValue("StringItemList") >>= entries;
+      for (const rtl::OUString& entry : entries) {
+        field.add_list_entries(utf8(entry));
+      }
+    }
+    if (has_property("SelectedItems")) {
+      css::uno::Sequence<sal_Int16> selected;
+      model_props->getPropertyValue("SelectedItems") >>= selected;
+      if (selected.hasElements()) {
+        field.set_selected_index(selected[0]);
+        std::string joined;
+        for (sal_Int16 item : selected) {
+          if (item < 0 || item >= field.list_entries_size()) continue;
+          if (!joined.empty()) joined += "\n";
+          joined += field.list_entries(item);
+        }
+        if (!joined.empty()) field.set_text(joined);
+      }
+    }
+    Reference<css::drawing::XShape> shape(shape_props, UNO_QUERY);
+    if (shape.is()) {
+      css::awt::Size size = shape->getSize();
+      field.set_width_twips(hundredth_mm_to_twips(size.Width));
+      field.set_height_twips(hundredth_mm_to_twips(size.Height));
+      fill_shape_position(shape, label, field.mutable_anchor(), warner);
+    }
+    field.set_page_index(-1);
+    try {
+      Reference<css::text::XTextContent> content(shape_props, UNO_QUERY);
+      if (content.is()) {
+        int32_t page_index = -1;
+        caret_at(walk->cursor, content->getAnchor(), label + " anchor",
+                 walk->space, field.mutable_anchor(), &page_index, warner);
+        field.set_page_index(page_index);
+      }
+    } catch (const css::uno::Exception& error) {
+      warner.warn(label + " anchor query failed", error);
+    }
+    walk->marks->emit_form_control(std::move(field));
+  } catch (const css::uno::Exception& error) {
+    warner.warn(label + " form control extraction failed", error);
   }
 }
 
@@ -1102,10 +2019,14 @@ bool emit_writer_shapes(const Reference<css::container::XIndexAccess>& shapes,
     // emit_text_frames owns them, so skipping here is the dedup that keeps
     // each frame a single event.
     if (services->supportsService("com.sun.star.text.TextFrame")) continue;
-    if (!walk->want_shapes) continue;
     if (services->supportsService("com.sun.star.drawing.ControlShape")) {
+      if (walk->want_form_fields && walk->marks != nullptr) {
+        emit_form_control(props, label, walk, warner);
+        if (walk->marks->failed()) return false;
+      }
       continue;
     }
+    if (!walk->want_shapes) continue;
     Reference<css::text::XText> text(props, UNO_QUERY);
     if (!text.is()) continue;
     std::string content_text;
@@ -1165,7 +2086,7 @@ bool emit_writer_shapes(const Reference<css::container::XIndexAccess>& shapes,
     } catch (const css::uno::Exception& error) {
       warner.warn(label + " chain query failed", error);
     }
-    flatten_text_runs(text, label, out->mutable_runs(), warner);
+    flatten_text_runs(text, label, out->mutable_runs(), walk->marks, warner);
     if (!emit_fn(event)) return false;
     walk->shape_index++;
   }
@@ -1178,8 +2099,8 @@ bool emit_draw_shapes(const Reference<css::text::XTextDocument>& text_doc,
                       const Reference<css::uno::XComponentContext>& context,
                       const Reference<css::text::XTextViewCursor>& cursor,
                       CaretSpace* space, const PartSelection& parts,
-                      SelectionProbe* probe, const EmitFn& emit_fn,
-                      Warner& warner) {
+                      SelectionProbe* probe, MarkerCollector* marks,
+                      const EmitFn& emit_fn, Warner& warner) {
   Reference<css::drawing::XDrawPageSupplier> supplier(text_doc, UNO_QUERY);
   if (!supplier.is()) return true;
   Reference<css::container::XIndexAccess> shapes(supplier->getDrawPage(), UNO_QUERY);
@@ -1190,6 +2111,9 @@ bool emit_draw_shapes(const Reference<css::text::XTextDocument>& text_doc,
   walk.probe = probe;
   walk.want_images = parts.wants(officev1::DOCUMENT_PART_IMAGES);
   walk.want_shapes = parts.wants(officev1::DOCUMENT_PART_SHAPES);
+  walk.want_form_fields =
+      parts.wants(officev1::DOCUMENT_PART_FORM_FIELDS) && marks != nullptr;
+  walk.marks = marks;
   if (walk.want_images) walk.provider = graphic_provider(context, warner);
   return emit_writer_shapes(shapes, "", &walk, emit_fn, warner);
 }
@@ -1200,8 +2124,8 @@ bool emit_draw_shapes(const Reference<css::text::XTextDocument>& text_doc,
 // the draw-shape pass instead, so the two passes never overlap.
 bool emit_text_frames(const Reference<css::text::XTextDocument>& text_doc,
                       const Reference<css::text::XTextViewCursor>& cursor,
-                      CaretSpace* space, const EmitFn& emit_fn,
-                      Warner& warner) {
+                      CaretSpace* space, MarkerCollector* marks,
+                      const EmitFn& emit_fn, Warner& warner) {
   Reference<css::text::XTextFramesSupplier> supplier(text_doc, UNO_QUERY);
   if (!supplier.is()) return true;
   Reference<css::container::XIndexAccess> frames(supplier->getTextFrames(),
@@ -1262,7 +2186,8 @@ bool emit_text_frames(const Reference<css::text::XTextDocument>& text_doc,
         props->getPropertyValue("ChainPrevName") >>= chain;
         out->set_chain_prev(utf8(chain));
       }
-      flatten_text_runs(frame->getText(), label, out->mutable_runs(), warner);
+      flatten_text_runs(frame->getText(), label, out->mutable_runs(), marks,
+                        warner);
     } catch (const css::uno::Exception& error) {
       warner.warn(label + " extraction failed", error);
     }
@@ -1339,7 +2264,7 @@ bool emit_shapes(const Reference<css::drawing::XShapes>& shapes,
       Reference<css::text::XText> text(shape, UNO_QUERY);
       if (text.is()) {
         out->set_has_text(!text->getString().isEmpty());
-        flatten_text_runs(text, label, out->mutable_runs(), warner);
+        flatten_text_runs(text, label, out->mutable_runs(), nullptr, warner);
       }
     }
     Reference<css::drawing::XShapes> children;
@@ -1514,7 +2439,7 @@ bool emit_slide_shape(const Reference<css::drawing::XShape>& shape,
       }
       fill_runs(paragraph,
                 label + " paragraph " + std::to_string(paragraph_index),
-                para->mutable_runs(), nullptr, warner);
+                para->mutable_runs(), nullptr, nullptr, warner);
       paragraph_index++;
     }
   }
@@ -1549,9 +2474,54 @@ bool emit_slide_shape(const Reference<css::drawing::XShape>& shape,
 // header, then its shapes in paint order, then the speaker-notes shape of
 // its notes page. Slide.index matches the LibreOfficeKit part index and
 // PageImage.index, so no correlation logic is needed.
+// Emits every annotation of one slide as a Comment event with the slide's
+// index as its page and the annotation's slide-local position as its
+// anchor.
+bool emit_slide_annotations(const Reference<css::drawing::XDrawPage>& slide,
+                            int32_t slide_index, int32_t* comment_index,
+                            const EmitFn& emit_fn, Warner& warner) {
+  std::string label = "slide " + std::to_string(slide_index) + " annotations";
+  try {
+    Reference<css::office::XAnnotationAccess> access(slide, UNO_QUERY);
+    if (!access.is()) return true;
+    Reference<css::office::XAnnotationEnumeration> annotations =
+        access->createAnnotationEnumeration();
+    if (!annotations.is()) return true;
+    while (annotations->hasMoreElements()) {
+      Reference<css::office::XAnnotation> annotation =
+          annotations->nextElement();
+      if (!annotation.is()) continue;
+      officev1::StreamPagesResponse event;
+      officev1::Comment* out = event.mutable_comment();
+      out->set_index((*comment_index)++);
+      out->set_page_index(slide_index);
+      out->set_char_start(-1);
+      out->set_char_end(-1);
+      out->set_author(utf8(annotation->getAuthor()));
+      out->set_initials(utf8(annotation->getInitials()));
+      out->set_epoch_ms(datetime_epoch_ms(annotation->getDateTime()));
+      css::geometry::RealPoint2D position = annotation->getPosition();
+      // Annotation positions are in millimeters (the office core's
+      // RealPoint2D convention for annotations), converted to twips like
+      // every other coordinate: 1 mm = 100 hundredths.
+      out->mutable_anchor()->set_x(
+          hundredth_mm_to_twips(static_cast<long>(position.X * 100.0)));
+      out->mutable_anchor()->set_y(
+          hundredth_mm_to_twips(static_cast<long>(position.Y * 100.0)));
+      Reference<css::text::XText> text(annotation->getTextRange());
+      if (text.is()) out->set_text(utf8(text->getString()));
+      if (!emit_fn(event)) return false;
+    }
+  } catch (const css::uno::Exception& error) {
+    warner.warn(label + " walk failed", error);
+  }
+  return true;
+}
+
 bool emit_presentation_content(
     const Reference<css::drawing::XDrawPagesSupplier>& supplier,
-    const EmitFn& emit_fn, Warner& warner) {
+    const PartSelection& parts, const EmitFn& emit_fn, Warner& warner) {
+  int32_t comment_index = 0;
   Reference<css::drawing::XDrawPages> pages = supplier->getDrawPages();
   if (!pages.is()) {
     warner.warn("presentation document has no slides");
@@ -1568,6 +2538,15 @@ bool emit_presentation_content(
       continue;
     }
     if (!slide.is()) continue;
+
+    // A comments-only selection walks just the annotations.
+    if (!parts.wants(officev1::DOCUMENT_PART_SLIDES)) {
+      if (!emit_slide_annotations(slide, static_cast<int32_t>(i),
+                                  &comment_index, emit_fn, warner)) {
+        return false;
+      }
+      continue;
+    }
 
     officev1::StreamPagesResponse slide_event;
     officev1::Slide* out = slide_event.mutable_slide();
@@ -1658,6 +2637,13 @@ bool emit_presentation_content(
       }
     } catch (const css::uno::Exception& error) {
       warner.warn(label + " notes page walk failed", error);
+    }
+
+    if (parts.wants(officev1::DOCUMENT_PART_COMMENTS)) {
+      if (!emit_slide_annotations(slide, static_cast<int32_t>(i),
+                                  &comment_index, emit_fn, warner)) {
+        return false;
+      }
     }
   }
   return true;
@@ -2559,8 +3545,8 @@ bool emit_embedded_objects(const Reference<css::frame::XModel>& model,
 
 bool emit_notes(const Reference<css::text::XTextDocument>& text_doc,
                 const Reference<css::text::XTextViewCursor>& cursor,
-                CaretSpace* space, bool endnotes, const EmitFn& emit_fn,
-                Warner& warner) {
+                CaretSpace* space, bool endnotes, MarkerCollector* marks,
+                const EmitFn& emit_fn, Warner& warner) {
   Reference<css::container::XIndexAccess> notes;
   if (endnotes) {
     Reference<css::text::XEndnotesSupplier> supplier(text_doc, UNO_QUERY);
@@ -2595,7 +3581,7 @@ bool emit_notes(const Reference<css::text::XTextDocument>& text_doc,
                out->mutable_anchor(), &page_index, warner);
       out->set_page_index(page_index);
       flatten_text_runs(Reference<css::text::XText>(note, UNO_QUERY), label,
-                        out->mutable_runs(), warner);
+                        out->mutable_runs(), marks, warner);
     } catch (const css::uno::Exception& error) {
       warner.warn(label + " extraction failed", error);
     }
@@ -2606,8 +3592,8 @@ bool emit_notes(const Reference<css::text::XTextDocument>& text_doc,
 
 bool emit_document_indexes(const Reference<css::text::XTextDocument>& text_doc,
                            const Reference<css::text::XTextViewCursor>& cursor,
-                           CaretSpace* space, const EmitFn& emit_fn,
-                           Warner& warner) {
+                           CaretSpace* space, MarkerCollector* marks,
+                           const EmitFn& emit_fn, Warner& warner) {
   Reference<css::text::XDocumentIndexesSupplier> supplier(text_doc, UNO_QUERY);
   if (!supplier.is()) return true;
   Reference<css::container::XIndexAccess> indexes(supplier->getDocumentIndexes(),
@@ -2652,7 +3638,8 @@ bool emit_document_indexes(const Reference<css::text::XTextDocument>& text_doc,
               Reference<css::container::XEnumerationAccess> paragraph(
                   paragraphs->nextElement(), UNO_QUERY);
               if (paragraph.is()) {
-                fill_runs(paragraph, label, out->mutable_runs(), nullptr, warner);
+                fill_runs(paragraph, label, out->mutable_runs(), nullptr,
+                          marks, warner);
               }
             }
           }
@@ -2667,8 +3654,8 @@ bool emit_document_indexes(const Reference<css::text::XTextDocument>& text_doc,
 }
 
 bool emit_page_styles(const Reference<css::frame::XModel>& model,
-                      const PartSelection& parts, const EmitFn& emit_fn,
-                      Warner& warner) {
+                      const PartSelection& parts, MarkerCollector* marks,
+                      const EmitFn& emit_fn, Warner& warner) {
   Reference<css::style::XStyleFamiliesSupplier> supplier(model, UNO_QUERY);
   if (!supplier.is()) return true;
   Reference<css::container::XNameAccess> families = supplier->getStyleFamilies();
@@ -2749,7 +3736,7 @@ bool emit_page_styles(const Reference<css::frame::XModel>& model,
           while (paragraphs->hasMoreElements()) {
             officev1::Paragraph paragraph;
             if (fill_paragraph(paragraphs->nextElement(), index, no_cursor,
-                               nullptr, nullptr, nullptr, &paragraph,
+                               nullptr, nullptr, nullptr, marks, &paragraph,
                                warner)) {
               *header_footer->add_paragraphs() = paragraph;
               index++;
@@ -2784,11 +3771,24 @@ bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
 
   bool want_paragraphs = parts.wants(officev1::DOCUMENT_PART_PARAGRAPHS);
   bool want_tables = parts.wants(officev1::DOCUMENT_PART_TABLES);
+  bool want_markers = parts.wants(officev1::DOCUMENT_PART_COMMENTS) ||
+                      parts.wants(officev1::DOCUMENT_PART_TRACKED_CHANGES) ||
+                      parts.wants(officev1::DOCUMENT_PART_BOOKMARKS) ||
+                      parts.wants(officev1::DOCUMENT_PART_FORM_FIELDS);
+  // The marker collector rides every portion walk, so comment, bookmark,
+  // tracked-change, and form-field boundaries are observed exactly where
+  // the annotation-space offsets are counted.
+  std::optional<MarkerCollector> collector;
+  MarkerCollector* marks = nullptr;
+  if (want_markers) {
+    collector.emplace(parts, cursor, &caret_space, emit_fn, warner);
+    marks = &*collector;
+  }
   // The probe may be live for the explicit per-cell table part alone; the
   // paragraph and image measurements still key on LINE_RECTS.
   SelectionProbe* line_probe =
       parts.wants(officev1::DOCUMENT_PART_LINE_RECTS) ? probe : nullptr;
-  if (want_paragraphs || want_tables) {
+  if (want_paragraphs || want_tables || want_markers) {
     Reference<css::container::XEnumerationAccess> body(text_doc->getText(),
                                                        UNO_QUERY);
     if (!body.is()) {
@@ -2799,6 +3799,10 @@ bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
     int32_t paragraph_index = 0;
     int32_t table_index = 0;
     int64_t annotation_offset = 0;
+    // When only markers want the body walk, the caret and line-rectangle
+    // measurements behind the unselected paragraph part stay skipped.
+    Reference<css::text::XTextViewCursor> paragraph_cursor =
+        want_paragraphs ? cursor : Reference<css::text::XTextViewCursor>();
     while (elements->hasMoreElements()) {
       css::uno::Any element = elements->nextElement();
       Reference<css::text::XTextTable> table(element, UNO_QUERY);
@@ -2809,47 +3813,62 @@ bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
             return false;
           }
         }
+        if (marks != nullptr) {
+          walk_table_marks(table, "table " + std::to_string(table_index),
+                           marks, warner);
+          if (marks->failed()) return false;
+        }
         table_index++;
         continue;
       }
-      if (!want_paragraphs) continue;
+      if (!want_paragraphs && marks == nullptr) continue;
       officev1::StreamPagesResponse event;
-      if (!fill_paragraph(element, paragraph_index, cursor, &caret_space,
-                          &annotation_offset, line_probe,
+      if (!fill_paragraph(element, paragraph_index, paragraph_cursor,
+                          &caret_space, &annotation_offset, line_probe, marks,
                           event.mutable_paragraph(), warner)) {
         continue;
       }
-      if (!emit_fn(event)) return false;
+      if (want_paragraphs && !emit_fn(event)) return false;
+      if (marks != nullptr && marks->failed()) return false;
       paragraph_index++;
     }
   }
   if (parts.wants(officev1::DOCUMENT_PART_FOOTNOTES)) {
-    if (!emit_notes(text_doc, cursor, &caret_space, false, emit_fn, warner)) {
+    if (!emit_notes(text_doc, cursor, &caret_space, false, marks, emit_fn,
+                    warner)) {
       return false;
     }
-    if (!emit_notes(text_doc, cursor, &caret_space, true, emit_fn, warner)) {
+    if (!emit_notes(text_doc, cursor, &caret_space, true, marks, emit_fn,
+                    warner)) {
       return false;
     }
   }
   if (parts.wants(officev1::DOCUMENT_PART_INDEXES)) {
-    if (!emit_document_indexes(text_doc, cursor, &caret_space, emit_fn,
+    if (!emit_document_indexes(text_doc, cursor, &caret_space, marks, emit_fn,
                                warner)) {
       return false;
     }
   }
   if (parts.wants(officev1::DOCUMENT_PART_PAGE_STYLES) ||
       parts.wants(officev1::DOCUMENT_PART_HEADERS_FOOTERS)) {
-    if (!emit_page_styles(model, parts, emit_fn, warner)) return false;
+    if (!emit_page_styles(model, parts, marks, emit_fn, warner)) return false;
   }
   if (parts.wants(officev1::DOCUMENT_PART_TEXT_FRAMES)) {
-    if (!emit_text_frames(text_doc, cursor, &caret_space, emit_fn, warner)) {
+    if (!emit_text_frames(text_doc, cursor, &caret_space, marks, emit_fn,
+                          warner)) {
       return false;
     }
   }
   if (parts.wants(officev1::DOCUMENT_PART_IMAGES) ||
-      parts.wants(officev1::DOCUMENT_PART_SHAPES)) {
-    return emit_draw_shapes(text_doc, context, cursor, &caret_space, parts,
-                            line_probe, emit_fn, warner);
+      parts.wants(officev1::DOCUMENT_PART_SHAPES) ||
+      (parts.wants(officev1::DOCUMENT_PART_FORM_FIELDS) && marks != nullptr)) {
+    if (!emit_draw_shapes(text_doc, context, cursor, &caret_space, parts,
+                          line_probe, marks, emit_fn, warner)) {
+      return false;
+    }
+  }
+  if (marks != nullptr) {
+    return marks->finish(text_doc, model);
   }
   return true;
 }
@@ -2909,7 +3928,11 @@ bool emit_typed_content(const PartSelection& parts, SelectionProbe* probe,
           parts.wants(officev1::DOCUMENT_PART_PAGE_STYLES) ||
           parts.wants(officev1::DOCUMENT_PART_INDEXES) ||
           parts.wants(officev1::DOCUMENT_PART_TEXT_FRAMES) ||
-          parts.wants(officev1::DOCUMENT_PART_SHAPES);
+          parts.wants(officev1::DOCUMENT_PART_SHAPES) ||
+          parts.wants(officev1::DOCUMENT_PART_COMMENTS) ||
+          parts.wants(officev1::DOCUMENT_PART_TRACKED_CHANGES) ||
+          parts.wants(officev1::DOCUMENT_PART_BOOKMARKS) ||
+          parts.wants(officev1::DOCUMENT_PART_FORM_FIELDS);
       if (!wants_text_part) return true;
       return emit_text_content(text_doc, context, parts, probe, emit_fn,
                                warner);
@@ -2929,10 +3952,13 @@ bool emit_typed_content(const PartSelection& parts, SelectionProbe* probe,
     // reports only for Impress.
     if (info.is() && info->supportsService(
                          "com.sun.star.presentation.PresentationDocument")) {
-      if (!parts.wants(officev1::DOCUMENT_PART_SLIDES)) return true;
+      if (!parts.wants(officev1::DOCUMENT_PART_SLIDES) &&
+          !parts.wants(officev1::DOCUMENT_PART_COMMENTS)) {
+        return true;
+      }
       Reference<css::drawing::XDrawPagesSupplier> slides(model, UNO_QUERY);
       if (slides.is()) {
-        return emit_presentation_content(slides, emit_fn, warner);
+        return emit_presentation_content(slides, parts, emit_fn, warner);
       }
       return true;
     }

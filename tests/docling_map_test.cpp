@@ -866,6 +866,203 @@ void verify_partial_stream() {
           "partial: arenas empty");
 }
 
+// Comments, tracked changes, bookmarks, form fields, and run hyperlinks
+// fold into the comment section, the body metadata, and the form area.
+void verify_marks_stream() {
+  grlibre::DoclingMapper mapper;
+  mapper.consume(info_event("text", 1, 15840));
+  {
+    officev1::StreamPagesResponse event;
+    officev1::Paragraph* paragraph = event.mutable_paragraph();
+    paragraph->set_index(0);
+    paragraph->set_page_index(0);
+    paragraph->set_list_level(-1);
+    paragraph->set_page_number_offset(-1);
+    paragraph->set_char_offset(0);
+    officev1::TextRun* plain = paragraph->add_runs();
+    plain->set_text("See ");
+    plain->set_char_offset(0);
+    plain->set_char_length(4);
+    officev1::TextRun* linked = paragraph->add_runs();
+    linked->set_text("the docs");
+    linked->set_char_offset(4);
+    linked->set_char_length(8);
+    linked->set_hyperlink_url("https://example.test/docs");
+    linked->set_hyperlink_target("_blank");
+    officev1::TextRun* linked_bold = paragraph->add_runs();
+    linked_bold->set_text(" now");
+    linked_bold->set_char_offset(12);
+    linked_bold->set_char_length(4);
+    linked_bold->set_weight(150.0f);
+    linked_bold->set_hyperlink_url("https://example.test/docs");
+    linked_bold->set_hyperlink_target("_blank");
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::Comment* comment = event.mutable_comment();
+    comment->set_index(0);
+    comment->set_name("cmt1");
+    comment->set_author("Alice");
+    comment->set_initials("A");
+    comment->set_epoch_ms(1700000000000);
+    comment->set_text("Please fix");
+    comment->set_resolved(true);
+    comment->set_char_start(4);
+    comment->set_char_end(12);
+    comment->set_anchored_text("the docs");
+    comment->set_page_index(0);
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::TrackedChange* change = event.mutable_tracked_change();
+    change->set_index(0);
+    change->set_kind(officev1::TRACKED_CHANGE_KIND_INSERT);
+    change->set_kind_name("Insert");
+    change->set_author("Bob");
+    change->set_char_start(0);
+    change->set_char_end(4);
+    change->set_changed_text("See ");
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::Bookmark* bookmark = event.mutable_bookmark();
+    bookmark->set_index(0);
+    bookmark->set_name("mark1");
+    bookmark->set_char_start(4);
+    bookmark->set_char_end(12);
+    bookmark->set_covered_text("the docs");
+    bookmark->set_page_index(0);
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::FormField* field = event.mutable_form_field();
+    field->set_index(0);
+    field->set_kind(officev1::FORM_FIELD_KIND_CHECKBOX);
+    field->set_field_type("vnd.oasis.opendocument.field.FORMCHECKBOX");
+    field->set_name("check1");
+    field->set_checked(true);
+    field->set_char_start(16);
+    field->set_char_end(16);
+    field->set_selected_index(-1);
+    officev1::FormFieldParameter* parameter = field->add_parameters();
+    parameter->set_name("Checkbox_Checked");
+    parameter->set_bool_value(true);
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::FormField* field = event.mutable_form_field();
+    field->set_index(1);
+    field->set_kind(officev1::FORM_FIELD_KIND_DROPDOWN);
+    field->set_field_type("vnd.oasis.opendocument.field.FORMDROPDOWN");
+    field->set_name("drop1");
+    field->set_text("beta");
+    field->set_selected_index(1);
+    field->add_list_entries("alpha");
+    field->add_list_entries("beta");
+    field->set_char_start(17);
+    field->set_char_end(17);
+    mapper.consume(event);
+  }
+  mapper.consume(status_event(""));
+
+  require_integrity(mapper, "marks");
+  const docv1::Document& document = mapper.document();
+
+  const docv1::TextItemBase* paragraph =
+      find_text(document, docv1::DOC_ITEM_LABEL_TEXT);
+  require(paragraph != nullptr && paragraph->text() == "See the docs now",
+          "marks: paragraph folded");
+  require(paragraph->hyperlink() == "https://example.test/docs",
+          "marks: first hyperlink lands in the docling slot");
+  const auto& link_fields = paragraph->meta().custom_fields();
+  require(link_fields.count("hyperlinks") == 1, "marks: hyperlinks recorded");
+  const auto& links = link_fields.at("hyperlinks").list_value();
+  require(links.values_size() == 1,
+          "marks: adjacent runs of one link merge into one entry");
+  const auto& link = links.values(0).struct_value().fields();
+  require(link.at("url").string_value() == "https://example.test/docs" &&
+              link.at("target").string_value() == "_blank" &&
+              link.at("char_start").number_value() == 4 &&
+              link.at("char_end").number_value() == 16,
+          "marks: the merged link spans both runs");
+
+  const docv1::GroupItem* comments = nullptr;
+  const docv1::GroupItem* form_area = nullptr;
+  for (const docv1::GroupItem& group : document.groups()) {
+    if (group.label() == docv1::GROUP_LABEL_COMMENT_SECTION) comments = &group;
+    if (group.label() == docv1::GROUP_LABEL_FORM_AREA) form_area = &group;
+  }
+  require(comments != nullptr && comments->children_size() == 1,
+          "marks: one comment in the comment section");
+  require(comments->parent().ref() == "#/furniture",
+          "marks: comments live in furniture");
+  bool comment_ok = false;
+  for (const docv1::BaseTextItem& item : document.texts()) {
+    const docv1::TextItemBase& base = base_of(item);
+    if (base.text() != "Please fix") continue;
+    const auto& fields = base.meta().custom_fields();
+    comment_ok = fields.at("author").string_value() == "Alice" &&
+                 fields.at("resolved").bool_value() &&
+                 fields.at("char_start").number_value() == 4 &&
+                 fields.at("char_end").number_value() == 12 &&
+                 fields.at("anchored_text").string_value() == "the docs" &&
+                 fields.at("date_ms").number_value() == 1700000000000.0;
+  }
+  require(comment_ok, "marks: comment carries author, span, and state");
+
+  const auto& body_fields = document.body().meta().custom_fields();
+  require(body_fields.count("tracked_change:0") == 1,
+          "marks: tracked change recorded on the body");
+  const auto& change = body_fields.at("tracked_change:0").struct_value();
+  require(change.fields().at("kind").string_value() == "Insert" &&
+              change.fields().at("author").string_value() == "Bob" &&
+              change.fields().at("char_start").number_value() == 0 &&
+              change.fields().at("char_end").number_value() == 4 &&
+              change.fields().at("text").string_value() == "See ",
+          "marks: tracked change carries kind, author, and span");
+  require(body_fields.count("bookmark:mark1") == 1,
+          "marks: bookmark recorded on the body");
+  const auto& mark = body_fields.at("bookmark:mark1").struct_value();
+  require(mark.fields().at("char_start").number_value() == 4 &&
+              mark.fields().at("char_end").number_value() == 12 &&
+              mark.fields().at("text").string_value() == "the docs",
+          "marks: bookmark carries its span and covered text");
+
+  require(form_area != nullptr && form_area->children_size() == 2,
+          "marks: both form fields land in the form area");
+  const docv1::TextItemBase* checkbox =
+      find_text(document, docv1::DOC_ITEM_LABEL_CHECKBOX_SELECTED);
+  require(checkbox != nullptr, "marks: checked checkbox gets the selected label");
+  const auto& checkbox_fields = checkbox->meta().custom_fields();
+  require(checkbox_fields.at("checked").bool_value() &&
+              checkbox_fields.at("name").string_value() == "check1" &&
+              checkbox_fields.at("param:Checkbox_Checked").bool_value(),
+          "marks: checkbox state and parameters survive");
+  bool dropdown_ok = false;
+  for (const docv1::BaseTextItem& item : document.texts()) {
+    const docv1::TextItemBase& base = base_of(item);
+    if (base.meta().custom_fields().count("selected_index") == 0) continue;
+    const auto& fields = base.meta().custom_fields();
+    dropdown_ok = base.text() == "beta" &&
+                  fields.at("selected_index").number_value() == 1 &&
+                  fields.at("list_entries").list_value().values_size() == 2;
+  }
+  require(dropdown_ok, "marks: dropdown selection and entries survive");
+
+  // Every folded item still carries the collector source.
+  for (const docv1::BaseTextItem& item : document.texts()) {
+    const docv1::TextItemBase& base = base_of(item);
+    require(base.source_size() == 1 &&
+                base.source(0).collector().collector() == "libreoffice",
+            "marks: items carry the libreoffice collector source");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -874,6 +1071,7 @@ int main() {
   verify_impress_stream();
   verify_draw_stream();
   verify_partial_stream();
+  verify_marks_stream();
   std::cout << "docling_map_test passed\n";
   return 0;
 }

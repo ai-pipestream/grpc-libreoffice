@@ -45,7 +45,17 @@ at STANDARD plus COMMENTS):
   and text-chain names), and `Shape` events for text-bearing draw-page
   shapes, imported textboxes included; draw-page groups are recursed, each
   group emitted as its own `Shape` event with `is_group` and its children
-  naming their ancestors through `group_path`. Drawing documents emit `DrawingShape` events (shape type, name,
+  naming their ancestors through `group_path`. Text documents also emit
+  `Comment` events (author, initials, date, content, resolved state, reply
+  threading, and the anchored range's span and covered text), `TrackedChange`
+  events (kind, author, date, span, changed text, and nesting data),
+  `Bookmark` events (name, span, covered text), and `FormField` events for
+  in-text fieldmarks (checkbox state, dropdown entries and selection, text
+  content, every stored parameter) and draw-page form controls (label,
+  state, geometry); runs everywhere carry their hyperlink URL, target, and
+  name, so link spans fall out of the run offsets. Presentations emit
+  slide annotations as `Comment` events with slide-local positions.
+  Drawing documents emit `DrawingShape` events (shape type, name,
   position and size in twips, rotation, group nesting, text runs) in
   page-then-paint order, plus `EmbeddedImage` events for image shapes.
   Embedded objects emit `EmbeddedObject` events for every document class:
