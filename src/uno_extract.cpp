@@ -655,11 +655,17 @@ void flatten_text_runs(const Reference<css::text::XText>& text,
 // shape and recursing through groups. The container-scoped contract (one
 // call per XShapes, group_path carrying nesting) is what presentation
 // extraction will reuse. image_counter numbers the EmbeddedImage events
-// emitted for image shapes across the whole document.
+// emitted for image shapes across the whole document. DrawingShape events
+// are gated on the SHAPES part and image bytes on the IMAGES part; groups
+// are still recursed when only IMAGES is selected so nested image shapes
+// are found.
 bool emit_shapes(const Reference<css::drawing::XShapes>& shapes,
                  int32_t page_index, const std::string& group_path,
                  const Reference<css::graphic::XGraphicProvider>& provider,
-                 int32_t* image_counter, const EmitFn& emit_fn, Warner& warner) {
+                 int32_t* image_counter, const PartSelection& parts,
+                 const EmitFn& emit_fn, Warner& warner) {
+  bool want_shapes = parts.wants(officev1::DOCUMENT_PART_SHAPES);
+  bool want_images = parts.wants(officev1::DOCUMENT_PART_IMAGES);
   for (sal_Int32 i = 0; i < shapes->getCount(); i++) {
     std::string shape_path = group_path.empty()
                                  ? std::to_string(i)
@@ -674,12 +680,15 @@ bool emit_shapes(const Reference<css::drawing::XShapes>& shapes,
       continue;
     }
     if (!shape.is()) continue;
+    std::string shape_type = utf8(shape->getShapeType());
+    // The DrawingShape event doubles as the scratch for the name and
+    // geometry the image event reuses, so those cheap fields fill in even
+    // when the SHAPES part is off; the expensive text-run walk stays gated.
     officev1::StreamPagesResponse event;
     officev1::DrawingShape* out = event.mutable_drawing_shape();
     out->set_page_index(page_index);
     out->set_z_order(i);
     out->set_group_path(group_path);
-    std::string shape_type = utf8(shape->getShapeType());
     out->set_shape_type(shape_type);
     Reference<css::container::XNamed> named(shape, UNO_QUERY);
     if (named.is()) out->set_name(utf8(named->getName()));
@@ -694,7 +703,7 @@ bool emit_shapes(const Reference<css::drawing::XShapes>& shapes,
       warner.warn(label + " geometry query failed", error);
     }
     Reference<css::beans::XPropertySet> props(shape, UNO_QUERY);
-    if (props.is()) {
+    if (want_shapes && props.is()) {
       try {
         sal_Int32 rotation = 0;
         props->getPropertyValue("RotateAngle") >>= rotation;
@@ -706,25 +715,28 @@ bool emit_shapes(const Reference<css::drawing::XShapes>& shapes,
         warner.warn(label + " rotation query failed", error);
       }
     }
-    Reference<css::text::XText> text(shape, UNO_QUERY);
-    if (text.is()) {
-      out->set_has_text(!text->getString().isEmpty());
-      flatten_text_runs(text, label, out->mutable_runs(), warner);
+    if (want_shapes) {
+      Reference<css::text::XText> text(shape, UNO_QUERY);
+      if (text.is()) {
+        out->set_has_text(!text->getString().isEmpty());
+        flatten_text_runs(text, label, out->mutable_runs(), warner);
+      }
     }
     Reference<css::drawing::XShapes> children;
     if (shape_type == "com.sun.star.drawing.GroupShape") {
       children = Reference<css::drawing::XShapes>(shape, UNO_QUERY);
     }
     out->set_is_group(children.is());
-    if (!emit_fn(event)) return false;
+    if (want_shapes && !emit_fn(event)) return false;
     if (children.is()) {
       if (!emit_shapes(children, page_index, shape_path, provider,
-                       image_counter, emit_fn, warner)) {
+                       image_counter, parts, emit_fn, warner)) {
         return false;
       }
       continue;
     }
-    if (shape_type == "com.sun.star.drawing.GraphicObjectShape" && props.is()) {
+    if (want_images &&
+        shape_type == "com.sun.star.drawing.GraphicObjectShape" && props.is()) {
       Reference<css::graphic::XGraphic> graphic;
       try {
         props->getPropertyValue("Graphic") >>= graphic;
@@ -756,14 +768,16 @@ bool emit_shapes(const Reference<css::drawing::XShapes>& shapes,
 bool emit_drawing_content(
     const Reference<css::drawing::XDrawPagesSupplier>& supplier,
     const Reference<css::uno::XComponentContext>& context,
-    const EmitFn& emit_fn, Warner& warner) {
+    const PartSelection& parts, const EmitFn& emit_fn, Warner& warner) {
   Reference<css::drawing::XDrawPages> pages = supplier->getDrawPages();
   if (!pages.is()) {
     warner.warn("drawing document has no draw pages");
     return true;
   }
-  Reference<css::graphic::XGraphicProvider> provider =
-      graphic_provider(context, warner);
+  Reference<css::graphic::XGraphicProvider> provider;
+  if (parts.wants(officev1::DOCUMENT_PART_IMAGES)) {
+    provider = graphic_provider(context, warner);
+  }
   int32_t image_counter = 0;
   for (sal_Int32 p = 0; p < pages->getCount(); p++) {
     Reference<css::drawing::XShapes> page;
@@ -775,7 +789,7 @@ bool emit_drawing_content(
     }
     if (!page.is()) continue;
     if (!emit_shapes(page, static_cast<int32_t>(p), "", provider,
-                     &image_counter, emit_fn, warner)) {
+                     &image_counter, parts, emit_fn, warner)) {
       return false;
     }
   }
@@ -890,7 +904,8 @@ bool emit_document_indexes(const Reference<css::text::XTextDocument>& text_doc,
 }
 
 bool emit_page_styles(const Reference<css::frame::XModel>& model,
-                      const EmitFn& emit_fn, Warner& warner) {
+                      const PartSelection& parts, const EmitFn& emit_fn,
+                      Warner& warner) {
   Reference<css::style::XStyleFamiliesSupplier> supplier(model, UNO_QUERY);
   if (!supplier.is()) return true;
   Reference<css::container::XNameAccess> families = supplier->getStyleFamilies();
@@ -917,32 +932,37 @@ bool emit_page_styles(const Reference<css::frame::XModel>& model,
     std::string name = utf8(style->getName());
     std::string label = "page style " + name;
 
-    officev1::StreamPagesResponse geometry_event;
-    officev1::PageStyleInfo* out = geometry_event.mutable_page_style();
-    out->set_name(name);
-    out->set_columns(1);
-    try {
-      sal_Int32 width = 0, height = 0, left = 0, right = 0, top = 0, bottom = 0;
-      props->getPropertyValue("Width") >>= width;
-      props->getPropertyValue("Height") >>= height;
-      props->getPropertyValue("LeftMargin") >>= left;
-      props->getPropertyValue("RightMargin") >>= right;
-      props->getPropertyValue("TopMargin") >>= top;
-      props->getPropertyValue("BottomMargin") >>= bottom;
-      out->set_width_twips(hundredth_mm_to_twips(width));
-      out->set_height_twips(hundredth_mm_to_twips(height));
-      out->set_margin_left_twips(hundredth_mm_to_twips(left));
-      out->set_margin_right_twips(hundredth_mm_to_twips(right));
-      out->set_margin_top_twips(hundredth_mm_to_twips(top));
-      out->set_margin_bottom_twips(hundredth_mm_to_twips(bottom));
-      Reference<css::text::XTextColumns> columns;
-      props->getPropertyValue("TextColumns") >>= columns;
-      if (columns.is()) out->set_columns(std::max<sal_Int16>(1, columns->getColumnCount()));
-    } catch (const css::uno::Exception& error) {
-      warner.warn(label + " geometry query failed", error);
+    if (parts.wants(officev1::DOCUMENT_PART_PAGE_STYLES)) {
+      officev1::StreamPagesResponse geometry_event;
+      officev1::PageStyleInfo* out = geometry_event.mutable_page_style();
+      out->set_name(name);
+      out->set_columns(1);
+      try {
+        sal_Int32 width = 0, height = 0, left = 0, right = 0, top = 0, bottom = 0;
+        props->getPropertyValue("Width") >>= width;
+        props->getPropertyValue("Height") >>= height;
+        props->getPropertyValue("LeftMargin") >>= left;
+        props->getPropertyValue("RightMargin") >>= right;
+        props->getPropertyValue("TopMargin") >>= top;
+        props->getPropertyValue("BottomMargin") >>= bottom;
+        out->set_width_twips(hundredth_mm_to_twips(width));
+        out->set_height_twips(hundredth_mm_to_twips(height));
+        out->set_margin_left_twips(hundredth_mm_to_twips(left));
+        out->set_margin_right_twips(hundredth_mm_to_twips(right));
+        out->set_margin_top_twips(hundredth_mm_to_twips(top));
+        out->set_margin_bottom_twips(hundredth_mm_to_twips(bottom));
+        Reference<css::text::XTextColumns> columns;
+        props->getPropertyValue("TextColumns") >>= columns;
+        if (columns.is()) {
+          out->set_columns(std::max<sal_Int16>(1, columns->getColumnCount()));
+        }
+      } catch (const css::uno::Exception& error) {
+        warner.warn(label + " geometry query failed", error);
+      }
+      if (!emit_fn(geometry_event)) return false;
     }
-    if (!emit_fn(geometry_event)) return false;
 
+    if (!parts.wants(officev1::DOCUMENT_PART_HEADERS_FOOTERS)) continue;
     for (bool footer : {false, true}) {
       try {
         sal_Bool enabled = false;
@@ -984,7 +1004,8 @@ bool emit_page_styles(const Reference<css::frame::XModel>& model,
 
 bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
                        const Reference<css::uno::XComponentContext>& context,
-                       const EmitFn& emit_fn, Warner& warner) {
+                       const PartSelection& parts, const EmitFn& emit_fn,
+                       Warner& warner) {
   Reference<css::frame::XModel> model(text_doc, UNO_QUERY);
   Reference<css::text::XTextViewCursor> cursor;
   if (model.is()) {
@@ -996,41 +1017,62 @@ bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
     warner.warn("no view cursor, layout positions will be missing");
   }
 
-  Reference<css::container::XEnumerationAccess> body(text_doc->getText(), UNO_QUERY);
-  if (!body.is()) {
-    warner.warn("document body is not enumerable");
-    return true;
-  }
-  Reference<css::container::XEnumeration> elements = body->createEnumeration();
-  int32_t paragraph_index = 0;
-  int32_t table_index = 0;
-  int64_t annotation_offset = 0;
-  while (elements->hasMoreElements()) {
-    css::uno::Any element = elements->nextElement();
-    Reference<css::text::XTextTable> table(element, UNO_QUERY);
-    if (table.is()) {
-      if (!emit_table(table, table_index, cursor, emit_fn, warner)) return false;
-      table_index++;
-      continue;
+  bool want_paragraphs = parts.wants(officev1::DOCUMENT_PART_PARAGRAPHS);
+  bool want_tables = parts.wants(officev1::DOCUMENT_PART_TABLES);
+  if (want_paragraphs || want_tables) {
+    Reference<css::container::XEnumerationAccess> body(text_doc->getText(),
+                                                       UNO_QUERY);
+    if (!body.is()) {
+      warner.warn("document body is not enumerable");
+      return true;
     }
-    officev1::StreamPagesResponse event;
-    if (!fill_paragraph(element, paragraph_index, cursor, &annotation_offset,
-                        event.mutable_paragraph(), warner)) {
-      continue;
+    Reference<css::container::XEnumeration> elements = body->createEnumeration();
+    int32_t paragraph_index = 0;
+    int32_t table_index = 0;
+    int64_t annotation_offset = 0;
+    while (elements->hasMoreElements()) {
+      css::uno::Any element = elements->nextElement();
+      Reference<css::text::XTextTable> table(element, UNO_QUERY);
+      if (table.is()) {
+        if (want_tables) {
+          if (!emit_table(table, table_index, cursor, emit_fn, warner)) {
+            return false;
+          }
+        }
+        table_index++;
+        continue;
+      }
+      if (!want_paragraphs) continue;
+      officev1::StreamPagesResponse event;
+      if (!fill_paragraph(element, paragraph_index, cursor, &annotation_offset,
+                          event.mutable_paragraph(), warner)) {
+        continue;
+      }
+      if (!emit_fn(event)) return false;
+      paragraph_index++;
     }
-    if (!emit_fn(event)) return false;
-    paragraph_index++;
   }
-  if (!emit_notes(text_doc, cursor, false, emit_fn, warner)) return false;
-  if (!emit_notes(text_doc, cursor, true, emit_fn, warner)) return false;
-  if (!emit_document_indexes(text_doc, cursor, emit_fn, warner)) return false;
-  if (!emit_page_styles(model, emit_fn, warner)) return false;
-  return emit_images(text_doc, context, cursor, emit_fn, warner);
+  if (parts.wants(officev1::DOCUMENT_PART_FOOTNOTES)) {
+    if (!emit_notes(text_doc, cursor, false, emit_fn, warner)) return false;
+    if (!emit_notes(text_doc, cursor, true, emit_fn, warner)) return false;
+  }
+  if (parts.wants(officev1::DOCUMENT_PART_INDEXES)) {
+    if (!emit_document_indexes(text_doc, cursor, emit_fn, warner)) return false;
+  }
+  if (parts.wants(officev1::DOCUMENT_PART_PAGE_STYLES) ||
+      parts.wants(officev1::DOCUMENT_PART_HEADERS_FOOTERS)) {
+    if (!emit_page_styles(model, parts, emit_fn, warner)) return false;
+  }
+  if (parts.wants(officev1::DOCUMENT_PART_IMAGES)) {
+    return emit_images(text_doc, context, cursor, emit_fn, warner);
+  }
+  return true;
 }
 
 }  // namespace
 
-bool emit_typed_content(const EmitFn& emit_fn, std::vector<std::string>* warnings) {
+bool emit_typed_content(const PartSelection& parts, const EmitFn& emit_fn,
+                        std::vector<std::string>* warnings) {
   Warner warner(warnings);
   try {
     Reference<css::uno::XComponentContext> context = process_context();
@@ -1055,18 +1097,36 @@ bool emit_typed_content(const EmitFn& emit_fn, std::vector<std::string>* warning
       warner.warn("loaded document not found on the desktop, typed content unavailable");
       return true;
     }
-    if (!emit_metadata(model, emit_fn, warner)) return false;
+    if (parts.wants(officev1::DOCUMENT_PART_METADATA)) {
+      if (!emit_metadata(model, emit_fn, warner)) return false;
+    }
     Reference<css::text::XTextDocument> text_doc(model, UNO_QUERY);
     if (text_doc.is()) {
-      return emit_text_content(text_doc, context, emit_fn, warner);
+      // Skip the whole text walk when no text-document part is selected.
+      bool wants_text_part =
+          parts.wants(officev1::DOCUMENT_PART_PARAGRAPHS) ||
+          parts.wants(officev1::DOCUMENT_PART_TABLES) ||
+          parts.wants(officev1::DOCUMENT_PART_IMAGES) ||
+          parts.wants(officev1::DOCUMENT_PART_FOOTNOTES) ||
+          parts.wants(officev1::DOCUMENT_PART_HEADERS_FOOTERS) ||
+          parts.wants(officev1::DOCUMENT_PART_PAGE_STYLES) ||
+          parts.wants(officev1::DOCUMENT_PART_INDEXES);
+      if (!wants_text_part) return true;
+      return emit_text_content(text_doc, context, parts, emit_fn, warner);
     }
     // Draw, Impress, and Calc models all supply draw pages, so gate on the
     // DrawingDocument service, which the office core reports only for Draw.
+    if (!parts.wants(officev1::DOCUMENT_PART_SHAPES) &&
+        !parts.wants(officev1::DOCUMENT_PART_IMAGES)) {
+      return true;
+    }
     Reference<css::lang::XServiceInfo> info(model, UNO_QUERY);
     if (info.is() &&
         info->supportsService("com.sun.star.drawing.DrawingDocument")) {
       Reference<css::drawing::XDrawPagesSupplier> draw(model, UNO_QUERY);
-      if (draw.is()) return emit_drawing_content(draw, context, emit_fn, warner);
+      if (draw.is()) {
+        return emit_drawing_content(draw, context, parts, emit_fn, warner);
+      }
     }
     return true;
   } catch (const css::uno::Exception& error) {

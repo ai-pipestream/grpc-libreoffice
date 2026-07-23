@@ -61,10 +61,68 @@ message DocumentChunk {
   bool complete = 5;
 }
 
+// DocumentPart names one class of content the server can emit for a
+// StreamPages call. A request lists the parts it wants and the server emits
+// only those, skipping the extraction work behind unselected parts. An empty
+// list means every part. The identity event DocumentInfo and the terminal
+// RenderStatus are always emitted and are not part of this selection.
+enum DocumentPart {
+  // Unset; ignored if it appears in a parts list.
+  DOCUMENT_PART_UNSPECIFIED = 0;
+  // Rendered page images (PageImage).
+  DOCUMENT_PART_PAGES = 1;
+  // Stored document properties (DocumentMetadata).
+  DOCUMENT_PART_METADATA = 2;
+  // Body paragraphs of a text document (Paragraph).
+  DOCUMENT_PART_PARAGRAPHS = 3;
+  // Text-document tables (TableData).
+  DOCUMENT_PART_TABLES = 4;
+  // Embedded images with their bytes (EmbeddedImage).
+  DOCUMENT_PART_IMAGES = 5;
+  // Footnotes and endnotes (Footnote).
+  DOCUMENT_PART_FOOTNOTES = 6;
+  // Page-style headers and footers (HeaderFooter).
+  DOCUMENT_PART_HEADERS_FOOTERS = 7;
+  // In-use page-style geometry (PageStyleInfo).
+  DOCUMENT_PART_PAGE_STYLES = 8;
+  // Generated indexes and tables of contents (DocumentIndex).
+  DOCUMENT_PART_INDEXES = 9;
+  // Spreadsheet sheets and their sheet-scoped features.
+  DOCUMENT_PART_SHEETS = 10;
+  // Presentation slides and their shapes.
+  DOCUMENT_PART_SLIDES = 11;
+  // Drawing-page shapes (DrawingShape).
+  DOCUMENT_PART_SHAPES = 12;
+  // Writer text frames.
+  DOCUMENT_PART_TEXT_FRAMES = 13;
+  // Embedded OLE objects, charts, spreadsheets, and formulas.
+  DOCUMENT_PART_EMBEDDED_OBJECTS = 14;
+  // Per-line bounding rectangles on events already selected by their own
+  // part. A modifier: it only adds geometry to selected events, and the
+  // per-line measurement is skipped when this part is not requested.
+  DOCUMENT_PART_LINE_RECTS = 15;
+}
+
+// StreamOptions selects which document parts a StreamPages call emits. It
+// may be sent on any request in the upload stream; the first request whose
+// parts list is non-empty wins, matching how the chunk identity fields
+// (document_id, filename, content_type) are resolved. When no request
+// carries a non-empty list, every part is emitted.
+message StreamOptions {
+  // The parts to emit. Empty means every part. DOCUMENT_PART_UNSPECIFIED
+  // entries are ignored; order and duplicates do not matter.
+  repeated DocumentPart parts = 1;
+}
+
 // StreamPagesRequest carries one upload chunk of a StreamPages call.
 message StreamPagesRequest {
   // The upload chunk.
   DocumentChunk chunk = 1;
+  // Optional selection of which parts to emit. Resolved across the upload
+  // stream like the chunk identity fields (first non-empty parts list wins),
+  // so callers should send it on the first chunk. Absent or empty means
+  // every part.
+  StreamOptions options = 2;
 }
 
 // StreamPagesResponse is one event of a StreamPages response stream. Order:
@@ -74,9 +132,11 @@ message StreamPagesRequest {
 // TableData, EmbeddedImage, Footnote, HeaderFooter, PageStyleInfo, and
 // DocumentIndex. For drawing documents they are DrawingShape events in
 // page-then-paint order, plus EmbeddedImage events for image shapes. Every
-// event is emitted the moment it exists: pages stream while later pages are
-// still painting, and the caller can process page images while typed content
-// is still being extracted from the same loaded document.
+// event between DocumentInfo and RenderStatus is subject to the request's
+// StreamOptions part selection. Every event is emitted the moment it exists:
+// pages stream while later pages are still painting, and the caller can
+// process page images while typed content is still being extracted from the
+// same loaded document.
 message StreamPagesResponse {
   // Exactly one event per response message.
   oneof event {
@@ -528,6 +588,6 @@ message GetServiceInfoResponse {
   int32 render_dpi = 9;
   // True when StreamPages emits typed content events (DocumentMetadata,
   // Paragraph, TableData, EmbeddedImage, DrawingShape) alongside page
-  // images.
+  // images, selectable per request through StreamOptions.
   bool typed_content = 10;
 }

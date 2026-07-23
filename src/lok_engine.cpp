@@ -73,6 +73,103 @@ bool emit(int fd, const google::protobuf::MessageLite& message) {
   return write_frame(fd, serialized);
 }
 
+// Paints every page and streams PageImage events. Two-stage pipeline: this
+// thread paints page N+1 while the encoder thread compresses and emits page
+// N. The queue is bounded so raw pixel buffers never pile up; the FIFO plus
+// single encoder keeps emission in page order. Adds the emitted PNG bytes to
+// *output_bytes; on failure sets *error and returns false.
+bool paint_pages(lok::Document* document, const RenderOptions& options,
+                 const std::vector<PageRect>& pages, bool bgra, int out_fd,
+                 long* output_bytes, std::string* error) {
+  struct RawPage {
+    int index;
+    int width_px;
+    int height_px;
+    int dpi;
+    std::vector<unsigned char> pixels;
+  };
+  std::mutex queue_mutex;
+  std::condition_variable queue_changed;
+  std::deque<RawPage> queue;
+  bool paint_done = false;
+  std::atomic<bool> encoder_ok{true};
+  std::atomic<long> encoded_bytes{0};
+  constexpr size_t kMaxQueued = 2;
+
+  std::thread encoder([&] {
+    for (;;) {
+      RawPage raw;
+      {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        queue_changed.wait(lock, [&] { return !queue.empty() || paint_done; });
+        if (queue.empty()) return;
+        raw = std::move(queue.front());
+        queue.pop_front();
+      }
+      queue_changed.notify_one();
+      std::string png = encode_png(raw.pixels.data(), raw.width_px, raw.height_px, bgra);
+      if (png.empty()) {
+        encoder_ok = false;
+        return;
+      }
+      encoded_bytes += static_cast<long>(png.size());
+      officev1::StreamPagesResponse page_event;
+      officev1::PageImage* image = page_event.mutable_page_image();
+      image->set_index(raw.index);
+      image->set_width_px(raw.width_px);
+      image->set_height_px(raw.height_px);
+      image->set_dpi(raw.dpi);
+      image->set_png(std::move(png));
+      if (!emit(out_fd, page_event)) {
+        encoder_ok = false;
+        return;
+      }
+    }
+  });
+
+  for (size_t index = 0; encoder_ok && index < pages.size(); index++) {
+    const PageRect& page = pages[index];
+    document->setPart(page.part);
+    double scale = options.dpi / kTwipsPerInch;
+    int effective_dpi = options.dpi;
+    long side = std::max(page.width, page.height);
+    if (side * scale > options.max_side_px) {
+      scale = static_cast<double>(options.max_side_px) / side;
+      effective_dpi = std::max(1, static_cast<int>(scale * kTwipsPerInch));
+    }
+    int width_px = std::max(1, static_cast<int>(std::lround(page.width * scale)));
+    int height_px = std::max(1, static_cast<int>(std::lround(page.height * scale)));
+    RawPage raw;
+    raw.index = static_cast<int>(index);
+    raw.width_px = width_px;
+    raw.height_px = height_px;
+    raw.dpi = effective_dpi;
+    raw.pixels.resize(static_cast<size_t>(width_px) * height_px * 4);
+    document->paintTile(raw.pixels.data(), width_px, height_px,
+                        static_cast<int>(page.x), static_cast<int>(page.y),
+                        static_cast<int>(page.width), static_cast<int>(page.height));
+    {
+      std::unique_lock<std::mutex> lock(queue_mutex);
+      queue_changed.wait(lock, [&] { return queue.size() < kMaxQueued || !encoder_ok; });
+      if (!encoder_ok) break;
+      queue.push_back(std::move(raw));
+    }
+    queue_changed.notify_one();
+  }
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex);
+    paint_done = true;
+  }
+  queue_changed.notify_one();
+  encoder.join();
+  *output_bytes += encoded_bytes.load();
+  if (!encoder_ok) {
+    *error = "PNG encoding or emission failed";
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 int run_render(const RenderOptions& options, int out_fd, std::string* error) {
@@ -143,96 +240,16 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     *response.mutable_document_info() = info;
     ok = emit(out_fd, response);
 
-    // Two-stage pipeline: this thread paints page N+1 while the encoder
-    // thread compresses and emits page N. The queue is bounded so raw
-    // pixel buffers never pile up; the FIFO plus single encoder keeps
-    // emission in page order.
-    struct RawPage {
-      int index;
-      int width_px;
-      int height_px;
-      int dpi;
-      std::vector<unsigned char> pixels;
-    };
-    std::mutex queue_mutex;
-    std::condition_variable queue_changed;
-    std::deque<RawPage> queue;
-    bool paint_done = false;
-    std::atomic<bool> encoder_ok{true};
-    std::atomic<long> encoded_bytes{0};
-    constexpr size_t kMaxQueued = 2;
-
-    std::thread encoder([&] {
-      for (;;) {
-        RawPage raw;
-        {
-          std::unique_lock<std::mutex> lock(queue_mutex);
-          queue_changed.wait(lock, [&] { return !queue.empty() || paint_done; });
-          if (queue.empty()) return;
-          raw = std::move(queue.front());
-          queue.pop_front();
-        }
-        queue_changed.notify_one();
-        std::string png = encode_png(raw.pixels.data(), raw.width_px, raw.height_px, bgra);
-        if (png.empty()) {
-          encoder_ok = false;
-          return;
-        }
-        encoded_bytes += static_cast<long>(png.size());
-        officev1::StreamPagesResponse page_event;
-        officev1::PageImage* image = page_event.mutable_page_image();
-        image->set_index(raw.index);
-        image->set_width_px(raw.width_px);
-        image->set_height_px(raw.height_px);
-        image->set_dpi(raw.dpi);
-        image->set_png(std::move(png));
-        if (!emit(out_fd, page_event)) {
-          encoder_ok = false;
-          return;
-        }
+    // The paint/encode pipeline runs only when page images are selected.
+    // The layout above (initializeForRendering, page rectangles) always
+    // runs: typed anchors read the live layout, and DocumentInfo.page_count
+    // must stay correct either way.
+    if (ok && options.parts.wants(officev1::DOCUMENT_PART_PAGES)) {
+      if (!paint_pages(document, options, pages, bgra, out_fd, &output_bytes,
+                       error)) {
+        delete document;
+        return kExitRenderFailure;
       }
-    });
-
-    for (size_t index = 0; ok && encoder_ok && index < pages.size(); index++) {
-      const PageRect& page = pages[index];
-      document->setPart(page.part);
-      double scale = options.dpi / kTwipsPerInch;
-      int effective_dpi = options.dpi;
-      long side = std::max(page.width, page.height);
-      if (side * scale > options.max_side_px) {
-        scale = static_cast<double>(options.max_side_px) / side;
-        effective_dpi = std::max(1, static_cast<int>(scale * kTwipsPerInch));
-      }
-      int width_px = std::max(1, static_cast<int>(std::lround(page.width * scale)));
-      int height_px = std::max(1, static_cast<int>(std::lround(page.height * scale)));
-      RawPage raw;
-      raw.index = static_cast<int>(index);
-      raw.width_px = width_px;
-      raw.height_px = height_px;
-      raw.dpi = effective_dpi;
-      raw.pixels.resize(static_cast<size_t>(width_px) * height_px * 4);
-      document->paintTile(raw.pixels.data(), width_px, height_px,
-                          static_cast<int>(page.x), static_cast<int>(page.y),
-                          static_cast<int>(page.width), static_cast<int>(page.height));
-      {
-        std::unique_lock<std::mutex> lock(queue_mutex);
-        queue_changed.wait(lock, [&] { return queue.size() < kMaxQueued || !encoder_ok; });
-        if (!encoder_ok) break;
-        queue.push_back(std::move(raw));
-      }
-      queue_changed.notify_one();
-    }
-    {
-      std::lock_guard<std::mutex> lock(queue_mutex);
-      paint_done = true;
-    }
-    queue_changed.notify_one();
-    encoder.join();
-    output_bytes = encoded_bytes.load();
-    if (!encoder_ok) {
-      *error = "PNG encoding or emission failed";
-      delete document;
-      return kExitRenderFailure;
     }
     // Pages have streamed; typed content follows from the same loaded
     // document, each event emitted the moment it is extracted. Extraction
@@ -240,6 +257,7 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     std::vector<std::string> typed_warnings;
     if (ok) {
       ok = emit_typed_content(
+          options.parts,
           [&](const google::protobuf::MessageLite& event) {
             output_bytes += static_cast<long>(event.ByteSizeLong());
             return emit(out_fd, event);

@@ -1,8 +1,25 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 namespace grlibre {
+
+// Which document parts the caller selected, decoded from the worker's argv
+// parts token: "all" selects everything (the wire default), otherwise a
+// comma-joined list of ai.pipestream.office.v1.DocumentPart numeric values.
+struct PartSelection {
+  // True when every part is selected.
+  bool all = true;
+  // Bitmask keyed by DocumentPart value; bit 0 is never set because
+  // DOCUMENT_PART_UNSPECIFIED entries are ignored.
+  std::uint32_t mask = 0;
+
+  // Whether the caller asked for the given DocumentPart value.
+  bool wants(int part) const {
+    return all || (part > 0 && part < 32 && (mask & (1u << part)) != 0);
+  }
+};
 
 // Everything one worker process needs to render one document.
 struct RenderOptions {
@@ -23,6 +40,8 @@ struct RenderOptions {
   int max_side_px = 4096;
   // Uploaded byte count, echoed into RenderStatus.
   long input_bytes = 0;
+  // Which parts to emit; defaults to every part.
+  PartSelection parts;
 };
 
 // Worker process exit codes, mapped to gRPC status codes by the parent.
