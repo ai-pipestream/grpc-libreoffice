@@ -266,14 +266,35 @@ message PageImage {
   bytes png = 5;
 }
 
-// TwipsPoint is a point in twips (1/1440 inch) on a page, origin at the
-// page's top-left corner. Multiply by dpi/1440 to get pixels at a
-// PageImage's dpi; divide by 20 to get typographic points.
+// TwipsPoint is a point in twips (1/1440 inch), document-absolute: the
+// origin is the first page's top-left corner, so subtract the containing
+// page's origin for page-local coordinates. Multiply by dpi/1440 to get
+// pixels at a PageImage's dpi; divide by 20 to get typographic points.
 message TwipsPoint {
   // Horizontal offset from the page's left edge.
   int64 x = 1;
   // Vertical offset from the page's top edge.
   int64 y = 2;
+}
+
+// LineBox is the bounding rectangle of one laid-out line of a text range,
+// measured from the same layout the page images were painted from. A range
+// that wraps or straddles a page break yields one LineBox per line, in
+// reading order. Coordinates are twips in the same document-absolute space
+// as TwipsPoint; subtract the containing page's origin for page-local
+// coordinates.
+message LineBox {
+  // Zero-based page the line sits on; matches PageImage.index. -1 when the
+  // page could not be resolved.
+  int32 page_index = 1;
+  // Left edge in twips.
+  int64 x_twips = 2;
+  // Top edge in twips.
+  int64 y_twips = 3;
+  // Width in twips.
+  int64 width_twips = 4;
+  // Height in twips.
+  int64 height_twips = 5;
 }
 
 // DocumentMetadata carries the document's stored properties. Emitted once,
@@ -400,6 +421,11 @@ message Paragraph {
   // Offset of the paragraph's first character in the document's annotation
   // text space (see TextRun.char_offset); -1 outside the body flow.
   int64 char_offset = 11;
+  // Per-line bounding rectangles of the paragraph from the live layout, in
+  // reading order; empty when line rectangles were not requested or could
+  // not be measured. start and end give text-flow anchors; line_rects give
+  // the true bounding boxes.
+  repeated LineBox line_rects = 12;
 }
 
 // Footnote is one footnote or endnote, with its citation label, its content
@@ -504,6 +530,12 @@ message TableData {
   TwipsPoint end = 6;
   // The cells, in the office core's cell-name order.
   repeated TableCellData cells = 7;
+  // Per-line bounding rectangles of the table's cells from the live layout,
+  // collected cell by cell in cell-name order, because the office core
+  // cannot select across cell boundaries. Bounded to tables of at most 64
+  // cells; empty for larger tables or when line rectangles were not
+  // requested.
+  repeated LineBox line_rects = 8;
 }
 
 // EmbeddedImage is one image object embedded in the document, with its bytes
@@ -529,6 +561,13 @@ message EmbeddedImage {
   int64 width_twips = 7;
   // Laid-out height in twips.
   int64 height_twips = 8;
+  // Per-line bounding rectangles of the image's anchor text from the live
+  // layout; best effort. For an as-char (inline) anchor this is the anchor
+  // line's box; for a floating anchor it does not describe the frame, so
+  // width_twips, height_twips, and anchor remain the authoritative
+  // geometry. Empty when line rectangles were not requested or could not
+  // be measured.
+  repeated LineBox line_rects = 9;
 }
 
 // EmbeddedObjectKind classifies an embedded object's inner content.

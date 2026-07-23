@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <iostream>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -922,6 +923,131 @@ void verify_part_selection() {
           "draw-images-only extracts the image");
 }
 
+// A flat ODT on a tiny page so content wraps and paginates: a one-line
+// heading, a long paragraph that wraps and straddles the page break, a 2x2
+// table, and an as-char image whose anchor line box is meaningful.
+const char kLineRectsFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+ xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
+ office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:automatic-styles>
+  <style:page-layout style:name="pm1">
+   <style:page-layout-properties fo:page-width="10cm" fo:page-height="6cm"
+    fo:margin-top="1cm" fo:margin-bottom="1cm" fo:margin-left="1cm" fo:margin-right="1cm"/>
+  </style:page-layout>
+ </office:automatic-styles>
+ <office:master-styles>
+  <style:master-page style:name="Standard" style:page-layout-name="pm1"/>
+ </office:master-styles>
+ <office:body><office:text>
+  <text:h text:outline-level="1">Head</text:h>
+  <text:p>wrap the quick brown fox jumps over the lazy dog the quick brown
+   fox jumps over the lazy dog the quick brown fox jumps over the lazy dog
+   the quick brown fox jumps over the lazy dog the quick brown fox jumps
+   over the lazy dog the quick brown fox jumps over the lazy dog the quick
+   brown fox jumps over the lazy dog the quick brown fox jumps over the
+   lazy dog the quick brown fox jumps over the lazy dog the quick brown fox
+   jumps over the lazy dog the quick brown fox jumps over the lazy dog the
+   quick brown fox jumps over the lazy dog</text:p>
+  <table:table table:name="LT">
+   <table:table-column table:number-columns-repeated="2"/>
+   <table:table-row>
+    <table:table-cell><text:p>A1x</text:p></table:table-cell>
+    <table:table-cell><text:p>B1x</text:p></table:table-cell>
+   </table:table-row>
+   <table:table-row>
+    <table:table-cell><text:p>A2x</text:p></table:table-cell>
+    <table:table-cell><text:p>B2x</text:p></table:table-cell>
+   </table:table-row>
+  </table:table>
+  <text:p>Image line <draw:frame draw:name="LImg" text:anchor-type="as-char" svg:width="1cm" svg:height="1cm"><draw:image><office:binary-data>iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==</office:binary-data></draw:image></draw:frame> anchors here.</text:p>
+ </office:text></office:body>
+</office:document>
+)";
+
+void verify_line_rects() {
+  std::vector<std::string> payloads;
+  auto outcome = run("pages", "fodt", kLineRectsFodt, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "line rects fodt renders ok: " + outcome.detail);
+  bool heading_ok = false;
+  bool wrap_ok = false;
+  bool same_space_ok = false;
+  bool table_ok = false;
+  bool image_ok = false;
+  std::set<int> pages_seen;
+  officev1::StreamPagesResponse event;
+  for (const std::string& payload : payloads) {
+    require(event.ParseFromString(payload), "line rects event parses");
+    if (event.has_paragraph()) {
+      const officev1::Paragraph& para = event.paragraph();
+      std::string text;
+      for (const officev1::TextRun& text_run : para.runs()) {
+        text += text_run.text();
+      }
+      for (const officev1::LineBox& box : para.line_rects()) {
+        require(box.page_index() >= 0, "line box resolves its page");
+        require(box.width_twips() > 0 && box.height_twips() > 0,
+                "line box has real extent");
+        pages_seen.insert(box.page_index());
+      }
+      if (text == "Head") {
+        heading_ok = para.line_rects_size() == 1 &&
+                     para.line_rects(0).height_twips() > 0;
+      }
+      if (text.compare(0, 4, "wrap") == 0) {
+        wrap_ok = para.line_rects_size() > 3;
+        // Within one page, line boxes descend in reading order.
+        for (int i = 1; i < para.line_rects_size(); i++) {
+          if (para.line_rects(i).page_index() ==
+              para.line_rects(i - 1).page_index()) {
+            wrap_ok = wrap_ok && para.line_rects(i).y_twips() >
+                                     para.line_rects(i - 1).y_twips();
+          }
+        }
+        // The caret start and the first line box describe the same spot in
+        // the same document-absolute space.
+        // The caret round-trips through 1/100 mm inside the office core, so
+        // allow a few twips of conversion slack.
+        const officev1::LineBox& first = para.line_rects(0);
+        same_space_ok =
+            std::llabs(first.x_twips() - para.start().x()) <= 60 &&
+            para.start().y() >= first.y_twips() - 30 &&
+            para.start().y() <= first.y_twips() + first.height_twips();
+      }
+    }
+    if (event.has_table()) {
+      const officev1::TableData& table = event.table();
+      table_ok = table.line_rects_size() >= 1 &&
+                 table.line_rects(0).page_index() >= 0;
+    }
+    if (event.has_embedded_image()) {
+      const officev1::EmbeddedImage& image = event.embedded_image();
+      image_ok = image.line_rects_size() >= 1 &&
+                 image.line_rects(0).page_index() == image.page_index();
+    }
+  }
+  require(heading_ok, "single-line heading yields exactly one line box");
+  require(wrap_ok, "wrapping paragraph yields ordered per-line boxes");
+  require(pages_seen.size() >= 2,
+          "line boxes span at least two pages across the document");
+  require(same_space_ok, "caret start and first line box share one space");
+  require(table_ok, "table carries its per-table line box union");
+  require(image_ok, "as-char image carries its anchor line box");
+  officev1::StreamPagesResponse last;
+  require(last.ParseFromString(payloads.back()), "line rects last parses");
+  require(last.has_status() &&
+              last.status().state() == officev1::RenderStatus::STATE_OK,
+          "line rects stream ends ok");
+  require(last.status().warnings().empty(),
+          "line rects extraction produced no warnings");
+}
+
 // A flat ODT with three embedded objects: a Math formula, a bar chart with
 // three categories and two numeric series, and an embedded spreadsheet.
 // Flat ODF embeds each object's document inline, keeping the fixture
@@ -1093,6 +1219,7 @@ int main() {
   verify_typed_presentation();
   verify_part_selection();
   verify_embedded_objects();
+  verify_line_rects();
   verify_corrupt_zip_is_load_failure();
   std::cout << "worker-render-test passed\n";
   return 0;
