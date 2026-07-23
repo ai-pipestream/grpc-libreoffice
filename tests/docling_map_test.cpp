@@ -384,6 +384,10 @@ void verify_writer_stream() {
               && body->prov(1).bbox().b()
                   <= document.pages().at(2).size().height(),
           "writer: page-local box inside the page");
+  require(body->source_size() == 1
+              && body->source(0).collector().collector() == "libreoffice"
+              && body->source(0).collector().model() == "lok",
+          "writer: text items carry the libreoffice collector source");
   require(body->prov(0).charspan().start() == 33
               && body->prov(0).charspan().end() == 42,
           "writer: measured line narrows its charspan in annotation space");
@@ -393,6 +397,10 @@ void verify_writer_stream() {
 
   // Table folding.
   require(document.tables_size() == 1, "writer: one TableItem");
+  require(document.tables(0).source(0).collector().collector() == "libreoffice",
+          "writer: table items carry the libreoffice collector source");
+  require(document.pictures(0).source(0).collector().collector() == "libreoffice",
+          "writer: picture items carry the libreoffice collector source");
   const docv1::TableItem& table = document.tables(0);
   require(table.data().num_rows() == 2 && table.data().num_cols() == 2,
           "writer: table dimensions");

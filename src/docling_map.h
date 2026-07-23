@@ -69,6 +69,11 @@ class DoclingMapper {
 
   ai::pipestream::document::v1::GroupItem* group_by_ref(const std::string& ref);
   void link_child(const std::string& parent_ref, const std::string& child_ref);
+  // Stamps the CollectorSource attribution ("libreoffice"/"lok") every text,
+  // picture, and table item carries.
+  void stamp_collector_source(
+      google::protobuf::RepeatedPtrField<ai::pipestream::document::v1::SourceType>*
+          source);
   ai::pipestream::document::v1::GroupItem* add_group(
       const std::string& parent_ref,
       ai::pipestream::document::v1::GroupLabel label, const std::string& name,
