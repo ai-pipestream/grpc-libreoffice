@@ -415,6 +415,8 @@ void DoclingMapper::consume(const officev1::StreamPagesResponse& event) {
       return on_sheet_row(event.sheet_row());
     case officev1::StreamPagesResponse::kSheetNamedRange:
       return on_sheet_named_range(event.sheet_named_range());
+    case officev1::StreamPagesResponse::kSheetDatabaseRange:
+      return on_sheet_database_range(event.sheet_database_range());
     case officev1::StreamPagesResponse::kSheetCellComment:
       return on_sheet_cell_comment(event.sheet_cell_comment());
     case officev1::StreamPagesResponse::kSheetChart:
@@ -1088,6 +1090,19 @@ void DoclingMapper::on_sheet_named_range(
   (*fields)["type_flags"] = num_value(range.type_flags());
   (*document_.mutable_body()->mutable_meta()->mutable_custom_fields())
       ["named_range:" + range.name()] = value;
+}
+
+void DoclingMapper::on_sheet_database_range(
+    const officev1::SheetDatabaseRange& range) {
+  google::protobuf::Value value;
+  auto* fields = value.mutable_struct_value()->mutable_fields();
+  (*fields)["sheet_index"] = num_value(range.sheet_index());
+  (*fields)["range"] = str_value(range_a1(range.range()));
+  (*fields)["contains_header"] = bool_value(range.contains_header());
+  (*fields)["totals_row"] = bool_value(range.totals_row());
+  (*fields)["auto_filter"] = bool_value(range.auto_filter());
+  (*document_.mutable_body()->mutable_meta()->mutable_custom_fields())
+      ["database_range:" + range.name()] = value;
 }
 
 void DoclingMapper::on_sheet_cell_comment(

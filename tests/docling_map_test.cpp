@@ -469,6 +469,17 @@ void verify_calc_stream() {
   }
   {
     officev1::StreamPagesResponse event;
+    officev1::SheetDatabaseRange* range = event.mutable_sheet_database_range();
+    range->set_name("Orders");
+    range->set_sheet_index(0);
+    range->mutable_range()->set_end_row(2);
+    range->mutable_range()->set_end_column(1);
+    range->set_contains_header(true);
+    range->set_auto_filter(true);
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
     officev1::SheetChart* chart = event.mutable_sheet_chart();
     chart->set_sheet_index(0);
     chart->set_name("Chart 1");
@@ -531,6 +542,19 @@ void verify_calc_stream() {
   require(document.body().meta().custom_fields().count("named_range:MyRange")
               == 1,
           "calc: named range on body meta");
+  require(document.body().meta().custom_fields().count("database_range:Orders")
+              == 1,
+          "calc: database range on body meta");
+  {
+    const auto& fields = document.body().meta().custom_fields()
+        .at("database_range:Orders").struct_value().fields();
+    require(fields.at("range").string_value() == "A1:B3"
+                && fields.at("sheet_index").number_value() == 0
+                && fields.at("contains_header").bool_value()
+                && fields.at("auto_filter").bool_value()
+                && !fields.at("totals_row").bool_value(),
+            "calc: database range fields survive on body meta");
+  }
   bool chart_ok = false;
   for (const docv1::PictureItem& picture : document.pictures()) {
     if (picture.label() == docv1::DOC_ITEM_LABEL_CHART) {

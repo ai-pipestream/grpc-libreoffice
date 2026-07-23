@@ -385,6 +385,9 @@ const char kTypedFods[] = R"(<?xml version="1.0" encoding="UTF-8"?>
     <table:table-cell office:value-type="string"><text:p>secret</text:p></table:table-cell>
    </table:table-row>
   </table:table>
+  <table:database-ranges>
+   <table:database-range table:name="DBData" table:target-range-address="Data.A1:Data.C3" table:contains-header="true" table:display-filter-buttons="true"/>
+  </table:database-ranges>
  </office:spreadsheet></office:body>
 </office:document>
 )";
@@ -406,6 +409,7 @@ void verify_typed_spreadsheet() {
   std::vector<officev1::Sheet> sheets;
   std::vector<officev1::SheetRow> rows;
   std::vector<officev1::SheetCellComment> comments;
+  std::vector<officev1::SheetDatabaseRange> database_ranges;
   officev1::StreamPagesResponse event;
   for (const std::string& payload : payloads) {
     require(event.ParseFromString(payload), "fods event parses");
@@ -413,6 +417,9 @@ void verify_typed_spreadsheet() {
     if (event.has_sheet_row()) rows.push_back(event.sheet_row());
     if (event.has_sheet_cell_comment()) {
       comments.push_back(event.sheet_cell_comment());
+    }
+    if (event.has_sheet_database_range()) {
+      database_ranges.push_back(event.sheet_database_range());
     }
   }
   require(sheets.size() == 2, "two sheet headers");
@@ -467,6 +474,18 @@ void verify_typed_spreadsheet() {
               comments[0].author() == "Kris" &&
               comments[0].text() == "Check stock",
           "cell comment with author, position, and text");
+  require(database_ranges.size() == 1, "one database range event");
+  require(database_ranges[0].name() == "DBData" &&
+              database_ranges[0].sheet_index() == 0 &&
+              database_ranges[0].range().start_row() == 0 &&
+              database_ranges[0].range().start_column() == 0 &&
+              database_ranges[0].range().end_row() == 2 &&
+              database_ranges[0].range().end_column() == 2,
+          "database range covers Data.A1:C3 by name");
+  require(database_ranges[0].contains_header() &&
+              database_ranges[0].auto_filter() &&
+              !database_ranges[0].totals_row(),
+          "database range keeps header and filter flags");
   officev1::StreamPagesResponse last;
   require(last.ParseFromString(payloads.back()), "fods last event parses");
   require(last.has_status(), "fods stream ends with status");

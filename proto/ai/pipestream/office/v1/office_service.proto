@@ -136,8 +136,8 @@ message StreamPagesRequest {
 // presentation documents they are one Slide header per slide followed by its
 // SlideShape events in paint order. For spreadsheet documents they are one
 // Sheet header per sheet followed by its SheetRow events and sheet features
-// (SheetCellComment, SheetChart, SheetPivotTable), with SheetNamedRange
-// events once per workbook. Every
+// (SheetCellComment, SheetChart, SheetPivotTable), with SheetNamedRange and
+// SheetDatabaseRange events once per workbook. Every
 // event between DocumentInfo and RenderStatus is subject to the request's
 // StreamOptions part selection. Every event is emitted the moment it exists:
 // pages stream while later pages are still painting, and the caller can
@@ -202,6 +202,9 @@ message StreamPagesResponse {
     SheetRow sheet_row = 19;
     // One workbook-scoped defined name. Emitted for spreadsheet documents.
     SheetNamedRange sheet_named_range = 20;
+    // One database range defined on the workbook. Emitted for spreadsheet
+    // documents.
+    SheetDatabaseRange sheet_database_range = 24;
     // One cell annotation (comment) on a sheet. Emitted for spreadsheet
     // documents.
     SheetCellComment sheet_cell_comment = 21;
@@ -814,6 +817,24 @@ message SheetNamedRange {
   string content = 2;
   // NamedRangeFlag bits from the office core.
   int32 type_flags = 3;
+}
+
+// SheetDatabaseRange is one database range defined on the workbook: a named
+// cell range that also stores the workbook's filtering, sorting, subtotal,
+// and import settings for that data area.
+message SheetDatabaseRange {
+  // The database range's name.
+  string name = 1;
+  // Zero-based sheet ordinal of the data area; matches Sheet.index.
+  int32 sheet_index = 2;
+  // The data area the range covers.
+  SheetRangeRef range = 3;
+  // True when the first row of the area is treated as column headers.
+  bool contains_header = 4;
+  // True when the last row of the area is a totals row.
+  bool totals_row = 5;
+  // True when the range keeps an auto filter on its header row.
+  bool auto_filter = 6;
 }
 
 // SheetCellComment is one cell annotation on a sheet.

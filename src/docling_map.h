@@ -138,6 +138,8 @@ class DoclingMapper {
   void on_sheet_row(const ai::pipestream::office::v1::SheetRow& row);
   void on_sheet_named_range(
       const ai::pipestream::office::v1::SheetNamedRange& range);
+  void on_sheet_database_range(
+      const ai::pipestream::office::v1::SheetDatabaseRange& range);
   void on_sheet_cell_comment(
       const ai::pipestream::office::v1::SheetCellComment& comment);
   void on_sheet_chart(const ai::pipestream::office::v1::SheetChart& chart);
