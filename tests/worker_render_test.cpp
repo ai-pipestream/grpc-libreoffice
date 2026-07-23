@@ -337,6 +337,154 @@ void verify_typed_content() {
           "typed extraction produced no warnings");
 }
 
+// A flat ODS with two sheets: a data sheet exercising a merged header, a
+// numeric cell, a currency-formatted cell, a formula, and a cell comment,
+// plus a hidden second sheet. Flat XML keeps the fixture diskless and
+// reviewable.
+const char kTypedFods[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+ xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:of="urn:oasis:names:tc:opendocument:xmlns:of:1.2"
+ office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.spreadsheet">
+ <office:automatic-styles>
+  <number:currency-style style:name="N107">
+   <number:currency-symbol number:language="en" number:country="US">$</number:currency-symbol>
+   <number:number number:decimal-places="2" number:min-integer-digits="1"/>
+  </number:currency-style>
+  <style:style style:name="ce1" style:family="table-cell" style:data-style-name="N107"/>
+  <style:style style:name="ta2" style:family="table">
+   <style:table-properties table:display="false"/>
+  </style:style>
+ </office:automatic-styles>
+ <office:body><office:spreadsheet>
+  <table:table table:name="Data">
+   <table:table-row>
+    <table:table-cell table:number-columns-spanned="2" office:value-type="string"><text:p>Name</text:p></table:table-cell>
+    <table:covered-table-cell/>
+    <table:table-cell office:value-type="string"><text:p>Price</text:p></table:table-cell>
+   </table:table-row>
+   <table:table-row>
+    <table:table-cell office:value-type="string"><office:annotation><dc:creator>Kris</dc:creator><text:p>Check stock</text:p></office:annotation><text:p>Widget</text:p></table:table-cell>
+    <table:table-cell office:value-type="float" office:value="42"><text:p>42</text:p></table:table-cell>
+    <table:table-cell table:style-name="ce1" office:value-type="currency" office:currency="USD" office:value="9.99"><text:p>$9.99</text:p></table:table-cell>
+   </table:table-row>
+   <table:table-row>
+    <table:table-cell/>
+    <table:table-cell/>
+    <table:table-cell table:formula="of:=[.B2]*[.C2]" office:value-type="float" office:value="419.58"><text:p>419.58</text:p></table:table-cell>
+   </table:table-row>
+  </table:table>
+  <table:table table:name="Hidden" table:style-name="ta2">
+   <table:table-row>
+    <table:table-cell office:value-type="string"><text:p>secret</text:p></table:table-cell>
+   </table:table-row>
+  </table:table>
+ </office:spreadsheet></office:body>
+</office:document>
+)";
+
+std::map<int, int> run_selection(const std::string& extension,
+                                 const std::string& document,
+                                 const std::string& parts_token,
+                                 const std::string& what);
+
+void verify_typed_spreadsheet() {
+  std::vector<std::string> payloads;
+  auto outcome = run("pages", "fods", kTypedFods, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "typed fods renders ok: " + outcome.detail);
+  officev1::StreamPagesResponse first;
+  require(first.ParseFromString(payloads.front()), "fods info parses");
+  require(first.document_info().document_type() == "spreadsheet",
+          "fods is a spreadsheet");
+  std::vector<officev1::Sheet> sheets;
+  std::vector<officev1::SheetRow> rows;
+  std::vector<officev1::SheetCellComment> comments;
+  officev1::StreamPagesResponse event;
+  for (const std::string& payload : payloads) {
+    require(event.ParseFromString(payload), "fods event parses");
+    if (event.has_sheet()) sheets.push_back(event.sheet());
+    if (event.has_sheet_row()) rows.push_back(event.sheet_row());
+    if (event.has_sheet_cell_comment()) {
+      comments.push_back(event.sheet_cell_comment());
+    }
+  }
+  require(sheets.size() == 2, "two sheet headers");
+  require(sheets[0].index() == 0 && sheets[0].name() == "Data" &&
+              sheets[0].visible(),
+          "data sheet header with name and visibility");
+  require(sheets[1].index() == 1 && sheets[1].name() == "Hidden" &&
+              !sheets[1].visible(),
+          "hidden sheet detected at index 1");
+  require(sheets[0].used_end_row() == 2 && sheets[0].used_end_column() == 2,
+          "used bounds cover A1:C3");
+  bool merge_ok = false;
+  bool value_ok = false;
+  bool currency_ok = false;
+  bool formula_ok = false;
+  bool covered_cell_absent = true;
+  for (const officev1::SheetRow& row : rows) {
+    require(row.sheet_index() != 0 || row.row() <= 2,
+            "rows stay inside the used bounds");
+    for (const officev1::SheetCell& cell : row.cells()) {
+      if (row.sheet_index() == 0 && row.row() == 0 && cell.column() == 0) {
+        merge_ok = cell.merged_columns() == 2 && cell.merged_rows() == 1 &&
+                   cell.type() == officev1::SHEET_CELL_TYPE_TEXT &&
+                   cell.display() == "Name";
+      }
+      if (row.sheet_index() == 0 && row.row() == 0 && cell.column() == 1) {
+        covered_cell_absent = false;
+      }
+      if (row.sheet_index() == 0 && row.row() == 1 && cell.column() == 1) {
+        value_ok = cell.type() == officev1::SHEET_CELL_TYPE_VALUE &&
+                   cell.number() == 42.0;
+      }
+      if (row.sheet_index() == 0 && row.row() == 1 && cell.column() == 2) {
+        currency_ok = cell.type() == officev1::SHEET_CELL_TYPE_VALUE &&
+                      cell.number() == 9.99 && cell.number_format() != 0 &&
+                      !cell.number_format_string().empty();
+      }
+      if (row.sheet_index() == 0 && row.row() == 2 && cell.column() == 2) {
+        formula_ok = cell.type() == officev1::SHEET_CELL_TYPE_FORMULA &&
+                     !cell.formula().empty() &&
+                     cell.number() > 419.57 && cell.number() < 419.59;
+      }
+    }
+  }
+  require(merge_ok, "merge anchor carries its span");
+  require(covered_cell_absent, "covered merge cells are absent");
+  require(value_ok, "numeric cell keeps its number");
+  require(currency_ok, "currency cell carries its number format code");
+  require(formula_ok, "formula cell keeps formula and computed number");
+  require(comments.size() == 1 && comments[0].sheet_index() == 0 &&
+              comments[0].row() == 1 && comments[0].column() == 0 &&
+              comments[0].author() == "Kris" &&
+              comments[0].text() == "Check stock",
+          "cell comment with author, position, and text");
+  officev1::StreamPagesResponse last;
+  require(last.ParseFromString(payloads.back()), "fods last event parses");
+  require(last.has_status(), "fods stream ends with status");
+  require(last.status().state() == officev1::RenderStatus::STATE_OK,
+          "fods status ok");
+  require(last.status().warnings().empty(),
+          "fods extraction produced no warnings");
+
+  // Born gated: SHEETS only emits the sheet family and nothing else.
+  std::map<int, int> counts =
+      run_selection("fods", kTypedFods, "10", "sheets-only");
+  require(counts[officev1::StreamPagesResponse::kSheet] == 2,
+          "sheets-only emits sheet headers");
+  require(counts[officev1::StreamPagesResponse::kSheetRow] > 0,
+          "sheets-only emits rows");
+  require(counts[officev1::StreamPagesResponse::kPageImage] == 0 &&
+              counts[officev1::StreamPagesResponse::kMetadata] == 0,
+          "sheets-only emits no pages or metadata");
+}
+
 // A flat ODG with, on one page: a rectangle with text, an ellipse, a text
 // box with a bold span, a line, a group of two shapes, and an embedded 1x1
 // PNG. Flat XML keeps the fixture diskless and reviewable.
@@ -797,6 +945,7 @@ int main() {
   verify_csv_is_spreadsheet();
   verify_pdf_mode();
   verify_typed_content();
+  verify_typed_spreadsheet();
   verify_draw_shapes();
   verify_typed_presentation();
   verify_part_selection();
