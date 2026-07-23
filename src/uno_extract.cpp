@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cstdio>
 #include <ctime>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -45,8 +46,36 @@
 #include <com/sun/star/lang/IllegalArgumentException.hpp>
 #include <com/sun/star/lang/XMultiServiceFactory.hpp>
 #include <com/sun/star/lang/XServiceInfo.hpp>
+#include <com/sun/star/sheet/XCellRangeAddressable.hpp>
+#include <com/sun/star/sheet/XDataPilotDescriptor.hpp>
+#include <com/sun/star/sheet/XDataPilotTable.hpp>
+#include <com/sun/star/sheet/XDataPilotTables.hpp>
+#include <com/sun/star/sheet/XDataPilotTablesSupplier.hpp>
+#include <com/sun/star/sheet/XNamedRange.hpp>
+#include <com/sun/star/sheet/XPrintAreas.hpp>
+#include <com/sun/star/sheet/XSheetAnnotation.hpp>
+#include <com/sun/star/sheet/XSheetAnnotations.hpp>
+#include <com/sun/star/sheet/XSheetAnnotationsSupplier.hpp>
+#include <com/sun/star/sheet/XSheetCellCursor.hpp>
+#include <com/sun/star/sheet/XSheetCellRange.hpp>
+#include <com/sun/star/sheet/XSpreadsheet.hpp>
+#include <com/sun/star/sheet/XSpreadsheetDocument.hpp>
+#include <com/sun/star/sheet/XSpreadsheets.hpp>
+#include <com/sun/star/sheet/XUsedAreaCursor.hpp>
+#include <com/sun/star/table/CellAddress.hpp>
+#include <com/sun/star/table/CellContentType.hpp>
+#include <com/sun/star/table/CellRangeAddress.hpp>
+#include <com/sun/star/table/XCell.hpp>
+#include <com/sun/star/table/XCellRange.hpp>
+#include <com/sun/star/table/XTableChart.hpp>
+#include <com/sun/star/table/XTableCharts.hpp>
+#include <com/sun/star/table/XTableChartsSupplier.hpp>
 #include <com/sun/star/table/XTableColumns.hpp>
 #include <com/sun/star/table/XTableRows.hpp>
+#include <com/sun/star/text/XSimpleText.hpp>
+#include <com/sun/star/util/XMergeable.hpp>
+#include <com/sun/star/util/XNumberFormats.hpp>
+#include <com/sun/star/util/XNumberFormatsSupplier.hpp>
 #include <com/sun/star/text/XDocumentIndex.hpp>
 #include <com/sun/star/text/XDocumentIndexesSupplier.hpp>
 #include <com/sun/star/text/XEndnotesSupplier.hpp>
@@ -1204,6 +1233,390 @@ bool emit_presentation_content(
   return true;
 }
 
+// Copies a cell-range address into the wire range ref.
+void fill_range_ref(const css::table::CellRangeAddress& address,
+                    officev1::SheetRangeRef* out) {
+  out->set_start_row(address.StartRow);
+  out->set_start_column(address.StartColumn);
+  out->set_end_row(address.EndRow);
+  out->set_end_column(address.EndColumn);
+}
+
+// Emits typed spreadsheet content from the live Calc model: workbook-scoped
+// named ranges once, then per sheet a Sheet header, its used rows with
+// non-empty typed cells, cell comments, charts, pivot tables, and draw-page
+// images. Each event streams the moment it is parsed, and every walk is
+// bounded to the sheet's used rectangle, so the full grid is never touched.
+bool emit_calc_content(
+    const Reference<css::sheet::XSpreadsheetDocument>& calc_doc,
+    const Reference<css::frame::XModel>& model,
+    const Reference<css::uno::XComponentContext>& context,
+    const PartSelection& parts, const EmitFn& emit_fn, Warner& warner) {
+  bool want_sheets = parts.wants(officev1::DOCUMENT_PART_SHEETS);
+  bool want_images = parts.wants(officev1::DOCUMENT_PART_IMAGES);
+
+  // Number-format codes resolve once per key through this cache. Key 0 is
+  // General and stays an empty code on the wire.
+  Reference<css::util::XNumberFormats> formats;
+  if (want_sheets) {
+    Reference<css::util::XNumberFormatsSupplier> supplier(model, UNO_QUERY);
+    if (supplier.is()) formats = supplier->getNumberFormats();
+  }
+  std::map<sal_Int32, std::string> format_cache;
+  auto format_code = [&](sal_Int32 key) -> std::string {
+    if (key == 0 || !formats.is()) return std::string();
+    auto found = format_cache.find(key);
+    if (found != format_cache.end()) return found->second;
+    std::string code;
+    try {
+      Reference<css::beans::XPropertySet> props = formats->getByKey(key);
+      if (props.is()) {
+        rtl::OUString text;
+        props->getPropertyValue("FormatString") >>= text;
+        code = utf8(text);
+      }
+    } catch (const css::uno::Exception& error) {
+      warner.warn("number format " + std::to_string(key) + " query failed",
+                  error);
+    }
+    format_cache[key] = code;
+    return code;
+  };
+
+  if (want_sheets) {
+    // Named ranges are a readonly property on the model, not a supplier
+    // interface; the collection also answers XIndexAccess.
+    try {
+      Reference<css::beans::XPropertySet> doc_props(model, UNO_QUERY);
+      if (doc_props.is()) {
+        Reference<css::container::XIndexAccess> named;
+        doc_props->getPropertyValue("NamedRanges") >>= named;
+        if (named.is()) {
+          for (sal_Int32 i = 0; i < named->getCount(); i++) {
+            Reference<css::sheet::XNamedRange> range(named->getByIndex(i),
+                                                     UNO_QUERY);
+            if (!range.is()) continue;
+            officev1::StreamPagesResponse event;
+            officev1::SheetNamedRange* out = event.mutable_sheet_named_range();
+            out->set_name(utf8(range->getName()));
+            out->set_content(utf8(range->getContent()));
+            out->set_type_flags(range->getType());
+            if (!emit_fn(event)) return false;
+          }
+        }
+      }
+    } catch (const css::beans::UnknownPropertyException&) {
+      // Expected probe result: NamedRanges is a service property that a
+      // minimal model may not carry.
+    } catch (const css::uno::Exception& error) {
+      warner.warn("named ranges query failed", error);
+    }
+  }
+
+  Reference<css::container::XIndexAccess> sheets(calc_doc->getSheets(),
+                                                 UNO_QUERY);
+  if (!sheets.is()) {
+    warner.warn("spreadsheet sheets are not index accessible");
+    return true;
+  }
+  Reference<css::graphic::XGraphicProvider> provider;
+  if (want_images) provider = graphic_provider(context, warner);
+  PartSelection images_only;
+  images_only.all = false;
+  if (want_images) {
+    images_only.mask = 1u << officev1::DOCUMENT_PART_IMAGES;
+  }
+  int32_t image_counter = 0;
+
+  for (sal_Int32 s = 0; s < sheets->getCount(); s++) {
+    std::string label = "sheet " + std::to_string(s);
+    Reference<css::sheet::XSpreadsheet> sheet(sheets->getByIndex(s), UNO_QUERY);
+    if (!sheet.is()) {
+      warner.warn(label + " is not a spreadsheet object");
+      continue;
+    }
+
+    if (want_sheets) {
+      css::table::CellRangeAddress used;
+      used.Sheet = static_cast<sal_Int16>(s);
+      used.StartRow = 0;
+      used.StartColumn = 0;
+      used.EndRow = 0;
+      used.EndColumn = 0;
+
+      officev1::StreamPagesResponse event;
+      officev1::Sheet* out = event.mutable_sheet();
+      out->set_index(static_cast<int32_t>(s));
+      out->set_tab_color_rgb(-1);
+      Reference<css::container::XNamed> named(sheet, UNO_QUERY);
+      if (named.is()) out->set_name(utf8(named->getName()));
+      Reference<css::beans::XPropertySet> props(sheet, UNO_QUERY);
+      if (props.is()) {
+        try {
+          sal_Bool visible = true;
+          props->getPropertyValue("IsVisible") >>= visible;
+          out->set_visible(visible);
+        } catch (const css::uno::Exception& error) {
+          warner.warn(label + " visibility query failed", error);
+        }
+        try {
+          sal_Int32 color = -1;
+          props->getPropertyValue("TabColor") >>= color;
+          out->set_tab_color_rgb(color);
+        } catch (const css::beans::UnknownPropertyException&) {
+          // Expected probe result: TabColor is an optional sheet property.
+        } catch (const css::uno::Exception& error) {
+          warner.warn(label + " tab color query failed", error);
+        }
+      }
+      // The used-area cursor bounds the walk: collapse to the start, expand
+      // to the end, and read the exact rectangle.
+      try {
+        Reference<css::sheet::XSheetCellCursor> cursor = sheet->createCursor();
+        Reference<css::sheet::XUsedAreaCursor> area(cursor, UNO_QUERY);
+        Reference<css::sheet::XCellRangeAddressable> addressable(cursor,
+                                                                 UNO_QUERY);
+        if (area.is() && addressable.is()) {
+          area->gotoStartOfUsedArea(false);
+          area->gotoEndOfUsedArea(true);
+          used = addressable->getRangeAddress();
+        }
+      } catch (const css::uno::Exception& error) {
+        warner.warn(label + " used area query failed", error);
+      }
+      out->set_used_start_row(used.StartRow);
+      out->set_used_start_column(used.StartColumn);
+      out->set_used_end_row(used.EndRow);
+      out->set_used_end_column(used.EndColumn);
+      try {
+        Reference<css::sheet::XPrintAreas> print(sheet, UNO_QUERY);
+        if (print.is()) {
+          for (const css::table::CellRangeAddress& range :
+               print->getPrintAreas()) {
+            fill_range_ref(range, out->add_print_areas());
+          }
+        }
+      } catch (const css::uno::Exception& error) {
+        warner.warn(label + " print areas query failed", error);
+      }
+      if (!emit_fn(event)) return false;
+
+      for (sal_Int32 r = used.StartRow; r <= used.EndRow; r++) {
+        officev1::StreamPagesResponse row_event;
+        officev1::SheetRow* row = row_event.mutable_sheet_row();
+        row->set_sheet_index(static_cast<int32_t>(s));
+        row->set_row(r);
+        for (sal_Int32 c = used.StartColumn; c <= used.EndColumn; c++) {
+          std::string cell_label = label + " cell r" + std::to_string(r) +
+                                   " c" + std::to_string(c);
+          try {
+            Reference<css::table::XCell> cell = sheet->getCellByPosition(c, r);
+            if (!cell.is()) continue;
+            css::table::CellContentType type = cell->getType();
+            if (type == css::table::CellContentType_EMPTY) continue;
+            officev1::SheetCell* out_cell = row->add_cells();
+            out_cell->set_column(c);
+            switch (type) {
+              case css::table::CellContentType_VALUE:
+                out_cell->set_type(officev1::SHEET_CELL_TYPE_VALUE);
+                break;
+              case css::table::CellContentType_TEXT:
+                out_cell->set_type(officev1::SHEET_CELL_TYPE_TEXT);
+                break;
+              case css::table::CellContentType_FORMULA:
+                out_cell->set_type(officev1::SHEET_CELL_TYPE_FORMULA);
+                break;
+              default:
+                out_cell->set_type(officev1::SHEET_CELL_TYPE_EMPTY);
+                break;
+            }
+            if (type == css::table::CellContentType_FORMULA) {
+              out_cell->set_formula(utf8(cell->getFormula()));
+            }
+            if (type != css::table::CellContentType_TEXT) {
+              out_cell->set_number(cell->getValue());
+            }
+            Reference<css::text::XText> text(cell, UNO_QUERY);
+            if (text.is()) out_cell->set_display(utf8(text->getString()));
+            sal_Int32 key = 0;
+            Reference<css::beans::XPropertySet> cell_props(cell, UNO_QUERY);
+            if (cell_props.is()) {
+              cell_props->getPropertyValue("NumberFormat") >>= key;
+            }
+            out_cell->set_number_format(key);
+            out_cell->set_number_format_string(format_code(key));
+            out_cell->set_merged_columns(1);
+            out_cell->set_merged_rows(1);
+            // The merge cursor is built only when the cheap gate says the
+            // cell is inside a merged region.
+            Reference<css::util::XMergeable> mergeable(cell, UNO_QUERY);
+            if (mergeable.is() && mergeable->getIsMerged()) {
+              Reference<css::sheet::XSheetCellRange> cell_range(cell,
+                                                                UNO_QUERY);
+              if (cell_range.is()) {
+                Reference<css::sheet::XSheetCellCursor> merge_cursor =
+                    sheet->createCursorByRange(cell_range);
+                Reference<css::sheet::XCellRangeAddressable> merge_address(
+                    merge_cursor, UNO_QUERY);
+                if (merge_cursor.is() && merge_address.is()) {
+                  merge_cursor->collapseToMergedArea();
+                  css::table::CellRangeAddress span =
+                      merge_address->getRangeAddress();
+                  if (span.StartRow == r && span.StartColumn == c) {
+                    out_cell->set_merged_columns(span.EndColumn -
+                                                 span.StartColumn + 1);
+                    out_cell->set_merged_rows(span.EndRow - span.StartRow + 1);
+                  }
+                }
+              }
+            }
+          } catch (const css::uno::Exception& error) {
+            warner.warn(cell_label + " extraction failed", error);
+          }
+        }
+        if (row->cells_size() > 0) {
+          if (!emit_fn(row_event)) return false;
+        }
+      }
+
+      try {
+        Reference<css::sheet::XSheetAnnotationsSupplier> supplier(sheet,
+                                                                  UNO_QUERY);
+        if (supplier.is()) {
+          Reference<css::container::XIndexAccess> annotations(
+              supplier->getAnnotations(), UNO_QUERY);
+          if (annotations.is()) {
+            for (sal_Int32 i = 0; i < annotations->getCount(); i++) {
+              Reference<css::sheet::XSheetAnnotation> annotation(
+                  annotations->getByIndex(i), UNO_QUERY);
+              if (!annotation.is()) continue;
+              officev1::StreamPagesResponse comment_event;
+              officev1::SheetCellComment* comment =
+                  comment_event.mutable_sheet_cell_comment();
+              css::table::CellAddress position = annotation->getPosition();
+              comment->set_sheet_index(static_cast<int32_t>(s));
+              comment->set_row(position.Row);
+              comment->set_column(position.Column);
+              comment->set_author(utf8(annotation->getAuthor()));
+              comment->set_date(utf8(annotation->getDate()));
+              comment->set_visible(annotation->getIsVisible());
+              // Annotation text is guaranteed through XSimpleText, not
+              // XText.
+              Reference<css::text::XSimpleText> text(annotation, UNO_QUERY);
+              if (text.is()) comment->set_text(utf8(text->getString()));
+              if (!emit_fn(comment_event)) return false;
+            }
+          }
+        }
+      } catch (const css::uno::Exception& error) {
+        warner.warn(label + " annotations query failed", error);
+      }
+
+      try {
+        Reference<css::table::XTableChartsSupplier> supplier(sheet, UNO_QUERY);
+        if (supplier.is()) {
+          Reference<css::container::XNameAccess> charts(supplier->getCharts(),
+                                                        UNO_QUERY);
+          if (charts.is()) {
+            for (const rtl::OUString& name : charts->getElementNames()) {
+              Reference<css::table::XTableChart> chart(charts->getByName(name),
+                                                       UNO_QUERY);
+              if (!chart.is()) continue;
+              officev1::StreamPagesResponse chart_event;
+              officev1::SheetChart* out_chart =
+                  chart_event.mutable_sheet_chart();
+              out_chart->set_sheet_index(static_cast<int32_t>(s));
+              out_chart->set_name(utf8(name));
+              for (const css::table::CellRangeAddress& range :
+                   chart->getRanges()) {
+                fill_range_ref(range, out_chart->add_ranges());
+              }
+              out_chart->set_has_column_headers(chart->getHasColumnHeaders());
+              out_chart->set_has_row_headers(chart->getHasRowHeaders());
+              if (!emit_fn(chart_event)) return false;
+            }
+          }
+        }
+      } catch (const css::uno::Exception& error) {
+        warner.warn(label + " charts query failed", error);
+      }
+
+      try {
+        Reference<css::sheet::XDataPilotTablesSupplier> supplier(sheet,
+                                                                 UNO_QUERY);
+        if (supplier.is()) {
+          Reference<css::container::XNameAccess> pivots(
+              supplier->getDataPilotTables(), UNO_QUERY);
+          if (pivots.is()) {
+            auto add_fields =
+                [&](const Reference<css::container::XIndexAccess>& fields,
+                    google::protobuf::RepeatedPtrField<std::string>* out_fields) {
+                  if (!fields.is()) return;
+                  for (sal_Int32 i = 0; i < fields->getCount(); i++) {
+                    Reference<css::container::XNamed> field(
+                        fields->getByIndex(i), UNO_QUERY);
+                    if (field.is()) *out_fields->Add() = utf8(field->getName());
+                  }
+                };
+            for (const rtl::OUString& name : pivots->getElementNames()) {
+              css::uno::Any entry = pivots->getByName(name);
+              Reference<css::sheet::XDataPilotDescriptor> descriptor(entry,
+                                                                     UNO_QUERY);
+              Reference<css::sheet::XDataPilotTable> table(entry, UNO_QUERY);
+              officev1::StreamPagesResponse pivot_event;
+              officev1::SheetPivotTable* pivot =
+                  pivot_event.mutable_sheet_pivot_table();
+              pivot->set_sheet_index(static_cast<int32_t>(s));
+              pivot->set_name(utf8(name));
+              if (descriptor.is()) {
+                fill_range_ref(descriptor->getSourceRange(),
+                               pivot->mutable_source_range());
+                add_fields(descriptor->getRowFields(),
+                           pivot->mutable_row_fields());
+                add_fields(descriptor->getColumnFields(),
+                           pivot->mutable_column_fields());
+                add_fields(descriptor->getDataFields(),
+                           pivot->mutable_data_fields());
+                add_fields(descriptor->getPageFields(),
+                           pivot->mutable_page_fields());
+              }
+              if (table.is()) {
+                fill_range_ref(table->getOutputRange(),
+                               pivot->mutable_output_range());
+              }
+              if (!emit_fn(pivot_event)) return false;
+            }
+          }
+        }
+      } catch (const css::uno::Exception& error) {
+        warner.warn(label + " pivot tables query failed", error);
+      }
+    }
+
+    if (want_images) {
+      // The sheet draw page reuses the drawing walker in images-only mode:
+      // EmbeddedImage events keyed to the sheet index, no DrawingShape
+      // events, groups still recursed.
+      try {
+        Reference<css::drawing::XDrawPageSupplier> supplier(sheet, UNO_QUERY);
+        if (supplier.is()) {
+          Reference<css::drawing::XShapes> page(supplier->getDrawPage(),
+                                                UNO_QUERY);
+          if (page.is()) {
+            if (!emit_shapes(page, static_cast<int32_t>(s), "", provider,
+                             &image_counter, images_only, emit_fn, warner)) {
+              return false;
+            }
+          }
+        }
+      } catch (const css::uno::Exception& error) {
+        warner.warn(label + " draw page walk failed", error);
+      }
+    }
+  }
+  return true;
+}
+
 bool emit_notes(const Reference<css::text::XTextDocument>& text_doc,
                 const Reference<css::text::XTextViewCursor>& cursor,
                 bool endnotes, const EmitFn& emit_fn, Warner& warner) {
@@ -1527,6 +1940,15 @@ bool emit_typed_content(const PartSelection& parts, const EmitFn& emit_fn,
           parts.wants(officev1::DOCUMENT_PART_SHAPES);
       if (!wants_text_part) return true;
       return emit_text_content(text_doc, context, parts, emit_fn, warner);
+    }
+    Reference<css::sheet::XSpreadsheetDocument> calc_doc(model, UNO_QUERY);
+    if (calc_doc.is()) {
+      if (!parts.wants(officev1::DOCUMENT_PART_SHEETS) &&
+          !parts.wants(officev1::DOCUMENT_PART_IMAGES)) {
+        return true;
+      }
+      return emit_calc_content(calc_doc, model, context, parts, emit_fn,
+                               warner);
     }
     Reference<css::lang::XServiceInfo> info(model, UNO_QUERY);
     // Impress models also supply draw pages, so the presentation branch is

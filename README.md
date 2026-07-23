@@ -46,6 +46,12 @@ at STANDARD plus COMMENTS):
   shapes, imported textboxes included. Drawing documents emit `DrawingShape` events (shape type, name,
   position and size in twips, rotation, group nesting, text runs) in
   page-then-paint order, plus `EmbeddedImage` events for image shapes.
+  Spreadsheets emit one `Sheet` header per sheet (name, visibility, tab
+  color, used bounds, print areas) followed by `SheetRow` events carrying
+  only the used range's non-empty typed cells (cell type, formula, numeric
+  value, display string, number-format key and code, merge span), plus
+  `SheetCellComment`, `SheetChart`, and `SheetPivotTable` events per sheet
+  and `SheetNamedRange` events per workbook.
   Presentations emit one `Slide` header per slide (name, autolayout,
   master page) followed by `SlideShape` events in paint order, each with
   its placeholder role, geometry in twips, and text paragraphs carrying
