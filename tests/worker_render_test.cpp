@@ -922,6 +922,149 @@ void verify_part_selection() {
           "draw-images-only extracts the image");
 }
 
+// A flat ODT with three embedded objects: a Math formula, a bar chart with
+// three categories and two numeric series, and an embedded spreadsheet.
+// Flat ODF embeds each object's document inline, keeping the fixture
+// diskless and reviewable.
+const char kEmbeddedFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+ xmlns:chart="urn:oasis:names:tc:opendocument:xmlns:chart:1.0"
+ office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:body><office:text>
+  <text:p>Objects follow.</text:p>
+  <text:p>The flat XML type detector matches any office:mimetype token in
+   the first four thousand bytes of the file, so this filler paragraph
+   keeps the nested spreadsheet object's mimetype beyond that window and
+   the document reliably detected as text. It carries no assertions of its
+   own; it only pads the byte offset of the objects below, which is why it
+   rambles on for a few more words than any reasonable paragraph would
+   otherwise need to.</text:p>
+  <text:p><draw:frame draw:name="Math1" svg:width="3cm" svg:height="1cm"><draw:object>
+   <math xmlns="http://www.w3.org/1998/Math/MathML" display="block">
+    <semantics>
+     <mrow><msup><mi>a</mi><mn>2</mn></msup><mo>+</mo><msup><mi>b</mi><mn>2</mn></msup><mo>=</mo><msup><mi>c</mi><mn>2</mn></msup></mrow>
+     <annotation encoding="StarMath 5.0">a^2 + b^2 = c^2</annotation>
+    </semantics>
+   </math>
+  </draw:object></draw:frame></text:p>
+  <text:p><draw:frame draw:name="Chart1" svg:width="8cm" svg:height="6cm"><draw:object>
+   <office:document office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.chart">
+    <office:body><office:chart>
+     <chart:chart chart:class="chart:bar">
+      <chart:title><text:p>Sales</text:p></chart:title>
+      <chart:plot-area>
+       <chart:axis chart:dimension="x" chart:name="primary-x"><chart:categories table:cell-range-address="local-table.$A$2:.$A$4"/></chart:axis>
+       <chart:axis chart:dimension="y" chart:name="primary-y"/>
+       <chart:series chart:values-cell-range-address="local-table.$B$2:.$B$4" chart:label-cell-address="local-table.$B$1"><chart:data-point chart:repeated="3"/></chart:series>
+       <chart:series chart:values-cell-range-address="local-table.$C$2:.$C$4" chart:label-cell-address="local-table.$C$1"><chart:data-point chart:repeated="3"/></chart:series>
+      </chart:plot-area>
+      <table:table table:name="local-table">
+       <table:table-header-columns><table:table-column/></table:table-header-columns>
+       <table:table-columns><table:table-column table:number-columns-repeated="2"/></table:table-columns>
+       <table:table-header-rows>
+        <table:table-row><table:table-cell/><table:table-cell office:value-type="string"><text:p>Alpha</text:p></table:table-cell><table:table-cell office:value-type="string"><text:p>Beta</text:p></table:table-cell></table:table-row>
+       </table:table-header-rows>
+       <table:table-rows>
+        <table:table-row><table:table-cell office:value-type="string"><text:p>Q1</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="1"><text:p>1</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="4"><text:p>4</text:p></table:table-cell></table:table-row>
+        <table:table-row><table:table-cell office:value-type="string"><text:p>Q2</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="2"><text:p>2</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="5"><text:p>5</text:p></table:table-cell></table:table-row>
+        <table:table-row><table:table-cell office:value-type="string"><text:p>Q3</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="3"><text:p>3</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="6"><text:p>6</text:p></table:table-cell></table:table-row>
+       </table:table-rows>
+      </table:table>
+     </chart:chart>
+    </office:chart></office:body>
+   </office:document>
+  </draw:object></draw:frame></text:p>
+  <text:p><draw:frame draw:name="Calc1" svg:width="6cm" svg:height="3cm"><draw:object>
+   <office:document office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.spreadsheet">
+    <office:body><office:spreadsheet>
+     <table:table table:name="Inner">
+      <table:table-row><table:table-cell office:value-type="string"><text:p>K</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="7"><text:p>7</text:p></table:table-cell></table:table-row>
+      <table:table-row><table:table-cell office:value-type="string"><text:p>L</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="8"><text:p>8</text:p></table:table-cell></table:table-row>
+     </table:table>
+    </office:spreadsheet></office:body>
+   </office:document>
+  </draw:object></draw:frame></text:p>
+ </office:text></office:body>
+</office:document>
+)";
+
+void verify_embedded_objects() {
+  std::vector<std::string> payloads;
+  auto outcome = run("pages", "fodt", kEmbeddedFodt, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "embedded fodt renders ok: " + outcome.detail);
+  std::vector<officev1::EmbeddedObject> objects;
+  officev1::StreamPagesResponse event;
+  for (const std::string& payload : payloads) {
+    require(event.ParseFromString(payload), "embedded event parses");
+    if (event.has_embedded_object()) objects.push_back(event.embedded_object());
+  }
+  require(objects.size() == 3, "three embedded objects, got " +
+                                   std::to_string(objects.size()));
+  bool formula_ok = false;
+  bool chart_ok = false;
+  bool sheet_ok = false;
+  for (const officev1::EmbeddedObject& object : objects) {
+    if (object.kind() == officev1::EMBEDDED_OBJECT_KIND_FORMULA) {
+      formula_ok = object.formula().find("a^2") != std::string::npos &&
+                   object.page_index() == 0 && object.width_twips() > 0;
+    }
+    if (object.kind() == officev1::EMBEDDED_OBJECT_KIND_CHART) {
+      const officev1::EmbeddedChart& chart = object.chart();
+      bool series_ok =
+          chart.series_size() == 2 && chart.series(0).values_y_size() == 3 &&
+          chart.series(0).values_y(0) == 1.0 &&
+          chart.series(0).values_y(2) == 3.0 &&
+          chart.series(1).values_y_size() == 3 &&
+          chart.series(1).values_y(2) == 6.0 &&
+          chart.series(0).label() == "Alpha" &&
+          chart.series(1).label() == "Beta";
+      bool categories_ok = chart.categories_size() == 3 &&
+                           chart.categories(0) == "Q1" &&
+                           chart.categories(2) == "Q3";
+      bool tabular_ok = chart.tabular().rows() == 4 &&
+                        chart.tabular().columns() == 3 &&
+                        chart.tabular().cells_size() > 0;
+      chart_ok = !chart.chart_type_service().empty() &&
+                 chart.kind() != officev1::EMBEDDED_CHART_KIND_UNSPECIFIED &&
+                 chart.title() == "Sales" && series_ok && categories_ok &&
+                 tabular_ok;
+    }
+    if (object.kind() == officev1::EMBEDDED_OBJECT_KIND_SPREADSHEET) {
+      const officev1::TableData& table = object.inner_table();
+      bool sampled = false;
+      for (const officev1::TableCellData& cell : table.cells()) {
+        if (cell.row() == 1 && cell.column() == 1 && cell.text() == "8") {
+          sampled = true;
+        }
+      }
+      sheet_ok = table.rows() == 2 && table.columns() == 2 && sampled;
+    }
+  }
+  require(formula_ok, "formula object with StarMath command and anchor page");
+  require(chart_ok, "chart object with typed series, categories, and grid");
+  require(sheet_ok, "embedded spreadsheet projected to its used grid");
+  officev1::StreamPagesResponse last;
+  require(last.ParseFromString(payloads.back()), "embedded last event parses");
+  require(last.has_status() &&
+              last.status().state() == officev1::RenderStatus::STATE_OK,
+          "embedded stream ends ok");
+
+  // Born gated: EMBEDDED_OBJECTS only emits object events and nothing else.
+  std::map<int, int> counts =
+      run_selection("fodt", kEmbeddedFodt, "14", "embedded-only");
+  require(counts[officev1::StreamPagesResponse::kEmbeddedObject] == 3,
+          "embedded-only emits the objects");
+  require(counts[officev1::StreamPagesResponse::kPageImage] == 0 &&
+              counts[officev1::StreamPagesResponse::kMetadata] == 0 &&
+              counts[officev1::StreamPagesResponse::kParagraph] == 0,
+          "embedded-only emits no pages, metadata, or paragraphs");
+}
+
 void verify_corrupt_zip_is_load_failure() {
   // Plain ASCII garbage would not do here: the office core content-sniffs
   // it as text and loads it. A broken zip container is genuinely unloadable
@@ -949,6 +1092,7 @@ int main() {
   verify_draw_shapes();
   verify_typed_presentation();
   verify_part_selection();
+  verify_embedded_objects();
   verify_corrupt_zip_is_load_failure();
   std::cout << "worker-render-test passed\n";
   return 0;

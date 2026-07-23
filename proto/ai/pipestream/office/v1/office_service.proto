@@ -189,7 +189,10 @@ message StreamPagesResponse {
     // imported textbox) with its styled runs. Currently emitted for text
     // documents.
     Shape shape = 16;
-    // Tag 17 is reserved for the embedded-object event.
+    // One embedded OLE object, chart, spreadsheet, or formula, with its
+    // classified inner content and replacement graphic. Emitted for every
+    // document class.
+    EmbeddedObject embedded_object = 17;
     // One sheet header for a spreadsheet: identity, visibility, and the
     // used bounds. Emitted for spreadsheet documents, before the sheet's
     // rows.
@@ -526,6 +529,134 @@ message EmbeddedImage {
   int64 width_twips = 7;
   // Laid-out height in twips.
   int64 height_twips = 8;
+}
+
+// EmbeddedObjectKind classifies an embedded object's inner content.
+enum EmbeddedObjectKind {
+  // Unset; never emitted.
+  EMBEDDED_OBJECT_KIND_UNSPECIFIED = 0;
+  // An embedded chart.
+  EMBEDDED_OBJECT_KIND_CHART = 1;
+  // An embedded spreadsheet.
+  EMBEDDED_OBJECT_KIND_SPREADSHEET = 2;
+  // An embedded Math formula.
+  EMBEDDED_OBJECT_KIND_FORMULA = 3;
+  // Any other OLE payload, carrying only a replacement graphic.
+  EMBEDDED_OBJECT_KIND_OLE_OTHER = 4;
+}
+
+// EmbeddedChartKind is the coarse chart family, mapped from the raw chart
+// type service name.
+enum EmbeddedChartKind {
+  // Unset or unrecognized service name; read chart_type_service and use
+  // EmbeddedChart.tabular.
+  EMBEDDED_CHART_KIND_UNSPECIFIED = 0;
+  // Horizontal bar chart.
+  EMBEDDED_CHART_KIND_BAR = 1;
+  // Vertical column chart.
+  EMBEDDED_CHART_KIND_COLUMN = 2;
+  // Line chart.
+  EMBEDDED_CHART_KIND_LINE = 3;
+  // Area chart.
+  EMBEDDED_CHART_KIND_AREA = 4;
+  // Pie chart.
+  EMBEDDED_CHART_KIND_PIE = 5;
+  // Scatter (XY) chart.
+  EMBEDDED_CHART_KIND_SCATTER = 6;
+  // Bubble chart.
+  EMBEDDED_CHART_KIND_BUBBLE = 7;
+  // Net (radar) chart.
+  EMBEDDED_CHART_KIND_NET = 8;
+  // Candlestick (stock) chart.
+  EMBEDDED_CHART_KIND_CANDLESTICK = 9;
+  // Any other chart family; read chart_type_service.
+  EMBEDDED_CHART_KIND_OTHER = 10;
+}
+
+// EmbeddedChartSeries is one data series of an embedded chart, with numbers
+// kept numeric.
+message EmbeddedChartSeries {
+  // The series label; empty when unset.
+  string label = 1;
+  // The y values, in category order.
+  repeated double values_y = 2;
+  // The x values, for scatter and bubble charts; empty otherwise.
+  repeated double values_x = 3;
+  // The bubble sizes, for bubble charts; empty otherwise.
+  repeated double sizes = 4;
+}
+
+// EmbeddedChart is the data extracted from an embedded chart's live model:
+// its type, titles, category axis, and one or more numeric series, plus a
+// tabular projection that is always populated.
+message EmbeddedChart {
+  // The classified chart kind, mapped from chart_type_service.
+  EmbeddedChartKind kind = 1;
+  // The raw chart type service name, for example
+  // "com.sun.star.chart2.BarChartType"; captured verbatim so a consumer can
+  // recover detail this contract does not model.
+  string chart_type_service = 2;
+  // The chart title; empty when unset.
+  string title = 3;
+  // The primary x or category axis title; empty when unset.
+  string x_axis_title = 4;
+  // The primary y axis title; empty when unset.
+  string y_axis_title = 5;
+  // Category labels from the category axis, in order; empty for charts
+  // without a category axis, such as scatter.
+  repeated string categories = 6;
+  // The chart's data series, in order.
+  repeated EmbeddedChartSeries series = 7;
+  // A projection of the chart as a cell grid: categories down the first
+  // column, one series per further column, with a label row on top. Always
+  // populated so any chart can be represented, including kinds this
+  // contract does not model. Reuses TableData; its caret start and end
+  // points are left unset.
+  TableData tabular = 8;
+}
+
+// EmbeddedObject is one embedded object discovered in the loaded document:
+// an OLE2 object, an embedded chart, an embedded spreadsheet, a Math
+// formula, or another OLE payload carrying only a replacement graphic.
+// Emitted for every document class, in discovery order.
+message EmbeddedObject {
+  // Zero-based index in discovery order, counted separately from
+  // EmbeddedImage.
+  int32 index = 1;
+  // The classified kind of the inner content.
+  EmbeddedObjectKind kind = 2;
+  // Zero-based page the object sits on; matches PageImage.index. -1 when
+  // the page could not be resolved.
+  int32 page_index = 3;
+  // The object's name from the document; may be empty.
+  string name = 4;
+  // The object's class id (CLSID) as stored; may be empty.
+  string clsid = 5;
+  // Caret position of the object's text anchor in the live layout. Set only
+  // for Writer text-anchored objects; unset for draw-page shapes.
+  TwipsPoint anchor = 6;
+  // Top-left position on the page in twips. Set for draw-page shapes;
+  // unset for Writer text-anchored objects.
+  TwipsPoint position = 7;
+  // Laid-out width in twips; 0 when unknown.
+  int64 width_twips = 8;
+  // Laid-out height in twips; 0 when unknown.
+  int64 height_twips = 9;
+  // MIME type of replacement_image. The object's stored replacement format
+  // when the graphic provider can round-trip it, otherwise "image/png".
+  string replacement_mime_type = 10;
+  // The replacement graphic bytes, re-encoded through the graphic provider;
+  // empty when no replacement graphic was available.
+  bytes replacement_image = 11;
+  // The extracted chart; set only when kind is EMBEDDED_OBJECT_KIND_CHART.
+  EmbeddedChart chart = 12;
+  // The embedded spreadsheet's used range as a cell grid; set only when
+  // kind is EMBEDDED_OBJECT_KIND_SPREADSHEET. Reuses TableData; its caret
+  // start and end points are left unset.
+  TableData inner_table = 13;
+  // The StarMath command string; set only when kind is
+  // EMBEDDED_OBJECT_KIND_FORMULA.
+  string formula = 14;
 }
 
 // SheetCellType is the office core's cell content classification, mirroring
@@ -922,7 +1053,7 @@ message GetServiceInfoResponse {
   int32 render_dpi = 9;
   // True when StreamPages emits typed content events (DocumentMetadata,
   // Paragraph, TableData, EmbeddedImage, DrawingShape, Slide, SlideShape,
-  // TextFrame, Shape, and the Sheet family) alongside page images,
-  // selectable per request through StreamOptions.
+  // TextFrame, Shape, EmbeddedObject, and the Sheet family) alongside page
+  // images, selectable per request through StreamOptions.
   bool typed_content = 10;
 }

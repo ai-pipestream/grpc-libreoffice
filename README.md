@@ -46,6 +46,11 @@ at STANDARD plus COMMENTS):
   shapes, imported textboxes included. Drawing documents emit `DrawingShape` events (shape type, name,
   position and size in twips, rotation, group nesting, text runs) in
   page-then-paint order, plus `EmbeddedImage` events for image shapes.
+  Embedded objects emit `EmbeddedObject` events for every document class:
+  charts with typed numeric series, categories, titles, and a tabular
+  projection walked from the live chart model; embedded spreadsheets as a
+  used-range cell grid; Math formulas as their StarMath command; and other
+  OLE payloads with their replacement graphic, geometry, and class id.
   Spreadsheets emit one `Sheet` header per sheet (name, visibility, tab
   color, used bounds, print areas) followed by `SheetRow` events carrying
   only the used range's non-empty typed cells (cell type, formula, numeric
