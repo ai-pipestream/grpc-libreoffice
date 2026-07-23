@@ -40,8 +40,10 @@ at STANDARD plus COMMENTS):
   events (original or re-encoded bytes, anchor position, laid-out size),
   `Footnote` events (label, anchor, content runs), `HeaderFooter` content
   per page style, `PageStyleInfo` (page size, margins, columns, in twips),
-  and `DocumentIndex` events (tables of contents and other generated
-  indexes). Drawing documents emit `DrawingShape` events (shape type, name,
+  `DocumentIndex` events (tables of contents and other generated
+  indexes), `TextFrame` events (styled runs, layout anchor, laid-out size,
+  and text-chain names), and `Shape` events for text-bearing draw-page
+  shapes, imported textboxes included. Drawing documents emit `DrawingShape` events (shape type, name,
   position and size in twips, rotation, group nesting, text runs) in
   page-then-paint order, plus `EmbeddedImage` events for image shapes.
   Presentations emit one `Slide` header per slide (name, autolayout,

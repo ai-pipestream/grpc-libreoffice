@@ -17,6 +17,7 @@
 #include <com/sun/star/beans/PropertyValue.hpp>
 #include <com/sun/star/beans/UnknownPropertyException.hpp>
 #include <com/sun/star/beans/XPropertySet.hpp>
+#include <com/sun/star/beans/XPropertySetInfo.hpp>
 #include <com/sun/star/container/XEnumerationAccess.hpp>
 #include <com/sun/star/container/XNameAccess.hpp>
 #include <com/sun/star/container/XIndexAccess.hpp>
@@ -56,6 +57,8 @@
 #include <com/sun/star/text/XTextContent.hpp>
 #include <com/sun/star/text/XTextDocument.hpp>
 #include <com/sun/star/text/XTextColumns.hpp>
+#include <com/sun/star/text/XTextFrame.hpp>
+#include <com/sun/star/text/XTextFramesSupplier.hpp>
 #include <com/sun/star/text/XTextRange.hpp>
 #include <com/sun/star/text/XTextTable.hpp>
 #include <com/sun/star/text/XTextViewCursor.hpp>
@@ -503,6 +506,22 @@ bool emit_table(const Reference<css::text::XTextTable>& table, int32_t index,
   return emit_fn(event);
 }
 
+// Flattens the paragraphs of an arbitrary text (footnote body, generated
+// index, frame or shape text) into runs outside the annotation space.
+void flatten_text_runs(const Reference<css::text::XText>& text,
+                       const std::string& label,
+                       google::protobuf::RepeatedPtrField<officev1::TextRun>* runs,
+                       Warner& warner) {
+  Reference<css::container::XEnumerationAccess> access(text, UNO_QUERY);
+  if (!access.is()) return;
+  Reference<css::container::XEnumeration> paragraphs = access->createEnumeration();
+  while (paragraphs->hasMoreElements()) {
+    Reference<css::container::XEnumerationAccess> paragraph(
+        paragraphs->nextElement(), UNO_QUERY);
+    if (paragraph.is()) fill_runs(paragraph, label, runs, nullptr, warner);
+  }
+}
+
 // Creates the office core's graphic provider. Warns and returns an empty
 // reference when unavailable, so callers still emit image metadata without
 // bytes.
@@ -567,17 +586,28 @@ void encode_graphic(const Reference<css::graphic::XGraphic>& graphic,
   }
 }
 
-bool emit_images(const Reference<css::text::XTextDocument>& text_doc,
-                 const Reference<css::uno::XComponentContext>& context,
-                 const Reference<css::text::XTextViewCursor>& cursor,
-                 const EmitFn& emit_fn, Warner& warner) {
+// Walks the text document's single draw page once and classifies each
+// shape: graphic objects emit EmbeddedImage (gated on IMAGES), draw-page
+// SwXTextFrame flys are skipped because emit_text_frames owns them, and the
+// remaining text-bearing shapes (custom shapes, text shapes, imported
+// textboxes whose XText resolves to their hidden backing frame) emit Shape
+// events (gated on SHAPES). Control shapes and empty-text shapes are
+// skipped silently.
+bool emit_draw_shapes(const Reference<css::text::XTextDocument>& text_doc,
+                      const Reference<css::uno::XComponentContext>& context,
+                      const Reference<css::text::XTextViewCursor>& cursor,
+                      const PartSelection& parts, const EmitFn& emit_fn,
+                      Warner& warner) {
   Reference<css::drawing::XDrawPageSupplier> supplier(text_doc, UNO_QUERY);
   if (!supplier.is()) return true;
   Reference<css::container::XIndexAccess> shapes(supplier->getDrawPage(), UNO_QUERY);
   if (!shapes.is()) return true;
-  Reference<css::graphic::XGraphicProvider> provider =
-      graphic_provider(context, warner);
-  int32_t emitted = 0;
+  bool want_images = parts.wants(officev1::DOCUMENT_PART_IMAGES);
+  bool want_shapes = parts.wants(officev1::DOCUMENT_PART_SHAPES);
+  Reference<css::graphic::XGraphicProvider> provider;
+  if (want_images) provider = graphic_provider(context, warner);
+  int32_t image_index = 0;
+  int32_t shape_index = 0;
   for (sal_Int32 i = 0; i < shapes->getCount(); i++) {
     std::string label = "shape " + std::to_string(i);
     Reference<css::beans::XPropertySet> props;
@@ -588,70 +618,198 @@ bool emit_images(const Reference<css::text::XTextDocument>& text_doc,
       continue;
     }
     if (!props.is()) continue;
-    // Only image shapes carry a source graphic. Frames, drawings, and other
-    // shape kinds get their own event types later.
     Reference<css::lang::XServiceInfo> services(props, UNO_QUERY);
-    if (!services.is() ||
-        !(services->supportsService("com.sun.star.text.TextGraphicObject") ||
-          services->supportsService("com.sun.star.drawing.GraphicObjectShape"))) {
+    if (!services.is()) continue;
+
+    if (services->supportsService("com.sun.star.text.TextGraphicObject") ||
+        services->supportsService("com.sun.star.drawing.GraphicObjectShape")) {
+      if (!want_images) continue;
+      Reference<css::graphic::XGraphic> graphic;
+      try {
+        props->getPropertyValue("Graphic") >>= graphic;
+      } catch (const css::uno::Exception& error) {
+        warner.warn(label + " graphic query failed", error);
+        continue;
+      }
+      if (!graphic.is()) continue;
+
+      officev1::StreamPagesResponse event;
+      officev1::EmbeddedImage* out = event.mutable_embedded_image();
+      out->set_index(image_index);
+      out->set_page_index(-1);
+      Reference<css::container::XNamed> named(props, UNO_QUERY);
+      if (named.is()) out->set_name(utf8(named->getName()));
+      std::string image_label = "image " + std::to_string(image_index);
+
+      encode_graphic(graphic, provider, image_label, out->mutable_mime_type(),
+                     out->mutable_data(), warner);
+
+      try {
+        Reference<css::text::XTextContent> content(props, UNO_QUERY);
+        if (content.is()) {
+          int32_t page_index = -1;
+          caret_at(cursor, content->getAnchor(), image_label + " anchor",
+                   out->mutable_anchor(), &page_index, warner);
+          out->set_page_index(page_index);
+        }
+        css::awt::Size layout_size;
+        props->getPropertyValue("LayoutSize") >>= layout_size;
+        out->set_width_twips(hundredth_mm_to_twips(layout_size.Width));
+        out->set_height_twips(hundredth_mm_to_twips(layout_size.Height));
+      } catch (const css::uno::Exception& error) {
+        warner.warn(image_label + " geometry query failed", error);
+      }
+
+      if (!emit_fn(event)) return false;
+      image_index++;
       continue;
     }
-    Reference<css::graphic::XGraphic> graphic;
+
+    // Writer text frames surface on the draw page as SwXTextFrame too;
+    // emit_text_frames owns them, so skipping here is the dedup that keeps
+    // each frame a single event.
+    if (services->supportsService("com.sun.star.text.TextFrame")) continue;
+    if (!want_shapes) continue;
+    if (services->supportsService("com.sun.star.drawing.ControlShape")) {
+      continue;
+    }
+    Reference<css::text::XText> text(props, UNO_QUERY);
+    if (!text.is()) continue;
+    std::string content_text;
     try {
-      props->getPropertyValue("Graphic") >>= graphic;
+      content_text = utf8(text->getString());
     } catch (const css::uno::Exception& error) {
-      warner.warn(label + " graphic query failed", error);
+      warner.warn(label + " text query failed", error);
       continue;
     }
-    if (!graphic.is()) continue;
+    if (content_text.empty()) continue;
 
     officev1::StreamPagesResponse event;
-    officev1::EmbeddedImage* out = event.mutable_embedded_image();
-    out->set_index(emitted);
+    officev1::Shape* out = event.mutable_shape();
+    out->set_index(shape_index);
     out->set_page_index(-1);
     Reference<css::container::XNamed> named(props, UNO_QUERY);
     if (named.is()) out->set_name(utf8(named->getName()));
-    std::string image_label = "image " + std::to_string(emitted);
-
-    encode_graphic(graphic, provider, image_label, out->mutable_mime_type(),
-                   out->mutable_data(), warner);
-
+    Reference<css::drawing::XShape> shape(props, UNO_QUERY);
+    if (shape.is()) {
+      out->set_shape_type(utf8(shape->getShapeType()));
+      try {
+        css::awt::Size size = shape->getSize();
+        out->set_width_twips(hundredth_mm_to_twips(size.Width));
+        out->set_height_twips(hundredth_mm_to_twips(size.Height));
+      } catch (const css::uno::Exception& error) {
+        warner.warn(label + " geometry query failed", error);
+      }
+    }
     try {
       Reference<css::text::XTextContent> content(props, UNO_QUERY);
       if (content.is()) {
         int32_t page_index = -1;
-        caret_at(cursor, content->getAnchor(), image_label + " anchor",
+        caret_at(cursor, content->getAnchor(), label + " anchor",
                  out->mutable_anchor(), &page_index, warner);
         out->set_page_index(page_index);
       }
-      css::awt::Size layout_size;
-      props->getPropertyValue("LayoutSize") >>= layout_size;
-      out->set_width_twips(hundredth_mm_to_twips(layout_size.Width));
-      out->set_height_twips(hundredth_mm_to_twips(layout_size.Height));
     } catch (const css::uno::Exception& error) {
-      warner.warn(image_label + " geometry query failed", error);
+      warner.warn(label + " anchor query failed", error);
     }
-
+    // Linked textboxes carry the chain names on the shape; absence is the
+    // normal case, so probe the property set first.
+    try {
+      Reference<css::beans::XPropertySetInfo> info = props->getPropertySetInfo();
+      if (info.is() && info->hasPropertyByName("ChainNextName")) {
+        rtl::OUString chain;
+        props->getPropertyValue("ChainNextName") >>= chain;
+        out->set_chain_next(utf8(chain));
+      }
+      if (info.is() && info->hasPropertyByName("ChainPrevName")) {
+        rtl::OUString chain;
+        props->getPropertyValue("ChainPrevName") >>= chain;
+        out->set_chain_prev(utf8(chain));
+      }
+    } catch (const css::uno::Exception& error) {
+      warner.warn(label + " chain query failed", error);
+    }
+    flatten_text_runs(text, label, out->mutable_runs(), warner);
     if (!emit_fn(event)) return false;
-    emitted++;
+    shape_index++;
   }
   return true;
 }
 
-// Flattens the paragraphs of an arbitrary text (footnote body, generated
-// index) into runs outside the annotation space.
-void flatten_text_runs(const Reference<css::text::XText>& text,
-                       const std::string& label,
-                       google::protobuf::RepeatedPtrField<officev1::TextRun>* runs,
-                       Warner& warner) {
-  Reference<css::container::XEnumerationAccess> access(text, UNO_QUERY);
-  if (!access.is()) return;
-  Reference<css::container::XEnumeration> paragraphs = access->createEnumeration();
-  while (paragraphs->hasMoreElements()) {
-    Reference<css::container::XEnumerationAccess> paragraph(
-        paragraphs->nextElement(), UNO_QUERY);
-    if (paragraph.is()) fill_runs(paragraph, label, runs, nullptr, warner);
+// Emits every Writer text frame with its runs, chain names, layout anchor,
+// and laid-out geometry. Textbox-backing hidden frames are not in this
+// enumeration (the office core excludes them); their text arrives through
+// the draw-shape pass instead, so the two passes never overlap.
+bool emit_text_frames(const Reference<css::text::XTextDocument>& text_doc,
+                      const Reference<css::text::XTextViewCursor>& cursor,
+                      const EmitFn& emit_fn, Warner& warner) {
+  Reference<css::text::XTextFramesSupplier> supplier(text_doc, UNO_QUERY);
+  if (!supplier.is()) return true;
+  Reference<css::container::XIndexAccess> frames(supplier->getTextFrames(),
+                                                 UNO_QUERY);
+  if (!frames.is()) return true;
+  for (sal_Int32 i = 0; i < frames->getCount(); i++) {
+    std::string label = "text frame " + std::to_string(i);
+    officev1::StreamPagesResponse event;
+    officev1::TextFrame* out = event.mutable_text_frame();
+    out->set_index(i);
+    out->set_page_index(-1);
+    try {
+      Reference<css::text::XTextFrame> frame(frames->getByIndex(i), UNO_QUERY);
+      if (!frame.is()) {
+        warner.warn(label + " is not a text frame object");
+        continue;
+      }
+      Reference<css::container::XNamed> named(frame, UNO_QUERY);
+      if (named.is()) out->set_name(utf8(named->getName()));
+      Reference<css::text::XTextContent> content(frame, UNO_QUERY);
+      if (content.is()) {
+        int32_t page_index = -1;
+        caret_at(cursor, content->getAnchor(), label + " anchor",
+                 out->mutable_anchor(), &page_index, warner);
+        out->set_page_index(page_index);
+      }
+      Reference<css::beans::XPropertySet> props(frame, UNO_QUERY);
+      if (props.is()) {
+        // Prefer the laid-out size; fall back to the model width and height.
+        // All of these are 1/100 mm on the wire out of the office core.
+        css::awt::Size size;
+        size.Width = 0;
+        size.Height = 0;
+        try {
+          css::awt::Size layout_size;
+          if ((props->getPropertyValue("LayoutSize") >>= layout_size) &&
+              layout_size.Width > 0 && layout_size.Height > 0) {
+            size = layout_size;
+          }
+        } catch (const css::beans::UnknownPropertyException&) {
+          // Expected probe result: LayoutSize is an optional frame property.
+        }
+        if (size.Width == 0 && size.Height == 0) {
+          sal_Int32 width = 0, height = 0;
+          props->getPropertyValue("Width") >>= width;
+          props->getPropertyValue("Height") >>= height;
+          size.Width = width;
+          size.Height = height;
+        }
+        out->set_width_twips(hundredth_mm_to_twips(size.Width));
+        out->set_height_twips(hundredth_mm_to_twips(size.Height));
+        // Chain names are maybevoid: present on every real frame, void or
+        // empty when the frame is not chained.
+        rtl::OUString chain;
+        props->getPropertyValue("ChainNextName") >>= chain;
+        out->set_chain_next(utf8(chain));
+        chain = rtl::OUString();
+        props->getPropertyValue("ChainPrevName") >>= chain;
+        out->set_chain_prev(utf8(chain));
+      }
+      flatten_text_runs(frame->getText(), label, out->mutable_runs(), warner);
+    } catch (const css::uno::Exception& error) {
+      warner.warn(label + " extraction failed", error);
+    }
+    if (!emit_fn(event)) return false;
   }
+  return true;
 }
 
 // Walks one shape container in paint order, emitting a DrawingShape per
@@ -1313,8 +1471,12 @@ bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
       parts.wants(officev1::DOCUMENT_PART_HEADERS_FOOTERS)) {
     if (!emit_page_styles(model, parts, emit_fn, warner)) return false;
   }
-  if (parts.wants(officev1::DOCUMENT_PART_IMAGES)) {
-    return emit_images(text_doc, context, cursor, emit_fn, warner);
+  if (parts.wants(officev1::DOCUMENT_PART_TEXT_FRAMES)) {
+    if (!emit_text_frames(text_doc, cursor, emit_fn, warner)) return false;
+  }
+  if (parts.wants(officev1::DOCUMENT_PART_IMAGES) ||
+      parts.wants(officev1::DOCUMENT_PART_SHAPES)) {
+    return emit_draw_shapes(text_doc, context, cursor, parts, emit_fn, warner);
   }
   return true;
 }
@@ -1360,7 +1522,9 @@ bool emit_typed_content(const PartSelection& parts, const EmitFn& emit_fn,
           parts.wants(officev1::DOCUMENT_PART_FOOTNOTES) ||
           parts.wants(officev1::DOCUMENT_PART_HEADERS_FOOTERS) ||
           parts.wants(officev1::DOCUMENT_PART_PAGE_STYLES) ||
-          parts.wants(officev1::DOCUMENT_PART_INDEXES);
+          parts.wants(officev1::DOCUMENT_PART_INDEXES) ||
+          parts.wants(officev1::DOCUMENT_PART_TEXT_FRAMES) ||
+          parts.wants(officev1::DOCUMENT_PART_SHAPES);
       if (!wants_text_part) return true;
       return emit_text_content(text_doc, context, parts, emit_fn, warner);
     }

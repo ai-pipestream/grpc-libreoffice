@@ -129,9 +129,10 @@ message StreamPagesRequest {
 // DocumentInfo first, then one PageImage per page in page order, then
 // DocumentMetadata and typed content events in reading order, then
 // RenderStatus. For text documents the typed content events are Paragraph,
-// TableData, EmbeddedImage, Footnote, HeaderFooter, PageStyleInfo, and
-// DocumentIndex. For drawing documents they are DrawingShape events in
-// page-then-paint order, plus EmbeddedImage events for image shapes. For
+// TableData, EmbeddedImage, Footnote, HeaderFooter, PageStyleInfo,
+// DocumentIndex, TextFrame, and Shape. For drawing documents they are
+// DrawingShape events in page-then-paint order, plus EmbeddedImage events
+// for image shapes. For
 // presentation documents they are one Slide header per slide followed by its
 // SlideShape events in paint order. Every
 // event between DocumentInfo and RenderStatus is subject to the request's
@@ -178,6 +179,13 @@ message StreamPagesResponse {
     // One shape on a slide or its notes page. Emitted for presentation
     // documents in paint order after the slide it belongs to.
     SlideShape slide_shape = 14;
+    // One text frame with its styled runs, layout anchor, and chain names.
+    // Currently emitted for text documents.
+    TextFrame text_frame = 15;
+    // One text-bearing draw-page shape (custom shape, text shape, or an
+    // imported textbox) with its styled runs. Currently emitted for text
+    // documents.
+    Shape shape = 16;
   }
 }
 
@@ -498,6 +506,74 @@ message EmbeddedImage {
   int64 height_twips = 8;
 }
 
+// TextFrame is one Writer text frame, in discovery order, with its styled
+// runs, the layout anchor of its anchor point, its laid-out geometry, and
+// its text-chain neighbours. A frame's text is out of the body flow, so
+// every run carries char_offset -1. Linked frames form one logical reading
+// text; the chain names recover that order.
+message TextFrame {
+  // Zero-based frame index in discovery order.
+  int32 index = 1;
+  // The frame's name from the document, for example "Frame1".
+  string name = 2;
+  // Zero-based page the frame's anchor sits on; matches PageImage.index. -1
+  // when unresolved, for example a page-anchored frame.
+  int32 page_index = 3;
+  // Caret position of the frame's text anchor in the live layout. Unset
+  // when the anchor could not be located.
+  TwipsPoint anchor = 4;
+  // Laid-out frame width in twips.
+  int64 width_twips = 5;
+  // Laid-out frame height in twips.
+  int64 height_twips = 6;
+  // The frame's content runs, in order, flattened across its paragraphs.
+  // Each run's char_offset is -1 because frame text is outside the body
+  // flow.
+  repeated TextRun runs = 7;
+  // Name of the next frame in the text chain that this frame's text flows
+  // into; empty when this frame is not chained forward.
+  string chain_next = 8;
+  // Name of the previous frame in the text chain that flows into this
+  // frame; empty when this frame is not chained backward.
+  string chain_prev = 9;
+}
+
+// Shape is one text-bearing draw-page shape of a text document: a custom
+// shape, a text shape, or an imported textbox. It carries the shape's
+// styled runs, its layout anchor, and its geometry. Graphic objects and OLE
+// objects are reported as EmbeddedImage instead, and Writer text frames as
+// TextFrame; this event is for the remaining text-capable shapes. Runs
+// carry char_offset -1.
+message Shape {
+  // Zero-based shape index in discovery order among emitted shapes.
+  int32 index = 1;
+  // The shape's name from the document; may be empty.
+  string name = 2;
+  // The office core's shape-type service name, for example
+  // "com.sun.star.drawing.CustomShape".
+  string shape_type = 3;
+  // Zero-based page the shape's anchor sits on; matches PageImage.index. -1
+  // when unresolved.
+  int32 page_index = 4;
+  // Caret position of the shape's text anchor in the live layout. Unset
+  // when the anchor could not be located.
+  TwipsPoint anchor = 5;
+  // Shape width in twips.
+  int64 width_twips = 6;
+  // Shape height in twips.
+  int64 height_twips = 7;
+  // The shape's content runs, in order, flattened across its paragraphs.
+  // Each run's char_offset is -1 because shape text is outside the body
+  // flow.
+  repeated TextRun runs = 8;
+  // Name of the next textbox in the chain this shape flows into; empty when
+  // the shape is not a linked textbox.
+  string chain_next = 9;
+  // Name of the previous textbox in the chain that flows into this shape;
+  // empty when the shape is not a linked textbox.
+  string chain_prev = 10;
+}
+
 // PlaceholderRole is the presentation role of a slide shape, derived from
 // the office core's shape type. Non-placeholder shapes report
 // PLACEHOLDER_ROLE_NONE. New roles (header, footer, slide number, date and
@@ -674,7 +750,8 @@ message GetServiceInfoResponse {
   // Requested render DPI for StreamPages.
   int32 render_dpi = 9;
   // True when StreamPages emits typed content events (DocumentMetadata,
-  // Paragraph, TableData, EmbeddedImage, DrawingShape, Slide, SlideShape)
-  // alongside page images, selectable per request through StreamOptions.
+  // Paragraph, TableData, EmbeddedImage, DrawingShape, Slide, SlideShape,
+  // TextFrame, Shape) alongside page images, selectable per request through
+  // StreamOptions.
   bool typed_content = 10;
 }
