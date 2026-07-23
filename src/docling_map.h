@@ -123,6 +123,10 @@ class DoclingMapper {
                      ai::pipestream::office::v1::LineBox>& lines,
                  ai::pipestream::document::v1::BoundingBox* box);
 
+  // The zero-based page whose rectangle contains the document-absolute
+  // point, resolved from DocumentInfo.page_rects; -1 when no page does.
+  int page_for_point(double x, double y) const;
+
   void on_document_info(const ai::pipestream::office::v1::DocumentInfo& info);
   void on_page_image(const ai::pipestream::office::v1::PageImage& page);
   void on_metadata(const ai::pipestream::office::v1::DocumentMetadata& meta);
@@ -169,6 +173,9 @@ class DoclingMapper {
   // Draw group nesting: (page index, child group_path) to the group's ref,
   // so a shape attaches under the group its group_path names.
   std::map<std::pair<int, std::string>, std::string> draw_groups_;
+  // Writer draw-page group nesting: child group_path to the group's ref.
+  // The text document has a single draw page, so the path alone keys it.
+  std::map<std::string, std::string> writer_groups_;
 };
 
 // Returns structural integrity problems of a mapped document: RefItem
