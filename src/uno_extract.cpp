@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <ctime>
 #include <map>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -336,24 +337,168 @@ bool emit_metadata(const Reference<css::frame::XModel>& model,
   return emit_fn(event);
 }
 
-// Positions the view cursor at the range and reports the caret point and
-// 0-based page. Reports failures against `what`.
+// Converts the view cursor's getPosition values into document-absolute
+// twips. The office core reports them in 1/100 mm relative to the page text
+// area (it subtracts the page style's top and left margins plus its fixed
+// document border), so the conversion adds those back per page style. This
+// keeps caret anchors and line rectangles in one coordinate space.
+class CaretSpace {
+ public:
+  explicit CaretSpace(const Reference<css::frame::XModel>& model)
+      : model_(model) {}
+
+  // Returns the (left, top) offset in twips for the page style at the
+  // cursor, loading the style margin table on first use.
+  std::pair<long, long> origin_for(
+      const Reference<css::text::XTextViewCursor>& cursor, Warner& warner) {
+    // The office core's fixed border around the page area, in twips.
+    constexpr long kDocumentBorder = 284;
+    load(warner);
+    try {
+      Reference<css::beans::XPropertySet> props(cursor, UNO_QUERY);
+      if (props.is()) {
+        rtl::OUString style;
+        props->getPropertyValue("PageStyleName") >>= style;
+        auto found = margins_.find(utf8(style));
+        if (found != margins_.end()) {
+          return {found->second.first + kDocumentBorder,
+                  found->second.second + kDocumentBorder};
+        }
+      }
+    } catch (const css::uno::Exception& error) {
+      warner.warn("page style of caret failed", error);
+    }
+    return {kDocumentBorder, kDocumentBorder};
+  }
+
+ private:
+  void load(Warner& warner) {
+    if (loaded_) return;
+    loaded_ = true;
+    try {
+      Reference<css::style::XStyleFamiliesSupplier> supplier(model_, UNO_QUERY);
+      if (!supplier.is()) return;
+      Reference<css::container::XNameAccess> families =
+          supplier->getStyleFamilies();
+      if (!families.is() || !families->hasByName("PageStyles")) return;
+      Reference<css::container::XIndexAccess> styles;
+      families->getByName("PageStyles") >>= styles;
+      if (!styles.is()) return;
+      for (sal_Int32 i = 0; i < styles->getCount(); i++) {
+        Reference<css::style::XStyle> style;
+        styles->getByIndex(i) >>= style;
+        Reference<css::beans::XPropertySet> props(style, UNO_QUERY);
+        if (!style.is() || !props.is()) continue;
+        sal_Int32 left = 0, top = 0;
+        props->getPropertyValue("LeftMargin") >>= left;
+        props->getPropertyValue("TopMargin") >>= top;
+        margins_[utf8(style->getName())] = {hundredth_mm_to_twips(left),
+                                            hundredth_mm_to_twips(top)};
+      }
+    } catch (const css::uno::Exception& error) {
+      warner.warn("page style margins are not readable", error);
+    }
+  }
+
+  Reference<css::frame::XModel> model_;
+  bool loaded_ = false;
+  std::map<std::string, std::pair<long, long>> margins_;
+};
+
+// Positions the view cursor at the range and reports the caret point in
+// document-absolute twips and the 0-based page. Reports failures against
+// `what`.
 void caret_at(const Reference<css::text::XTextViewCursor>& cursor,
               const Reference<css::text::XTextRange>& range,
-              const std::string& what, officev1::TwipsPoint* point,
-              int32_t* page_index, Warner& warner) {
+              const std::string& what, CaretSpace* space,
+              officev1::TwipsPoint* point, int32_t* page_index,
+              Warner& warner) {
   if (!cursor.is() || !range.is()) return;
   try {
     cursor->gotoRange(range, false);
     css::awt::Point position = cursor->getPosition();
-    point->set_x(position.X);
-    point->set_y(position.Y);
+    std::pair<long, long> origin =
+        space != nullptr ? space->origin_for(cursor, warner)
+                         : std::pair<long, long>{0, 0};
+    point->set_x(hundredth_mm_to_twips(position.X) + origin.first);
+    point->set_y(hundredth_mm_to_twips(position.Y) + origin.second);
     if (page_index != nullptr) {
       Reference<css::text::XPageCursor> page_cursor(cursor, UNO_QUERY);
       if (page_cursor.is()) *page_index = page_cursor->getPage() - 1;
     }
   } catch (const css::uno::Exception& error) {
     warner.warn("caret position of " + what + " failed", error);
+  }
+}
+
+// Parses the probe's last selection payload into LineBox entries: one
+// "x, y, w, h" rectangle per laid-out line, joined by semicolons, in
+// document twips. Blank payloads and the literal EMPTY parse to nothing.
+void collect_line_rects(
+    SelectionProbe* probe,
+    google::protobuf::RepeatedPtrField<officev1::LineBox>* out) {
+  struct Box {
+    long x, y, width, height;
+  };
+  std::vector<Box> boxes;
+  std::stringstream stream(probe->last_payload);
+  std::string entry;
+  while (std::getline(stream, entry, ';')) {
+    Box box{0, 0, 0, 0};
+    if (std::sscanf(entry.c_str(), "%ld , %ld , %ld , %ld", &box.x, &box.y,
+                    &box.width, &box.height) != 4 ||
+        box.width <= 0 || box.height <= 0) {
+      continue;
+    }
+    boxes.push_back(box);
+  }
+  // The office core's region compression reorders the rectangles; restore
+  // reading order.
+  std::sort(boxes.begin(), boxes.end(), [](const Box& a, const Box& b) {
+    return a.y != b.y ? a.y < b.y : a.x < b.x;
+  });
+  for (const Box& parsed : boxes) {
+    officev1::LineBox* box = out->Add();
+    box->set_x_twips(parsed.x);
+    box->set_y_twips(parsed.y);
+    box->set_width_twips(parsed.width);
+    box->set_height_twips(parsed.height);
+    box->set_page_index(-1);
+    long mid = parsed.y + parsed.height / 2;
+    for (size_t page = 0; page < probe->pages.size(); page++) {
+      const PageBox& rect = probe->pages[page];
+      if (mid >= rect.y && mid < rect.y + rect.height) {
+        box->set_page_index(static_cast<int32_t>(page));
+        break;
+      }
+    }
+  }
+}
+
+// Selects [start, end] with the view cursor, drains the selection callback,
+// and parses the per-line rectangles the layout reports for the selection.
+// Re-collapses the cursor and the payload afterwards so later caret reads
+// and measurements start clean.
+void measure_line_rects(
+    const Reference<css::text::XTextViewCursor>& cursor,
+    const Reference<css::text::XTextRange>& start,
+    const Reference<css::text::XTextRange>& end, SelectionProbe* probe,
+    const std::string& what,
+    google::protobuf::RepeatedPtrField<officev1::LineBox>* out,
+    Warner& warner) {
+  if (probe == nullptr || probe->reschedule == nullptr) return;
+  if (!cursor.is() || !start.is() || !end.is()) return;
+  try {
+    probe->last_payload.clear();
+    cursor->gotoRange(start, false);
+    cursor->gotoRange(end, true);
+    probe->flush();
+    collect_line_rects(probe, out);
+    cursor->gotoRange(start, false);
+    probe->flush();
+    probe->last_payload.clear();
+  } catch (const css::uno::Exception& error) {
+    warner.warn("line rectangles of " + what + " failed", error);
   }
 }
 
@@ -431,7 +576,8 @@ void fill_runs(const Reference<css::container::XEnumerationAccess>& paragraph,
 // offset non-null).
 bool fill_paragraph(const css::uno::Any& element, int32_t index,
                     const Reference<css::text::XTextViewCursor>& cursor,
-                    int64_t* offset, officev1::Paragraph* out, Warner& warner) {
+                    CaretSpace* space, int64_t* offset, SelectionProbe* probe,
+                    officev1::Paragraph* out, Warner& warner) {
   Reference<css::container::XEnumerationAccess> paragraph(element, UNO_QUERY);
   Reference<css::text::XTextRange> range(element, UNO_QUERY);
   if (!paragraph.is() || !range.is()) return false;
@@ -474,11 +620,13 @@ bool fill_paragraph(const css::uno::Any& element, int32_t index,
   }
   if (cursor.is()) {
     int32_t page_index = -1;
-    caret_at(cursor, range->getStart(), label + " start", out->mutable_start(),
-             &page_index, warner);
-    caret_at(cursor, range->getEnd(), label + " end", out->mutable_end(),
-             nullptr, warner);
+    caret_at(cursor, range->getStart(), label + " start", space,
+             out->mutable_start(), &page_index, warner);
+    caret_at(cursor, range->getEnd(), label + " end", space,
+             out->mutable_end(), nullptr, warner);
     out->set_page_index(page_index);
+    measure_line_rects(cursor, range->getStart(), range->getEnd(), probe,
+                       label, out->mutable_line_rects(), warner);
   }
   fill_runs(paragraph, label, out->mutable_runs(), offset, warner);
   if (offset != nullptr) *offset += 1;  // The newline after each body paragraph.
@@ -509,6 +657,7 @@ void parse_cell_name(const std::string& name, int32_t* row, int32_t* column) {
 
 bool emit_table(const Reference<css::text::XTextTable>& table, int32_t index,
                 const Reference<css::text::XTextViewCursor>& cursor,
+                CaretSpace* space, SelectionProbe* probe,
                 const EmitFn& emit_fn, Warner& warner) {
   officev1::StreamPagesResponse event;
   officev1::TableData* out = event.mutable_table();
@@ -541,14 +690,29 @@ bool emit_table(const Reference<css::text::XTextTable>& table, int32_t index,
           table->getCellByName(names[names.getLength() - 1]), UNO_QUERY);
       int32_t page_index = -1;
       if (first.is()) {
-        caret_at(cursor, first->getStart(), label + " start",
+        caret_at(cursor, first->getStart(), label + " start", space,
                  out->mutable_start(), &page_index, warner);
       }
       if (last.is()) {
-        caret_at(cursor, last->getEnd(), label + " end", out->mutable_end(),
-                 nullptr, warner);
+        caret_at(cursor, last->getEnd(), label + " end", space,
+                 out->mutable_end(), nullptr, warner);
       }
       out->set_page_index(page_index);
+      // A whole-table selection is impossible through the view cursor (the
+      // office core forbids expanding a selection across cell boundaries),
+      // so the table's line rectangles are collected cell by cell, bounded
+      // to small tables so the per-cell selection cost stays negligible.
+      if (probe != nullptr && probe->reschedule != nullptr &&
+          names.getLength() <= 64) {
+        for (const rtl::OUString& cell_name : names) {
+          Reference<css::text::XText> cell(table->getCellByName(cell_name),
+                                           UNO_QUERY);
+          if (!cell.is()) continue;
+          measure_line_rects(cursor, cell->getStart(), cell->getEnd(), probe,
+                             label + " cell " + utf8(cell_name),
+                             out->mutable_line_rects(), warner);
+        }
+      }
     }
   } catch (const css::uno::Exception& error) {
     warner.warn(label + " extraction failed", error);
@@ -646,7 +810,8 @@ void encode_graphic(const Reference<css::graphic::XGraphic>& graphic,
 bool emit_draw_shapes(const Reference<css::text::XTextDocument>& text_doc,
                       const Reference<css::uno::XComponentContext>& context,
                       const Reference<css::text::XTextViewCursor>& cursor,
-                      const PartSelection& parts, const EmitFn& emit_fn,
+                      CaretSpace* space, const PartSelection& parts,
+                      SelectionProbe* probe, const EmitFn& emit_fn,
                       Warner& warner) {
   Reference<css::drawing::XDrawPageSupplier> supplier(text_doc, UNO_QUERY);
   if (!supplier.is()) return true;
@@ -699,8 +864,24 @@ bool emit_draw_shapes(const Reference<css::text::XTextDocument>& text_doc,
         if (content.is()) {
           int32_t page_index = -1;
           caret_at(cursor, content->getAnchor(), image_label + " anchor",
-                   out->mutable_anchor(), &page_index, warner);
+                   space, out->mutable_anchor(), &page_index, warner);
           out->set_page_index(page_index);
+          // Best effort: select over the anchor character so an as-char
+          // image yields its line box. Floating anchors keep width, height,
+          // and anchor as the authoritative geometry.
+          if (probe != nullptr && probe->reschedule != nullptr && cursor.is()) {
+            Reference<css::text::XTextRange> anchor = content->getAnchor();
+            if (anchor.is()) {
+              probe->last_payload.clear();
+              cursor->gotoRange(anchor->getStart(), false);
+              cursor->goRight(1, true);
+              probe->flush();
+              collect_line_rects(probe, out->mutable_line_rects());
+              cursor->gotoRange(anchor->getStart(), false);
+              probe->flush();
+              probe->last_payload.clear();
+            }
+          }
         }
         css::awt::Size layout_size;
         props->getPropertyValue("LayoutSize") >>= layout_size;
@@ -755,7 +936,7 @@ bool emit_draw_shapes(const Reference<css::text::XTextDocument>& text_doc,
       Reference<css::text::XTextContent> content(props, UNO_QUERY);
       if (content.is()) {
         int32_t page_index = -1;
-        caret_at(cursor, content->getAnchor(), label + " anchor",
+        caret_at(cursor, content->getAnchor(), label + " anchor", space,
                  out->mutable_anchor(), &page_index, warner);
         out->set_page_index(page_index);
       }
@@ -792,7 +973,8 @@ bool emit_draw_shapes(const Reference<css::text::XTextDocument>& text_doc,
 // the draw-shape pass instead, so the two passes never overlap.
 bool emit_text_frames(const Reference<css::text::XTextDocument>& text_doc,
                       const Reference<css::text::XTextViewCursor>& cursor,
-                      const EmitFn& emit_fn, Warner& warner) {
+                      CaretSpace* space, const EmitFn& emit_fn,
+                      Warner& warner) {
   Reference<css::text::XTextFramesSupplier> supplier(text_doc, UNO_QUERY);
   if (!supplier.is()) return true;
   Reference<css::container::XIndexAccess> frames(supplier->getTextFrames(),
@@ -815,7 +997,7 @@ bool emit_text_frames(const Reference<css::text::XTextDocument>& text_doc,
       Reference<css::text::XTextContent> content(frame, UNO_QUERY);
       if (content.is()) {
         int32_t page_index = -1;
-        caret_at(cursor, content->getAnchor(), label + " anchor",
+        caret_at(cursor, content->getAnchor(), label + " anchor", space,
                  out->mutable_anchor(), &page_index, warner);
         out->set_page_index(page_index);
       }
@@ -1942,6 +2124,8 @@ bool emit_embedded_objects(const Reference<css::frame::XModel>& model,
     Reference<css::text::XTextViewCursorSupplier> cursor_supplier(
         model->getCurrentController(), UNO_QUERY);
     if (cursor_supplier.is()) cursor = cursor_supplier->getViewCursor();
+    CaretSpace caret_space(model);
+    CaretSpace* space = &caret_space;
     for (sal_Int32 i = 0; i < objects->getCount(); i++) {
       std::string label = "embedded object " + std::to_string(i);
       officev1::StreamPagesResponse event;
@@ -1973,7 +2157,7 @@ bool emit_embedded_objects(const Reference<css::frame::XModel>& model,
         Reference<css::text::XTextContent> content(props, UNO_QUERY);
         if (content.is()) {
           int32_t page_index = -1;
-          caret_at(cursor, content->getAnchor(), label + " anchor",
+          caret_at(cursor, content->getAnchor(), label + " anchor", space,
                    out->mutable_anchor(), &page_index, warner);
           out->set_page_index(page_index);
         }
@@ -2091,7 +2275,8 @@ bool emit_embedded_objects(const Reference<css::frame::XModel>& model,
 
 bool emit_notes(const Reference<css::text::XTextDocument>& text_doc,
                 const Reference<css::text::XTextViewCursor>& cursor,
-                bool endnotes, const EmitFn& emit_fn, Warner& warner) {
+                CaretSpace* space, bool endnotes, const EmitFn& emit_fn,
+                Warner& warner) {
   Reference<css::container::XIndexAccess> notes;
   if (endnotes) {
     Reference<css::text::XEndnotesSupplier> supplier(text_doc, UNO_QUERY);
@@ -2122,8 +2307,8 @@ bool emit_notes(const Reference<css::text::XTextDocument>& text_doc,
       if (note_label.isEmpty() && anchor.is()) note_label = anchor->getString();
       out->set_label(utf8(note_label));
       int32_t page_index = -1;
-      caret_at(cursor, anchor, label + " anchor", out->mutable_anchor(),
-               &page_index, warner);
+      caret_at(cursor, anchor, label + " anchor", space,
+               out->mutable_anchor(), &page_index, warner);
       out->set_page_index(page_index);
       flatten_text_runs(Reference<css::text::XText>(note, UNO_QUERY), label,
                         out->mutable_runs(), warner);
@@ -2137,7 +2322,8 @@ bool emit_notes(const Reference<css::text::XTextDocument>& text_doc,
 
 bool emit_document_indexes(const Reference<css::text::XTextDocument>& text_doc,
                            const Reference<css::text::XTextViewCursor>& cursor,
-                           const EmitFn& emit_fn, Warner& warner) {
+                           CaretSpace* space, const EmitFn& emit_fn,
+                           Warner& warner) {
   Reference<css::text::XDocumentIndexesSupplier> supplier(text_doc, UNO_QUERY);
   if (!supplier.is()) return true;
   Reference<css::container::XIndexAccess> indexes(supplier->getDocumentIndexes(),
@@ -2165,8 +2351,8 @@ bool emit_document_indexes(const Reference<css::text::XTextDocument>& text_doc,
       }
       Reference<css::text::XTextRange> anchor = doc_index->getAnchor();
       int32_t page_index = -1;
-      caret_at(cursor, anchor, label + " anchor", out->mutable_anchor(),
-               &page_index, warner);
+      caret_at(cursor, anchor, label + " anchor", space,
+               out->mutable_anchor(), &page_index, warner);
       out->set_page_index(page_index);
       // The generated text: enumerate paragraphs over a cursor spanning the
       // index's anchor range.
@@ -2279,7 +2465,8 @@ bool emit_page_styles(const Reference<css::frame::XModel>& model,
           while (paragraphs->hasMoreElements()) {
             officev1::Paragraph paragraph;
             if (fill_paragraph(paragraphs->nextElement(), index, no_cursor,
-                               nullptr, &paragraph, warner)) {
+                               nullptr, nullptr, nullptr, &paragraph,
+                               warner)) {
               *header_footer->add_paragraphs() = paragraph;
               index++;
             }
@@ -2297,8 +2484,8 @@ bool emit_page_styles(const Reference<css::frame::XModel>& model,
 
 bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
                        const Reference<css::uno::XComponentContext>& context,
-                       const PartSelection& parts, const EmitFn& emit_fn,
-                       Warner& warner) {
+                       const PartSelection& parts, SelectionProbe* probe,
+                       const EmitFn& emit_fn, Warner& warner) {
   Reference<css::frame::XModel> model(text_doc, UNO_QUERY);
   Reference<css::text::XTextViewCursor> cursor;
   if (model.is()) {
@@ -2309,6 +2496,7 @@ bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
   if (!cursor.is()) {
     warner.warn("no view cursor, layout positions will be missing");
   }
+  CaretSpace caret_space(model);
 
   bool want_paragraphs = parts.wants(officev1::DOCUMENT_PART_PARAGRAPHS);
   bool want_tables = parts.wants(officev1::DOCUMENT_PART_TABLES);
@@ -2328,7 +2516,8 @@ bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
       Reference<css::text::XTextTable> table(element, UNO_QUERY);
       if (table.is()) {
         if (want_tables) {
-          if (!emit_table(table, table_index, cursor, emit_fn, warner)) {
+          if (!emit_table(table, table_index, cursor, &caret_space, probe,
+                          emit_fn, warner)) {
             return false;
           }
         }
@@ -2337,7 +2526,8 @@ bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
       }
       if (!want_paragraphs) continue;
       officev1::StreamPagesResponse event;
-      if (!fill_paragraph(element, paragraph_index, cursor, &annotation_offset,
+      if (!fill_paragraph(element, paragraph_index, cursor, &caret_space,
+                          &annotation_offset, probe,
                           event.mutable_paragraph(), warner)) {
         continue;
       }
@@ -2346,29 +2536,40 @@ bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
     }
   }
   if (parts.wants(officev1::DOCUMENT_PART_FOOTNOTES)) {
-    if (!emit_notes(text_doc, cursor, false, emit_fn, warner)) return false;
-    if (!emit_notes(text_doc, cursor, true, emit_fn, warner)) return false;
+    if (!emit_notes(text_doc, cursor, &caret_space, false, emit_fn, warner)) {
+      return false;
+    }
+    if (!emit_notes(text_doc, cursor, &caret_space, true, emit_fn, warner)) {
+      return false;
+    }
   }
   if (parts.wants(officev1::DOCUMENT_PART_INDEXES)) {
-    if (!emit_document_indexes(text_doc, cursor, emit_fn, warner)) return false;
+    if (!emit_document_indexes(text_doc, cursor, &caret_space, emit_fn,
+                               warner)) {
+      return false;
+    }
   }
   if (parts.wants(officev1::DOCUMENT_PART_PAGE_STYLES) ||
       parts.wants(officev1::DOCUMENT_PART_HEADERS_FOOTERS)) {
     if (!emit_page_styles(model, parts, emit_fn, warner)) return false;
   }
   if (parts.wants(officev1::DOCUMENT_PART_TEXT_FRAMES)) {
-    if (!emit_text_frames(text_doc, cursor, emit_fn, warner)) return false;
+    if (!emit_text_frames(text_doc, cursor, &caret_space, emit_fn, warner)) {
+      return false;
+    }
   }
   if (parts.wants(officev1::DOCUMENT_PART_IMAGES) ||
       parts.wants(officev1::DOCUMENT_PART_SHAPES)) {
-    return emit_draw_shapes(text_doc, context, cursor, parts, emit_fn, warner);
+    return emit_draw_shapes(text_doc, context, cursor, &caret_space, parts,
+                            probe, emit_fn, warner);
   }
   return true;
 }
 
 }  // namespace
 
-bool emit_typed_content(const PartSelection& parts, const EmitFn& emit_fn,
+bool emit_typed_content(const PartSelection& parts, SelectionProbe* probe,
+                        const EmitFn& emit_fn,
                         std::vector<std::string>* warnings) {
   Warner warner(warnings);
   try {
@@ -2422,7 +2623,8 @@ bool emit_typed_content(const PartSelection& parts, const EmitFn& emit_fn,
           parts.wants(officev1::DOCUMENT_PART_TEXT_FRAMES) ||
           parts.wants(officev1::DOCUMENT_PART_SHAPES);
       if (!wants_text_part) return true;
-      return emit_text_content(text_doc, context, parts, emit_fn, warner);
+      return emit_text_content(text_doc, context, parts, probe, emit_fn,
+                               warner);
     }
     Reference<css::sheet::XSpreadsheetDocument> calc_doc(model, UNO_QUERY);
     if (calc_doc.is()) {

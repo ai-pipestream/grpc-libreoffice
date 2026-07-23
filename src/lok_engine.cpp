@@ -6,6 +6,8 @@
 #include <LibreOfficeKit/LibreOfficeKit.hxx>
 #include <LibreOfficeKit/LibreOfficeKitEnums.h>
 
+#include <dlfcn.h>
+
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -71,6 +73,28 @@ bool emit(int fd, const google::protobuf::MessageLite& message) {
   std::string serialized;
   if (!message.SerializeToString(&serialized)) return false;
   return write_frame(fd, serialized);
+}
+
+// Copies every text-selection payload into the probe; all other callback
+// types are ignored. Runs on the flush inside the extraction pass, never
+// concurrently with it.
+void selection_callback(int type, const char* payload, void* data) {
+  if (type != LOK_CALLBACK_TEXT_SELECTION || data == nullptr) return;
+  static_cast<SelectionProbe*>(data)->last_payload =
+      payload != nullptr ? payload : "";
+}
+
+// Resolves the office core's event drain. The callback that carries
+// selection rectangles is posted to the event queue, and the worker pumps
+// no loop, so extraction must drain it explicitly. Application::Reschedule
+// processes the currently pending events and returns; the idle-draining
+// alternative never settles under a loaded Writer document, whose layout
+// idle jobs reschedule themselves forever. Resolved by symbol like
+// process_context resolves the service factory, avoiding a hard link
+// against the VCL library.
+bool (*resolve_reschedule())(bool) {
+  return reinterpret_cast<bool (*)(bool)>(
+      dlsym(RTLD_DEFAULT, "_ZN11Application10RescheduleEb"));
 }
 
 // Paints every page and streams PageImage events. Two-stage pipeline: this
@@ -255,15 +279,47 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     // document, each event emitted the moment it is extracted. Extraction
     // problems degrade to status warnings, never a failed render.
     std::vector<std::string> typed_warnings;
+    // Per-line rectangles ride the selection callback; the sink registers
+    // only after painting so no callback can race the paint stage, and the
+    // probe stays null when the part is off or the flush is unresolvable.
+    SelectionProbe probe;
+    SelectionProbe* probe_ptr = nullptr;
+    if (ok && options.parts.wants(officev1::DOCUMENT_PART_LINE_RECTS)) {
+      probe.reschedule = resolve_reschedule();
+      probe.acquire_solar_mutex = reinterpret_cast<void (*)(unsigned int)>(
+          dlsym(RTLD_DEFAULT, "_ZN11Application17AcquireSolarMutexEj"));
+      probe.release_solar_mutex = reinterpret_cast<unsigned int (*)()>(
+          dlsym(RTLD_DEFAULT, "_ZN11Application17ReleaseSolarMutexEv"));
+      if (probe.reschedule == nullptr || probe.acquire_solar_mutex == nullptr ||
+          probe.release_solar_mutex == nullptr) {
+        probe.reschedule = nullptr;
+      }
+      if (probe.reschedule != nullptr) {
+        for (const PageRect& page : pages) {
+          PageBox box;
+          box.x = page.x;
+          box.y = page.y;
+          box.width = page.width;
+          box.height = page.height;
+          probe.pages.push_back(box);
+        }
+        document->registerCallback(&selection_callback, &probe);
+        probe_ptr = &probe;
+      } else {
+        typed_warnings.push_back(
+            "typed content: event flush unavailable, line rectangles omitted");
+      }
+    }
     if (ok) {
       ok = emit_typed_content(
-          options.parts,
+          options.parts, probe_ptr,
           [&](const google::protobuf::MessageLite& event) {
             output_bytes += static_cast<long>(event.ByteSizeLong());
             return emit(out_fd, event);
           },
           &typed_warnings);
     }
+    if (probe_ptr != nullptr) document->registerCallback(nullptr, nullptr);
     if (ok) {
       officev1::StreamPagesResponse final_event;
       officev1::RenderStatus* status = final_event.mutable_status();

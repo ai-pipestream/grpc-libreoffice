@@ -63,6 +63,11 @@ at STANDARD plus COMMENTS):
   outline depth, plus the speaker-notes shape of each notes page. Body
   runs carry character offsets in a documented annotation text space, so
   standoff annotations (NLP spans) anchor to the stream directly.
+  For text documents, `Paragraph`, `TableData`, and `EmbeddedImage` events
+  additionally carry true per-line bounding rectangles (`LineBox`, in
+  document-absolute twips) measured from the same layout the pages were
+  painted from: a wrapping or page-straddling paragraph yields one box per
+  laid-out line in reading order.
   Every event is emitted the moment it exists, so a caller can process page
   images while typed content is still streaming. Extraction problems degrade
   to `RenderStatus.warnings`, never a failed render.
