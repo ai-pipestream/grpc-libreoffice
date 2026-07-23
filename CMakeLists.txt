@@ -24,6 +24,36 @@ if(NOT EXISTS "${GRLIBRE_LOK_INCLUDE_DIR}/LibreOfficeKit/LibreOfficeKit.hxx")
     "install libreofficekit-dev or set GRLIBRE_LOK_INCLUDE_DIR")
 endif()
 
+# Typed content extraction attaches to the in-process UNO model of the
+# document LibreOfficeKit loaded, so the worker also builds against the
+# LibreOffice SDK: URE headers, cppumaker-generated type headers, and the
+# URE stub libraries.
+set(GRLIBRE_LO_SDK_DIR "/usr/lib/libreoffice/sdk" CACHE PATH
+  "LibreOffice SDK directory (cppumaker and linker stubs)")
+set(GRLIBRE_LO_PROGRAM_DIR "/usr/lib/libreoffice/program" CACHE PATH
+  "LibreOffice program directory (type databases and runtime URE libraries)")
+set(GRLIBRE_URE_INCLUDE_DIRS
+  "/usr/include/libreoffice;/usr/include/x86_64-linux-gnu/libreoffice" CACHE STRING
+  "URE header directories from the LibreOffice SDK")
+if(NOT EXISTS "${GRLIBRE_LO_SDK_DIR}/bin/cppumaker")
+  message(FATAL_ERROR "cppumaker not found under ${GRLIBRE_LO_SDK_DIR}/bin; "
+    "install libreoffice-dev or set GRLIBRE_LO_SDK_DIR")
+endif()
+
+set(UNO_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/uno_include")
+set(UNO_STAMP "${UNO_INCLUDE_DIR}/.generated")
+add_custom_command(
+  OUTPUT "${UNO_STAMP}"
+  COMMAND "${GRLIBRE_LO_SDK_DIR}/bin/cppumaker" -Gc "-O${UNO_INCLUDE_DIR}"
+          "${GRLIBRE_LO_PROGRAM_DIR}/types.rdb"
+          "${GRLIBRE_LO_PROGRAM_DIR}/types/offapi.rdb"
+  COMMAND ${CMAKE_COMMAND} -E touch "${UNO_STAMP}"
+  DEPENDS "${GRLIBRE_LO_PROGRAM_DIR}/types.rdb"
+          "${GRLIBRE_LO_PROGRAM_DIR}/types/offapi.rdb"
+  COMMENT "Generating UNO C++ type headers with cppumaker"
+  VERBATIM)
+add_custom_target(uno_headers DEPENDS "${UNO_STAMP}")
+
 include(FetchContent)
 set(gRPC_INSTALL OFF CACHE BOOL "" FORCE)
 set(gRPC_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -96,14 +126,29 @@ endif()
 add_executable(grlibre-worker
   src/worker_main.cpp
   src/lok_engine.cpp
+  src/uno_extract.cpp
   src/png_encode.cpp
   src/event_frame.cpp)
+add_dependencies(grlibre-worker uno_headers)
 target_include_directories(grlibre-worker PRIVATE
   src
   "${GRLIBRE_LOK_INCLUDE_DIR}"
   "${GRLIBRE_LOK_INCLUDE_DIR}/LibreOfficeKit"
+  "${UNO_INCLUDE_DIR}"
+  ${GRLIBRE_URE_INCLUDE_DIRS}
   third_party/stb)
-target_link_libraries(grlibre-worker PRIVATE office_proto ${CMAKE_DL_LIBS} Threads::Threads grlibre_flags)
+# The UNO binary interface contract for gcc-family toolchains on Linux.
+set_source_files_properties(src/uno_extract.cpp PROPERTIES
+  COMPILE_DEFINITIONS "LINUX;UNX;CPPU_ENV=gcc3")
+target_link_directories(grlibre-worker PRIVATE "${GRLIBRE_LO_SDK_DIR}/lib")
+target_link_libraries(grlibre-worker PRIVATE office_proto
+  uno_sal uno_cppu uno_cppuhelpergcc3
+  ${CMAKE_DL_LIBS} Threads::Threads grlibre_flags)
+# The URE runtime libraries live in the LibreOffice program directory, which
+# is not on the default linker search path.
+set_target_properties(grlibre-worker PROPERTIES
+  BUILD_RPATH "${GRLIBRE_LO_PROGRAM_DIR}"
+  INSTALL_RPATH "${GRLIBRE_LO_PROGRAM_DIR}")
 if(GRLIBRE_TCMALLOC)
   target_link_libraries(grlibre-worker PRIVATE ${GRLIBRE_TCMALLOC_LIB})
 endif()

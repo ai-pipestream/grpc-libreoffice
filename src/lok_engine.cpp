@@ -21,6 +21,7 @@
 #include "ai/pipestream/office/v1/office_service.pb.h"
 #include "event_frame.h"
 #include "png_encode.h"
+#include "uno_extract.h"
 
 namespace grlibre {
 
@@ -233,10 +234,25 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
       delete document;
       return kExitRenderFailure;
     }
+    // Pages have streamed; typed content follows from the same loaded
+    // document, each event emitted the moment it is extracted. Extraction
+    // problems degrade to status warnings, never a failed render.
+    std::vector<std::string> typed_warnings;
+    if (ok) {
+      ok = emit_typed_content(
+          [&](const google::protobuf::MessageLite& event) {
+            output_bytes += static_cast<long>(event.ByteSizeLong());
+            return emit(out_fd, event);
+          },
+          &typed_warnings);
+    }
     if (ok) {
       officev1::StreamPagesResponse final_event;
       officev1::RenderStatus* status = final_event.mutable_status();
       status->set_state(officev1::RenderStatus::STATE_OK);
+      for (const std::string& warning : typed_warnings) {
+        status->add_warnings(warning);
+      }
       status->set_input_bytes(options.input_bytes);
       status->set_output_bytes(output_bytes);
       status->set_render_millis(std::chrono::duration_cast<std::chrono::milliseconds>(

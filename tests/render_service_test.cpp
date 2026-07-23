@@ -26,6 +26,8 @@ struct StreamResult {
   grpc::Status status;
   officev1::DocumentInfo info;
   int pages = 0;
+  int paragraphs = 0;
+  bool got_metadata = false;
   bool got_status = false;
 };
 
@@ -54,6 +56,8 @@ StreamResult stream_pages(const std::shared_ptr<grpc::Channel>& channel,
   while (stream->Read(&response)) {
     if (response.has_document_info()) result.info = response.document_info();
     if (response.has_page_image()) result.pages++;
+    if (response.has_paragraph()) result.paragraphs++;
+    if (response.has_metadata()) result.got_metadata = true;
     if (response.has_status()) result.got_status = true;
   }
   result.status = stream->Finish();
@@ -132,6 +136,8 @@ int main() {
     require(result.info.document_id() == "test-doc", "document id echoed");
     require(result.info.document_type() == "text", "document type");
     require(result.pages >= 1, "pages emitted");
+    require(result.got_metadata, "metadata event relayed through the service");
+    require(result.paragraphs >= 1, "paragraph events relayed through the service");
     require(result.got_status, "final status emitted");
   }
 

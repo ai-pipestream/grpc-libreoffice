@@ -67,8 +67,13 @@ message StreamPagesRequest {
   DocumentChunk chunk = 1;
 }
 
-// StreamPagesResponse is one event of a StreamPages response stream:
-// DocumentInfo first, then one PageImage per page, then RenderStatus.
+// StreamPagesResponse is one event of a StreamPages response stream. Order:
+// DocumentInfo first, then one PageImage per page in page order, then
+// DocumentMetadata and typed content events (Paragraph, TableData,
+// EmbeddedImage) in reading order, then RenderStatus. Every event is emitted
+// the moment it exists: pages stream while later pages are still painting,
+// and the caller can process page images while typed content is still being
+// extracted from the same loaded document.
 message StreamPagesResponse {
   // Exactly one event per response message.
   oneof event {
@@ -78,6 +83,27 @@ message StreamPagesResponse {
     PageImage page_image = 2;
     // The final event of a successful stream.
     RenderStatus status = 3;
+    // The document's stored properties.
+    DocumentMetadata metadata = 4;
+    // One paragraph with styled runs and layout anchors. Currently emitted
+    // for text documents.
+    Paragraph paragraph = 5;
+    // One table with its cell grid. Currently emitted for text documents.
+    TableData table = 6;
+    // One embedded image with its bytes. Currently emitted for text
+    // documents.
+    EmbeddedImage embedded_image = 7;
+    // One footnote or endnote. Currently emitted for text documents.
+    Footnote footnote = 8;
+    // One page style's header or footer content. Currently emitted for text
+    // documents.
+    HeaderFooter header_footer = 9;
+    // Page geometry of one in-use page style. Currently emitted for text
+    // documents.
+    PageStyleInfo page_style = 10;
+    // One generated index, table of contents included. Currently emitted
+    // for text documents.
+    DocumentIndex document_index = 11;
   }
 }
 
@@ -133,6 +159,269 @@ message PageImage {
   bytes png = 5;
 }
 
+// TwipsPoint is a point in twips (1/1440 inch) on a page, origin at the
+// page's top-left corner. Multiply by dpi/1440 to get pixels at a
+// PageImage's dpi; divide by 20 to get typographic points.
+message TwipsPoint {
+  // Horizontal offset from the page's left edge.
+  int64 x = 1;
+  // Vertical offset from the page's top edge.
+  int64 y = 2;
+}
+
+// DocumentMetadata carries the document's stored properties. Emitted once,
+// directly after DocumentInfo, for every document type.
+message DocumentMetadata {
+  // Document title; empty when unset.
+  string title = 1;
+  // Document author; empty when unset.
+  string author = 2;
+  // Document subject; empty when unset.
+  string subject = 3;
+  // Document keywords; empty when unset.
+  repeated string keywords = 4;
+  // Creation time as milliseconds since the Unix epoch, UTC; 0 when unset.
+  int64 created_epoch_ms = 5;
+  // Last-modification time as milliseconds since the Unix epoch, UTC; 0 when
+  // unset.
+  int64 modified_epoch_ms = 6;
+  // Name of the author of the last save; empty when unset.
+  string modified_by = 7;
+  // The application that produced the document, as stored in it.
+  string generator = 8;
+  // Number of editing sessions the document has been through.
+  int32 editing_cycles = 9;
+  // Total editing time in seconds, as tracked by the producing application.
+  int64 editing_duration_seconds = 10;
+  // Last print time as milliseconds since the Unix epoch, UTC; 0 when never
+  // printed.
+  int64 printed_epoch_ms = 11;
+  // Name of the last printer of the document; empty when never printed.
+  string printed_by = 12;
+  // The document's default language as a BCP 47 style tag, for example
+  // "en-US"; empty when unset.
+  string language = 13;
+  // Name of the template the document was created from; empty when none.
+  string template_name = 14;
+  // The producing application's document statistics, numeric by name, for
+  // example WordCount, CharacterCount, ParagraphCount, PageCount.
+  map<string, int64> statistics = 15;
+  // Custom properties stored in the document, with their original types.
+  repeated UserProperty user_properties = 16;
+}
+
+// UserProperty is one custom document property, keeping the type the
+// producing application stored.
+message UserProperty {
+  // The property's name.
+  string name = 1;
+  // The property's value in its stored type.
+  oneof value {
+    // A text value.
+    string text = 2;
+    // A numeric value.
+    double number = 3;
+    // A boolean value.
+    bool flag = 4;
+    // A date or datetime value as milliseconds since the Unix epoch, UTC.
+    int64 epoch_ms = 5;
+  }
+}
+
+// TextRun is a stretch of text with uniform character formatting inside a
+// paragraph. Concatenating a paragraph's run texts yields its full text.
+message TextRun {
+  // The run's text.
+  string text = 1;
+  // Font family as the office core reports it, for example
+  // "Liberation Sans;Arial".
+  string font = 2;
+  // Font size in typographic points.
+  float size_pt = 3;
+  // Character weight on the office core's percentage scale: 100 is normal,
+  // 150 is bold.
+  float weight = 4;
+  // True when the run is italic.
+  bool italic = 5;
+  // True when the run is underlined.
+  bool underline = 6;
+  // True when the run is struck through.
+  bool strikethrough = 7;
+  // Text color as 0xRRGGBB. Automatic color is reported as 0.
+  uint32 color_rgb = 8;
+  // Offset of this run's first character in the document's annotation text
+  // space, counted in Unicode code points. The annotation text space is the
+  // concatenation of every body run's text in emission order with one
+  // newline after each body paragraph. -1 for runs outside the body flow
+  // (headers, footers, footnotes, indexes).
+  int64 char_offset = 9;
+  // The run's length in Unicode code points.
+  int64 char_length = 10;
+}
+
+// Paragraph is one body paragraph of a text document, in reading order, with
+// its styled runs and its exact layout anchors. The anchors are caret
+// positions from the live layout the page images were painted from: start is
+// the caret at the paragraph's first character, end at its last. A
+// paragraph's bottom edge is the next paragraph's start.y when both are on
+// the same page.
+message Paragraph {
+  // Zero-based paragraph index in reading order, counting body paragraphs.
+  int32 index = 1;
+  // Zero-based page the paragraph starts on; matches PageImage.index.
+  int32 page_index = 2;
+  // Paragraph style name, for example "Heading 1"; empty when unresolved.
+  string style = 3;
+  // Caret position at the paragraph's first character.
+  TwipsPoint start = 4;
+  // Caret position at the paragraph's last character.
+  TwipsPoint end = 5;
+  // The paragraph's runs, in order.
+  repeated TextRun runs = 6;
+  // Outline depth: 0 for body text, 1 through 10 for heading levels.
+  int32 outline_level = 7;
+  // Zero-based list nesting level when the paragraph is a list item; -1
+  // otherwise.
+  int32 list_level = 8;
+  // Name of the text section containing the paragraph; empty when the
+  // paragraph is not inside a section.
+  string section = 9;
+  // The page number this paragraph restarts numbering at, when it does; -1
+  // when the paragraph does not restart page numbering. Together with
+  // page_index this recovers printed page numbers.
+  int32 page_number_offset = 10;
+  // Offset of the paragraph's first character in the document's annotation
+  // text space (see TextRun.char_offset); -1 outside the body flow.
+  int64 char_offset = 11;
+}
+
+// Footnote is one footnote or endnote, with its citation label, its content
+// runs, and the layout anchor of its citation mark.
+message Footnote {
+  // Zero-based index within footnotes (or within endnotes when endnote is
+  // true), in document order.
+  int32 index = 1;
+  // True for an endnote, false for a footnote.
+  bool endnote = 2;
+  // The citation label as rendered, for example "1" or "*".
+  string label = 3;
+  // Zero-based page the citation mark sits on; matches PageImage.index. -1
+  // when unresolved.
+  int32 page_index = 4;
+  // Caret position of the citation mark in the live layout.
+  TwipsPoint anchor = 5;
+  // The note's content runs, in order, flattened across its paragraphs.
+  repeated TextRun runs = 6;
+}
+
+// HeaderFooter is the content of one page style's header or footer. It
+// repeats on every page using that style, so it carries no page position.
+message HeaderFooter {
+  // Name of the page style, for example "Standard".
+  string page_style = 1;
+  // True for the footer, false for the header.
+  bool footer = 2;
+  // The header or footer paragraphs. Their layout anchors are unset because
+  // the content repeats per page.
+  repeated Paragraph paragraphs = 3;
+}
+
+// PageStyleInfo is the page geometry of one page style that is in use:
+// physical size, margins, and column count, all numeric.
+message PageStyleInfo {
+  // Name of the page style, for example "Standard".
+  string name = 1;
+  // Page width in twips.
+  int64 width_twips = 2;
+  // Page height in twips.
+  int64 height_twips = 3;
+  // Left margin in twips.
+  int64 margin_left_twips = 4;
+  // Right margin in twips.
+  int64 margin_right_twips = 5;
+  // Top margin in twips.
+  int64 margin_top_twips = 6;
+  // Bottom margin in twips.
+  int64 margin_bottom_twips = 7;
+  // Number of text columns on pages using this style; 1 when not columnar.
+  int32 columns = 8;
+}
+
+// DocumentIndex is one generated index of a text document: a table of
+// contents, an alphabetical index, an index of illustrations or tables.
+message DocumentIndex {
+  // Zero-based index in document order.
+  int32 index = 1;
+  // The index's title as shown in the document.
+  string title = 2;
+  // The office core's service name for the index kind, for example
+  // "com.sun.star.text.ContentIndex" for a table of contents.
+  string type = 3;
+  // Zero-based page the index starts on; matches PageImage.index. -1 when
+  // unresolved.
+  int32 page_index = 4;
+  // Caret position of the index's start in the live layout.
+  TwipsPoint anchor = 5;
+  // The generated index text runs, flattened across its paragraphs.
+  repeated TextRun runs = 6;
+}
+
+// TableCellData is one cell of a table.
+message TableCellData {
+  // Zero-based row in the base grid; -1 when the office cell name does not
+  // map to the base grid (split or merged cells).
+  int32 row = 1;
+  // Zero-based column in the base grid; -1 under the same condition as row.
+  int32 column = 2;
+  // The office core's cell name, for example "A1"; preserved so split and
+  // merged cells stay addressable.
+  string name = 3;
+  // The cell's plain text.
+  string text = 4;
+}
+
+// TableData is one table of a text document, in reading order, with its cell
+// grid and layout anchors from the live layout.
+message TableData {
+  // Zero-based table index in reading order.
+  int32 index = 1;
+  // Zero-based page the table starts on; matches PageImage.index.
+  int32 page_index = 2;
+  // Row count of the base grid.
+  int32 rows = 3;
+  // Column count of the base grid.
+  int32 columns = 4;
+  // Caret position at the first cell's first character.
+  TwipsPoint start = 5;
+  // Caret position at the last cell's last character.
+  TwipsPoint end = 6;
+  // The cells, in the office core's cell-name order.
+  repeated TableCellData cells = 7;
+}
+
+// EmbeddedImage is one image object embedded in the document, with its bytes
+// re-encoded through the office core's graphic provider.
+message EmbeddedImage {
+  // Zero-based image index in discovery order.
+  int32 index = 1;
+  // Zero-based page the image is anchored on; matches PageImage.index. -1
+  // when the page could not be resolved.
+  int32 page_index = 2;
+  // The image object's name from the document; may be empty.
+  string name = 3;
+  // MIME type of data. The original embedded format when the graphic
+  // provider can round-trip it, otherwise "image/png".
+  string mime_type = 4;
+  // The image bytes.
+  bytes data = 5;
+  // Caret position of the image's text anchor in the live layout.
+  TwipsPoint anchor = 6;
+  // Laid-out width in twips.
+  int64 width_twips = 7;
+  // Laid-out height in twips.
+  int64 height_twips = 8;
+}
+
 // PdfChunk is one chunk of a produced PDF, in order. Concatenating every
 // data field yields the complete PDF.
 message PdfChunk {
@@ -185,4 +474,7 @@ message GetServiceInfoResponse {
   int32 max_concurrent_documents = 8;
   // Requested render DPI for StreamPages.
   int32 render_dpi = 9;
+  // True when StreamPages emits typed content events (DocumentMetadata,
+  // Paragraph, TableData, EmbeddedImage) alongside page images.
+  bool typed_content = 10;
 }
