@@ -329,6 +329,51 @@ void DoclingMapper::add_caret_prov(
            span_start, span_end);
 }
 
+bool DoclingMapper::cell_bbox(
+    const google::protobuf::RepeatedPtrField<officev1::LineBox>& lines,
+    docv1::BoundingBox* box) {
+  // The union covers only the lines on the cell's first page: TableCell has
+  // no page slot, so a cell straddling a page break keeps its first page's
+  // extent.
+  int page_index = -1;
+  double l = 0, t = 0, r = 0, b = 0;
+  bool first = true;
+  for (const officev1::LineBox& line : lines) {
+    if (line.page_index() < 0) continue;
+    if (page_index < 0) page_index = line.page_index();
+    if (line.page_index() != page_index) continue;
+    double ll = static_cast<double>(line.x_twips());
+    double lt = static_cast<double>(line.y_twips());
+    double lr = ll + static_cast<double>(line.width_twips());
+    double lb = lt + static_cast<double>(line.height_twips());
+    if (first) {
+      l = ll; t = lt; r = lr; b = lb;
+      first = false;
+    } else {
+      l = std::min(l, ll);
+      t = std::min(t, lt);
+      r = std::max(r, lr);
+      b = std::max(b, lb);
+    }
+  }
+  if (first) return false;
+  // Line rectangles are document-absolute like every LineBox; page-local
+  // like add_prov.
+  if (page_index < static_cast<int>(page_rects_.size())) {
+    const officev1::PageRect& page = page_rects_[page_index];
+    l -= static_cast<double>(page.x_twips());
+    r -= static_cast<double>(page.x_twips());
+    t -= static_cast<double>(page.y_twips());
+    b -= static_cast<double>(page.y_twips());
+  }
+  box->set_l(l);
+  box->set_t(t);
+  box->set_r(r);
+  box->set_b(b);
+  box->set_coord_origin(docv1::COORD_ORIGIN_TOPLEFT);
+  return true;
+}
+
 void DoclingMapper::fold_table(const officev1::TableData& table,
                                docv1::TableItem* item) {
   docv1::TableData* data = item->mutable_data();
@@ -350,6 +395,10 @@ void DoclingMapper::fold_table(const officev1::TableData& table,
     out->set_row_span(1);
     out->set_col_span(1);
     out->set_text(cell.text());
+    if (!cell.line_rects().empty()) {
+      docv1::BoundingBox box;
+      if (cell_bbox(cell.line_rects(), &box)) *out->mutable_bbox() = box;
+    }
   }
   if (table.rows() > 0 && table.columns() > 0
       && table.rows() * table.columns() <= kMaxGridCells) {
@@ -366,9 +415,10 @@ void DoclingMapper::fold_table(const officev1::TableData& table,
       }
     }
     for (const docv1::TableCell& cell : data->table_cells()) {
-      data->mutable_grid(cell.start_row_offset_idx())
-          ->mutable_cells(cell.start_col_offset_idx())
-          ->set_text(cell.text());
+      docv1::TableCell* slot = data->mutable_grid(cell.start_row_offset_idx())
+          ->mutable_cells(cell.start_col_offset_idx());
+      slot->set_text(cell.text());
+      if (cell.has_bbox()) *slot->mutable_bbox() = cell.bbox();
     }
   }
 }

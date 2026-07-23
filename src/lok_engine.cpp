@@ -291,7 +291,9 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     // probe stays null when the part is off or the flush is unresolvable.
     SelectionProbe probe;
     SelectionProbe* probe_ptr = nullptr;
-    if (ok && options.parts.wants(officev1::DOCUMENT_PART_LINE_RECTS)) {
+    if (ok && (options.parts.wants(officev1::DOCUMENT_PART_LINE_RECTS) ||
+               options.parts.explicit_wants(
+                   officev1::DOCUMENT_PART_CELL_LINE_RECTS))) {
       probe.reschedule = resolve_reschedule();
       probe.acquire_solar_mutex = reinterpret_cast<void (*)(unsigned int)>(
           dlsym(RTLD_DEFAULT, "_ZN11Application17AcquireSolarMutexEj"));
