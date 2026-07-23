@@ -19,6 +19,26 @@
 #include <com/sun/star/beans/UnknownPropertyException.hpp>
 #include <com/sun/star/beans/XPropertySet.hpp>
 #include <com/sun/star/beans/XPropertySetInfo.hpp>
+#include <com/sun/star/chart2/AxisType.hpp>
+#include <com/sun/star/chart2/ScaleData.hpp>
+#include <com/sun/star/chart2/XAxis.hpp>
+#include <com/sun/star/chart2/XChartDocument.hpp>
+#include <com/sun/star/chart2/XChartType.hpp>
+#include <com/sun/star/chart2/XChartTypeContainer.hpp>
+#include <com/sun/star/chart2/XCoordinateSystem.hpp>
+#include <com/sun/star/chart2/XCoordinateSystemContainer.hpp>
+#include <com/sun/star/chart2/XDataSeries.hpp>
+#include <com/sun/star/chart2/XDataSeriesContainer.hpp>
+#include <com/sun/star/chart2/XDiagram.hpp>
+#include <com/sun/star/chart2/XFormattedString.hpp>
+#include <com/sun/star/chart2/XTitle.hpp>
+#include <com/sun/star/chart2/XTitled.hpp>
+#include <com/sun/star/chart2/data/XDataSequence.hpp>
+#include <com/sun/star/chart2/data/XDataSource.hpp>
+#include <com/sun/star/chart2/data/XLabeledDataSequence.hpp>
+#include <com/sun/star/chart2/data/XNumericalDataSequence.hpp>
+#include <com/sun/star/chart2/data/XTextualDataSequence.hpp>
+#include <com/sun/star/document/XEmbeddedObjectSupplier2.hpp>
 #include <com/sun/star/container/XEnumerationAccess.hpp>
 #include <com/sun/star/container/XNameAccess.hpp>
 #include <com/sun/star/container/XIndexAccess.hpp>
@@ -86,6 +106,7 @@
 #include <com/sun/star/text/XTextContent.hpp>
 #include <com/sun/star/text/XTextDocument.hpp>
 #include <com/sun/star/text/XTextColumns.hpp>
+#include <com/sun/star/text/XTextEmbeddedObjectsSupplier.hpp>
 #include <com/sun/star/text/XTextFrame.hpp>
 #include <com/sun/star/text/XTextFramesSupplier.hpp>
 #include <com/sun/star/text/XTextRange.hpp>
@@ -1617,6 +1638,457 @@ bool emit_calc_content(
   return true;
 }
 
+// Formats a double for the tabular chart projection. The typed series keep
+// the values numeric; this text is only the grid projection.
+std::string double_text(double value) {
+  char buffer[32];
+  std::snprintf(buffer, sizeof buffer, "%g", value);
+  return buffer;
+}
+
+// Concatenates a chart title's formatted string parts.
+std::string chart_title_text(const Reference<css::chart2::XTitled>& titled) {
+  std::string text;
+  if (!titled.is()) return text;
+  Reference<css::chart2::XTitle> title = titled->getTitleObject();
+  if (!title.is()) return text;
+  for (const Reference<css::chart2::XFormattedString>& part : title->getText()) {
+    if (part.is()) text += utf8(part->getString());
+  }
+  return text;
+}
+
+// Maps the raw chart2 chart-type service name to the coarse wire kind.
+officev1::EmbeddedChartKind chart_kind_for(const std::string& service) {
+  if (ends_with(service, ".BarChartType")) return officev1::EMBEDDED_CHART_KIND_BAR;
+  if (ends_with(service, ".ColumnChartType")) {
+    return officev1::EMBEDDED_CHART_KIND_COLUMN;
+  }
+  if (ends_with(service, ".LineChartType")) return officev1::EMBEDDED_CHART_KIND_LINE;
+  if (ends_with(service, ".AreaChartType")) return officev1::EMBEDDED_CHART_KIND_AREA;
+  if (ends_with(service, ".PieChartType")) return officev1::EMBEDDED_CHART_KIND_PIE;
+  if (ends_with(service, ".ScatterChartType")) {
+    return officev1::EMBEDDED_CHART_KIND_SCATTER;
+  }
+  if (ends_with(service, ".BubbleChartType")) {
+    return officev1::EMBEDDED_CHART_KIND_BUBBLE;
+  }
+  if (ends_with(service, ".NetChartType")) return officev1::EMBEDDED_CHART_KIND_NET;
+  if (ends_with(service, ".CandleStickChartType")) {
+    return officev1::EMBEDDED_CHART_KIND_CANDLESTICK;
+  }
+  return officev1::EMBEDDED_CHART_KIND_OTHER;
+}
+
+// Walks an embedded chart's live chart2 model: type, titles, category axis,
+// and per-series numeric sequences routed by their Role property, then a
+// tabular grid projection that is always populated.
+void fill_chart(const Reference<css::chart2::XChartDocument>& chart_doc,
+                const std::string& label, officev1::EmbeddedChart* out,
+                Warner& warner) {
+  try {
+    out->set_title(
+        chart_title_text(Reference<css::chart2::XTitled>(chart_doc, UNO_QUERY)));
+    Reference<css::chart2::XDiagram> diagram = chart_doc->getFirstDiagram();
+    if (!diagram.is()) return;
+    Reference<css::chart2::XCoordinateSystemContainer> systems(diagram,
+                                                               UNO_QUERY);
+    if (!systems.is()) return;
+    for (const Reference<css::chart2::XCoordinateSystem>& coord :
+         systems->getCoordinateSystems()) {
+      if (!coord.is()) continue;
+      // Axis titles and the category labels, which live on the axis scale,
+      // not on the series.
+      for (sal_Int32 dimension = 0;
+           dimension < std::min<sal_Int32>(2, coord->getDimension());
+           dimension++) {
+        try {
+          Reference<css::chart2::XAxis> axis =
+              coord->getAxisByDimension(dimension, 0);
+          if (!axis.is()) continue;
+          std::string title = chart_title_text(
+              Reference<css::chart2::XTitled>(axis, UNO_QUERY));
+          if (dimension == 0 && out->x_axis_title().empty()) {
+            out->set_x_axis_title(title);
+          }
+          if (dimension == 1 && out->y_axis_title().empty()) {
+            out->set_y_axis_title(title);
+          }
+          if (dimension == 0 && out->categories().empty()) {
+            css::chart2::ScaleData scale = axis->getScaleData();
+            if (scale.Categories.is()) {
+              Reference<css::chart2::data::XTextualDataSequence> texts(
+                  scale.Categories->getValues(), UNO_QUERY);
+              if (texts.is()) {
+                for (const rtl::OUString& category : texts->getTextualData()) {
+                  out->add_categories(utf8(category));
+                }
+              }
+            }
+          }
+        } catch (const css::uno::Exception& error) {
+          warner.warn(label + " axis " + std::to_string(dimension) +
+                          " query failed",
+                      error);
+        }
+      }
+      Reference<css::chart2::XChartTypeContainer> types(coord, UNO_QUERY);
+      if (!types.is()) continue;
+      for (const Reference<css::chart2::XChartType>& type :
+           types->getChartTypes()) {
+        if (!type.is()) continue;
+        if (out->chart_type_service().empty()) {
+          std::string service = utf8(type->getChartType());
+          out->set_chart_type_service(service);
+          out->set_kind(chart_kind_for(service));
+        }
+        Reference<css::chart2::XDataSeriesContainer> series_container(type,
+                                                                      UNO_QUERY);
+        if (!series_container.is()) continue;
+        for (const Reference<css::chart2::XDataSeries>& series :
+             series_container->getDataSeries()) {
+          Reference<css::chart2::data::XDataSource> source(series, UNO_QUERY);
+          if (!source.is()) continue;
+          officev1::EmbeddedChartSeries* out_series = out->add_series();
+          for (const Reference<css::chart2::data::XLabeledDataSequence>&
+                   labeled : source->getDataSequences()) {
+            if (!labeled.is()) continue;
+            if (out_series->label().empty()) {
+              Reference<css::chart2::data::XTextualDataSequence> label_text(
+                  labeled->getLabel(), UNO_QUERY);
+              if (label_text.is()) {
+                for (const rtl::OUString& part : label_text->getTextualData()) {
+                  out_series->set_label(out_series->label() + utf8(part));
+                }
+              }
+            }
+            Reference<css::chart2::data::XDataSequence> values =
+                labeled->getValues();
+            if (!values.is()) continue;
+            rtl::OUString role;
+            try {
+              Reference<css::beans::XPropertySet> value_props(values,
+                                                              UNO_QUERY);
+              if (value_props.is()) {
+                value_props->getPropertyValue("Role") >>= role;
+              }
+            } catch (const css::beans::UnknownPropertyException&) {
+              // Expected probe result: a bare data sequence carries no role.
+            }
+            Reference<css::chart2::data::XNumericalDataSequence> numbers(
+                values, UNO_QUERY);
+            if (!numbers.is()) continue;
+            google::protobuf::RepeatedField<double>* target = nullptr;
+            if (role == "values-x") {
+              target = out_series->mutable_values_x();
+            } else if (role == "sizes") {
+              target = out_series->mutable_sizes();
+            } else {
+              // values-y and unlabeled numeric sequences are the y series.
+              target = out_series->mutable_values_y();
+            }
+            for (double value : numbers->getNumericalData()) {
+              target->Add(value);
+            }
+          }
+        }
+      }
+    }
+  } catch (const css::uno::Exception& error) {
+    warner.warn(label + " chart walk failed", error);
+  }
+  // The tabular projection: a label row on top, categories down the first
+  // column, one series per further column.
+  officev1::TableData* grid = out->mutable_tabular();
+  int rows = out->categories_size();
+  for (const officev1::EmbeddedChartSeries& series : out->series()) {
+    rows = std::max(rows, series.values_y_size());
+  }
+  grid->set_rows(rows + 1);
+  grid->set_columns(out->series_size() + 1);
+  for (int column = 0; column < out->series_size(); column++) {
+    officev1::TableCellData* cell = grid->add_cells();
+    cell->set_row(0);
+    cell->set_column(column + 1);
+    cell->set_text(out->series(column).label());
+  }
+  for (int row = 0; row < rows; row++) {
+    officev1::TableCellData* head = grid->add_cells();
+    head->set_row(row + 1);
+    head->set_column(0);
+    if (row < out->categories_size()) head->set_text(out->categories(row));
+    for (int column = 0; column < out->series_size(); column++) {
+      const officev1::EmbeddedChartSeries& series = out->series(column);
+      if (row >= series.values_y_size()) continue;
+      officev1::TableCellData* cell = grid->add_cells();
+      cell->set_row(row + 1);
+      cell->set_column(column + 1);
+      cell->set_text(double_text(series.values_y(row)));
+    }
+  }
+}
+
+// Projects an embedded spreadsheet's first non-empty sheet used range into
+// a plain cell grid.
+void fill_inner_table(
+    const Reference<css::sheet::XSpreadsheetDocument>& inner_doc,
+    const std::string& label, officev1::TableData* out, Warner& warner) {
+  try {
+    Reference<css::container::XIndexAccess> sheets(inner_doc->getSheets(),
+                                                   UNO_QUERY);
+    if (!sheets.is()) return;
+    for (sal_Int32 s = 0; s < sheets->getCount(); s++) {
+      Reference<css::sheet::XSpreadsheet> sheet(sheets->getByIndex(s),
+                                                UNO_QUERY);
+      if (!sheet.is()) continue;
+      Reference<css::sheet::XSheetCellCursor> cursor = sheet->createCursor();
+      Reference<css::sheet::XUsedAreaCursor> area(cursor, UNO_QUERY);
+      Reference<css::sheet::XCellRangeAddressable> addressable(cursor,
+                                                               UNO_QUERY);
+      if (!area.is() || !addressable.is()) continue;
+      area->gotoStartOfUsedArea(false);
+      area->gotoEndOfUsedArea(true);
+      css::table::CellRangeAddress used = addressable->getRangeAddress();
+      bool any = false;
+      for (sal_Int32 r = used.StartRow; r <= used.EndRow; r++) {
+        for (sal_Int32 c = used.StartColumn; c <= used.EndColumn; c++) {
+          Reference<css::table::XCell> cell = sheet->getCellByPosition(c, r);
+          if (!cell.is() ||
+              cell->getType() == css::table::CellContentType_EMPTY) {
+            continue;
+          }
+          Reference<css::text::XText> text(cell, UNO_QUERY);
+          officev1::TableCellData* out_cell = out->add_cells();
+          out_cell->set_row(r - used.StartRow);
+          out_cell->set_column(c - used.StartColumn);
+          if (text.is()) out_cell->set_text(utf8(text->getString()));
+          any = true;
+        }
+      }
+      if (any) {
+        out->set_rows(used.EndRow - used.StartRow + 1);
+        out->set_columns(used.EndColumn - used.StartColumn + 1);
+        return;  // The first non-empty sheet is the projection.
+      }
+      out->clear_cells();
+    }
+  } catch (const css::uno::Exception& error) {
+    warner.warn(label + " inner table walk failed", error);
+  }
+}
+
+// Classifies an embedded object's inner model and fills its typed content.
+void classify_embedded(const Reference<css::frame::XModel>& inner,
+                       const std::string& label, officev1::EmbeddedObject* out,
+                       Warner& warner) {
+  if (!inner.is()) {
+    // No inner Office model: a foreign OLE payload.
+    out->set_kind(officev1::EMBEDDED_OBJECT_KIND_OLE_OTHER);
+    return;
+  }
+  Reference<css::chart2::XChartDocument> chart(inner, UNO_QUERY);
+  if (chart.is()) {
+    out->set_kind(officev1::EMBEDDED_OBJECT_KIND_CHART);
+    fill_chart(chart, label, out->mutable_chart(), warner);
+    return;
+  }
+  Reference<css::sheet::XSpreadsheetDocument> inner_sheet(inner, UNO_QUERY);
+  if (inner_sheet.is()) {
+    out->set_kind(officev1::EMBEDDED_OBJECT_KIND_SPREADSHEET);
+    fill_inner_table(inner_sheet, label, out->mutable_inner_table(), warner);
+    return;
+  }
+  Reference<css::lang::XServiceInfo> info(inner, UNO_QUERY);
+  if (info.is() &&
+      info->supportsService("com.sun.star.formula.FormulaProperties")) {
+    out->set_kind(officev1::EMBEDDED_OBJECT_KIND_FORMULA);
+    try {
+      Reference<css::beans::XPropertySet> props(inner, UNO_QUERY);
+      if (props.is()) {
+        rtl::OUString formula;
+        props->getPropertyValue("Formula") >>= formula;
+        out->set_formula(utf8(formula));
+      }
+    } catch (const css::uno::Exception& error) {
+      warner.warn(label + " formula query failed", error);
+    }
+    return;
+  }
+  out->set_kind(officev1::EMBEDDED_OBJECT_KIND_OLE_OTHER);
+}
+
+// Emits every embedded object of the loaded document as a typed
+// EmbeddedObject event: Writer objects through the text-embedded-objects
+// collection with caret anchors, other document classes through their draw
+// pages' OLE2 shapes with twips geometry. The inner content is classified
+// off the already-instantiated Model property, which never forces the
+// object into a running state.
+bool emit_embedded_objects(const Reference<css::frame::XModel>& model,
+                           const Reference<css::uno::XComponentContext>& context,
+                           const EmitFn& emit_fn, Warner& warner) {
+  Reference<css::graphic::XGraphicProvider> provider =
+      graphic_provider(context, warner);
+  int32_t emitted = 0;
+
+  Reference<css::text::XTextDocument> text_doc(model, UNO_QUERY);
+  if (text_doc.is()) {
+    Reference<css::text::XTextEmbeddedObjectsSupplier> supplier(text_doc,
+                                                                UNO_QUERY);
+    if (!supplier.is()) return true;
+    Reference<css::container::XIndexAccess> objects(
+        supplier->getEmbeddedObjects(), UNO_QUERY);
+    if (!objects.is()) return true;
+    Reference<css::text::XTextViewCursor> cursor;
+    Reference<css::text::XTextViewCursorSupplier> cursor_supplier(
+        model->getCurrentController(), UNO_QUERY);
+    if (cursor_supplier.is()) cursor = cursor_supplier->getViewCursor();
+    for (sal_Int32 i = 0; i < objects->getCount(); i++) {
+      std::string label = "embedded object " + std::to_string(i);
+      officev1::StreamPagesResponse event;
+      officev1::EmbeddedObject* out = event.mutable_embedded_object();
+      out->set_index(emitted);
+      out->set_page_index(-1);
+      try {
+        Reference<css::beans::XPropertySet> props(objects->getByIndex(i),
+                                                  UNO_QUERY);
+        if (!props.is()) continue;
+        Reference<css::container::XNamed> named(props, UNO_QUERY);
+        if (named.is()) out->set_name(utf8(named->getName()));
+        try {
+          rtl::OUString clsid;
+          props->getPropertyValue("CLSID") >>= clsid;
+          out->set_clsid(utf8(clsid));
+        } catch (const css::beans::UnknownPropertyException&) {
+          // Expected probe result: not every entry stores a class id.
+        }
+        try {
+          sal_Int32 width = 0, height = 0;
+          props->getPropertyValue("Width") >>= width;
+          props->getPropertyValue("Height") >>= height;
+          out->set_width_twips(hundredth_mm_to_twips(width));
+          out->set_height_twips(hundredth_mm_to_twips(height));
+        } catch (const css::uno::Exception& error) {
+          warner.warn(label + " geometry query failed", error);
+        }
+        Reference<css::text::XTextContent> content(props, UNO_QUERY);
+        if (content.is()) {
+          int32_t page_index = -1;
+          caret_at(cursor, content->getAnchor(), label + " anchor",
+                   out->mutable_anchor(), &page_index, warner);
+          out->set_page_index(page_index);
+        }
+        Reference<css::frame::XModel> inner;
+        try {
+          props->getPropertyValue("Model") >>= inner;
+        } catch (const css::beans::UnknownPropertyException&) {
+          // Expected probe result: a foreign OLE entry has no inner model.
+        }
+        classify_embedded(inner, label, out, warner);
+        Reference<css::document::XEmbeddedObjectSupplier2> replacement(props,
+                                                                       UNO_QUERY);
+        if (replacement.is()) {
+          Reference<css::graphic::XGraphic> graphic =
+              replacement->getReplacementGraphic();
+          if (graphic.is()) {
+            encode_graphic(graphic, provider, label,
+                           out->mutable_replacement_mime_type(),
+                           out->mutable_replacement_image(), warner);
+          }
+        }
+      } catch (const css::uno::Exception& error) {
+        warner.warn(label + " extraction failed", error);
+      }
+      if (!emit_fn(event)) return false;
+      emitted++;
+    }
+    return true;
+  }
+
+  Reference<css::drawing::XDrawPagesSupplier> supplier(model, UNO_QUERY);
+  if (!supplier.is()) return true;
+  Reference<css::drawing::XDrawPages> pages = supplier->getDrawPages();
+  if (!pages.is()) return true;
+  for (sal_Int32 p = 0; p < pages->getCount(); p++) {
+    Reference<css::container::XIndexAccess> shapes(pages->getByIndex(p),
+                                                   UNO_QUERY);
+    if (!shapes.is()) continue;
+    for (sal_Int32 i = 0; i < shapes->getCount(); i++) {
+      std::string label = "page " + std::to_string(p) + " embedded object " +
+                          std::to_string(i);
+      Reference<css::beans::XPropertySet> props;
+      try {
+        props = Reference<css::beans::XPropertySet>(shapes->getByIndex(i),
+                                                    UNO_QUERY);
+      } catch (const css::uno::Exception& error) {
+        warner.warn(label + " is not reachable", error);
+        continue;
+      }
+      if (!props.is()) continue;
+      Reference<css::lang::XServiceInfo> services(props, UNO_QUERY);
+      if (!services.is() ||
+          !services->supportsService("com.sun.star.drawing.OLE2Shape")) {
+        continue;
+      }
+      officev1::StreamPagesResponse event;
+      officev1::EmbeddedObject* out = event.mutable_embedded_object();
+      out->set_index(emitted);
+      out->set_page_index(static_cast<int32_t>(p));
+      try {
+        Reference<css::container::XNamed> named(props, UNO_QUERY);
+        if (named.is()) out->set_name(utf8(named->getName()));
+        try {
+          rtl::OUString clsid;
+          props->getPropertyValue("CLSID") >>= clsid;
+          out->set_clsid(utf8(clsid));
+        } catch (const css::beans::UnknownPropertyException&) {
+          // Expected probe result: not every shape stores a class id.
+        }
+        Reference<css::drawing::XShape> shape(props, UNO_QUERY);
+        if (shape.is()) {
+          css::awt::Point position = shape->getPosition();
+          css::awt::Size size = shape->getSize();
+          out->mutable_position()->set_x(hundredth_mm_to_twips(position.X));
+          out->mutable_position()->set_y(hundredth_mm_to_twips(position.Y));
+          out->set_width_twips(hundredth_mm_to_twips(size.Width));
+          out->set_height_twips(hundredth_mm_to_twips(size.Height));
+        }
+        Reference<css::frame::XModel> inner;
+        try {
+          props->getPropertyValue("Model") >>= inner;
+        } catch (const css::beans::UnknownPropertyException&) {
+          // Expected probe result: a foreign OLE shape has no inner model.
+        }
+        classify_embedded(inner, label, out, warner);
+        // Draw-page OLE shapes have no ReplacementGraphic property; the
+        // thumbnail (or graphic) is the replacement image.
+        Reference<css::graphic::XGraphic> graphic;
+        try {
+          props->getPropertyValue("ThumbnailGraphic") >>= graphic;
+        } catch (const css::beans::UnknownPropertyException&) {
+          // Expected probe result: no thumbnail stored.
+        }
+        if (!graphic.is()) {
+          try {
+            props->getPropertyValue("Graphic") >>= graphic;
+          } catch (const css::beans::UnknownPropertyException&) {
+            // Expected probe result: no replacement graphic at all.
+          }
+        }
+        if (graphic.is()) {
+          encode_graphic(graphic, provider, label,
+                         out->mutable_replacement_mime_type(),
+                         out->mutable_replacement_image(), warner);
+        }
+      } catch (const css::uno::Exception& error) {
+        warner.warn(label + " extraction failed", error);
+      }
+      if (!emit_fn(event)) return false;
+      emitted++;
+    }
+  }
+  return true;
+}
+
 bool emit_notes(const Reference<css::text::XTextDocument>& text_doc,
                 const Reference<css::text::XTextViewCursor>& cursor,
                 bool endnotes, const EmitFn& emit_fn, Warner& warner) {
@@ -1914,16 +2386,27 @@ bool emit_typed_content(const PartSelection& parts, const EmitFn& emit_fn,
     }
     Reference<css::container::XEnumeration> it = components->createEnumeration();
     Reference<css::frame::XModel> model;
+    Reference<css::frame::XModel> fallback;
     while (it->hasMoreElements()) {
       Reference<css::frame::XModel> candidate(it->nextElement(), UNO_QUERY);
-      if (candidate.is()) model = candidate;
+      if (!candidate.is()) continue;
+      fallback = candidate;
+      // Embedded objects put their inner models on the desktop too; the
+      // loaded document is the component whose URL is the loaded file.
+      if (candidate->getURL().startsWith("file://")) model = candidate;
     }
+    if (!model.is()) model = fallback;
     if (!model.is()) {
       warner.warn("loaded document not found on the desktop, typed content unavailable");
       return true;
     }
     if (parts.wants(officev1::DOCUMENT_PART_METADATA)) {
       if (!emit_metadata(model, emit_fn, warner)) return false;
+    }
+    if (parts.wants(officev1::DOCUMENT_PART_EMBEDDED_OBJECTS)) {
+      if (!emit_embedded_objects(model, context, emit_fn, warner)) {
+        return false;
+      }
     }
     Reference<css::text::XTextDocument> text_doc(model, UNO_QUERY);
     if (text_doc.is()) {
