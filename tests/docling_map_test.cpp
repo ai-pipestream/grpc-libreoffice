@@ -242,6 +242,49 @@ void verify_writer_stream() {
     mapper.consume(event);
   }
   {
+    // A draw-page group container followed by its two children: a
+    // text-bearing shape anchored by model position, and a nested image.
+    officev1::StreamPagesResponse event;
+    officev1::Shape* group = event.mutable_shape();
+    group->set_name("Group1");
+    group->set_page_index(0);
+    group->set_z_order(3);
+    group->set_is_group(true);
+    group->mutable_position()->set_x(4000);
+    group->mutable_position()->set_y(6000);
+    group->set_width_twips(3000);
+    group->set_height_twips(2000);
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::Shape* child = event.mutable_shape();
+    child->set_name("Child1");
+    child->set_page_index(-1);
+    child->set_z_order(0);
+    child->set_group_path("3");
+    child->mutable_position()->set_x(4200);
+    child->mutable_position()->set_y(6200);
+    child->set_width_twips(1000);
+    child->set_height_twips(500);
+    officev1::TextRun* run = child->add_runs();
+    run->set_text("grouped text");
+    run->set_char_offset(-1);
+    run->set_char_length(12);
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::EmbeddedImage* nested = event.mutable_embedded_image();
+    nested->set_index(1);
+    nested->set_page_index(-1);
+    nested->set_name("NestedImg");
+    nested->set_mime_type("image/png");
+    nested->set_data("PNGBYTES2");
+    nested->set_group_path("3");
+    mapper.consume(event);
+  }
+  {
     // An embedded bar chart.
     officev1::StreamPagesResponse event;
     officev1::EmbeddedObject* object = event.mutable_embedded_object();
@@ -367,9 +410,9 @@ void verify_writer_stream() {
             "writer: cells without line rectangles carry no bbox");
   }
 
-  // Pictures: embedded image plus the chart.
-  require(document.pictures_size() == 2,
-          "writer: image and chart become pictures");
+  // Pictures: embedded image, the nested image, and the chart.
+  require(document.pictures_size() == 3,
+          "writer: images and chart become pictures");
   const docv1::PictureItem& image = document.pictures(0);
   require(image.label() == docv1::DOC_ITEM_LABEL_PICTURE
               && image.image().uri().rfind("data:image/png;base64,", 0) == 0,
@@ -377,9 +420,41 @@ void verify_writer_stream() {
   require(image.prov_size() == 1
               && image.prov(0).bbox().l() == 2000.0 - 284.0,
           "writer: image anchor page-local");
-  const docv1::PictureItem& chart = document.pictures(1);
+  const docv1::PictureItem& chart = document.pictures(2);
   require(chart.label() == docv1::DOC_ITEM_LABEL_CHART,
           "writer: chart labeled CHART");
+
+  // Draw-page group nesting: the container group, its text child under a
+  // wrapper group, and the nested image all chain to the group ref.
+  std::string wpg_ref;
+  for (const docv1::GroupItem& group : document.groups()) {
+    if (group.name() == "Group1"
+        && group.label() == docv1::GROUP_LABEL_PICTURE_AREA) {
+      wpg_ref = group.self_ref();
+    }
+  }
+  require(!wpg_ref.empty(), "writer: group container becomes a GroupItem");
+  const docv1::GroupItem* child_wrapper = nullptr;
+  for (const docv1::GroupItem& group : document.groups()) {
+    if (group.name() == "Child1") child_wrapper = &group;
+  }
+  require(child_wrapper != nullptr && child_wrapper->parent().ref() == wpg_ref,
+          "writer: grouped shape nests under the group");
+  bool child_prov_ok = false;
+  for (const docv1::BaseTextItem& item : document.texts()) {
+    if (item.item_case() != docv1::BaseTextItem::kText) continue;
+    const docv1::TextItemBase& base = item.text().base();
+    if (base.text() != "grouped text") continue;
+    // Position (4200, 6200) sits on page 0, whose origin is (284, 284).
+    child_prov_ok = base.parent().ref() == child_wrapper->self_ref()
+        && base.prov_size() == 1 && base.prov(0).page_no() == 1
+        && base.prov(0).bbox().l() == 4200.0 - 284.0
+        && base.prov(0).charspan().end() == 12;
+  }
+  require(child_prov_ok,
+          "writer: grouped shape prov resolves its page from the position");
+  require(document.pictures(1).parent().ref() == wpg_ref,
+          "writer: nested image nests under the group");
   bool bar_seen = false;
   bool tabular_seen = false;
   for (const docv1::PictureAnnotation& annotation : chart.annotations()) {

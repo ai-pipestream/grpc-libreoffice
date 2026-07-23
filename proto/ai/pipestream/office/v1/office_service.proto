@@ -610,6 +610,10 @@ message EmbeddedImage {
   // geometry. Empty when line rectangles were not requested or could not
   // be measured.
   repeated LineBox line_rects = 9;
+  // Slash-joined chain of ancestor group indices when the image sits inside
+  // a draw-page group of a text document; empty at the top level. The same
+  // scheme as Shape.group_path.
+  string group_path = 10;
 }
 
 // EmbeddedObjectKind classifies an embedded object's inner content.
@@ -939,12 +943,16 @@ message TextFrame {
   string chain_prev = 9;
 }
 
-// Shape is one text-bearing draw-page shape of a text document: a custom
-// shape, a text shape, or an imported textbox. It carries the shape's
+// Shape is one draw-page shape of a text document: a custom shape, a text
+// shape, an imported textbox, or a group container. It carries the shape's
 // styled runs, its layout anchor, and its geometry. Graphic objects and OLE
 // objects are reported as EmbeddedImage instead, and Writer text frames as
-// TextFrame; this event is for the remaining text-capable shapes. Runs
-// carry char_offset -1.
+// TextFrame; this event is for the remaining text-capable shapes and for
+// groups. A group container is emitted as its own event with is_group true,
+// directly before the events for its child shapes; each child names its
+// ancestor chain through group_path, exactly like DrawingShape. Group
+// children are not text contents, so they carry position instead of a
+// caret anchor. Runs carry char_offset -1.
 message Shape {
   // Zero-based shape index in discovery order among emitted shapes.
   int32 index = 1;
@@ -973,6 +981,24 @@ message Shape {
   // Name of the previous textbox in the chain that flows into this shape;
   // empty when the shape is not a linked textbox.
   string chain_prev = 10;
+  // Paint order of the shape within its immediate container, zero-based:
+  // the office core's index order inside the draw page or the containing
+  // group. Scoped to the container, so a group's children restart at 0.
+  // Counts every container slot, unlike index, which numbers emitted Shape
+  // events.
+  int32 z_order = 11;
+  // Slash-joined chain of ancestor group indices, empty at the top level;
+  // the same scheme as DrawingShape.group_path. For example "2" for a shape
+  // inside the top-level group at container index 2.
+  string group_path = 12;
+  // True when this event is a group container node. Its children follow as
+  // separate events whose group_path names this group.
+  bool is_group = 13;
+  // Top-left corner of the shape's bounding box from the shape model, in
+  // document-absolute twips like TwipsPoint. The geometry anchor for group
+  // children, which have no caret anchor; also set alongside anchor when
+  // the model reports it.
+  TwipsPoint position = 14;
 }
 
 // PlaceholderRole is the presentation role of a slide shape, derived from

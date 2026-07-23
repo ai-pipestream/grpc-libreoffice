@@ -165,6 +165,7 @@ const char kTypedFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
   <text:p><draw:frame draw:name="Img1" svg:width="1cm" svg:height="1cm"><draw:image><office:binary-data>iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==</office:binary-data></draw:image></draw:frame></text:p>
   <text:p><draw:frame draw:name="Frame1" text:anchor-type="paragraph" svg:width="5cm" svg:height="2cm"><draw:text-box draw:chain-next-name="Frame2"><text:p>frame body with a <text:span text:style-name="B1">bold</text:span> run</text:p></draw:text-box></draw:frame><draw:frame draw:name="Frame2" text:anchor-type="paragraph" svg:x="8cm" svg:width="5cm" svg:height="2cm"><draw:text-box/></draw:frame></text:p>
   <text:p><draw:custom-shape draw:name="Shape1" text:anchor-type="paragraph" svg:width="4cm" svg:height="2cm"><text:p>shape text</text:p><draw:enhanced-geometry draw:type="rectangle"/></draw:custom-shape></text:p>
+  <text:p><draw:g draw:name="WPG1" text:anchor-type="paragraph"><draw:custom-shape draw:name="GShape1" svg:x="1cm" svg:y="0cm" svg:width="3cm" svg:height="1cm"><text:p>grouped alpha</text:p><draw:enhanced-geometry draw:type="rectangle"/></draw:custom-shape><draw:custom-shape draw:name="GShape2" svg:x="1cm" svg:y="1.5cm" svg:width="3cm" svg:height="1cm"><text:p>grouped beta</text:p><draw:enhanced-geometry draw:type="rectangle"/></draw:custom-shape></draw:g></text:p>
  </office:text></office:body>
 </office:document>
 )";
@@ -190,6 +191,11 @@ void verify_typed_content() {
   bool shape_ok = false;
   bool frame_leaked_into_shapes = false;
   bool out_of_body_text_in_paragraphs = false;
+  bool group_ok = false;
+  int group_z = -1;
+  std::vector<std::string> child_paths;
+  std::set<std::string> child_texts;
+  bool children_ok = true;
   officev1::StreamPagesResponse event;
   for (const std::string& payload : payloads) {
     require(event.ParseFromString(payload), "typed event parses");
@@ -260,6 +266,21 @@ void verify_typed_content() {
           shape_ok = !shape.shape_type().empty() && text == "shape text" &&
                      offsets_ok && shape.width_twips() > 0;
         }
+        if (shape.name() == "WPG1") {
+          group_ok = shape.is_group() && shape.group_path().empty() &&
+                     shape.width_twips() > 0 && shape.height_twips() > 0;
+          group_z = shape.z_order();
+        }
+        if (shape.name() == "GShape1" || shape.name() == "GShape2") {
+          std::string text;
+          for (const officev1::TextRun& text_run : shape.runs()) {
+            text += text_run.text();
+          }
+          child_texts.insert(text);
+          child_paths.push_back(shape.group_path());
+          children_ok = children_ok && !shape.is_group() &&
+                        shape.has_position() && shape.width_twips() > 0;
+        }
         break;
       }
       case officev1::StreamPagesResponse::kFootnote: {
@@ -329,6 +350,16 @@ void verify_typed_content() {
   require(frame1_ok, "text frame with chain, geometry, and styled runs");
   require(frame2_ok, "chained frame carries its back link");
   require(shape_ok, "text-bearing shape with runs and geometry");
+  require(group_ok, "group container emitted as its own Shape event");
+  require(child_paths.size() == 2 && children_ok,
+          "both grouped shapes surface with position and text");
+  for (const std::string& path : child_paths) {
+    require(path == std::to_string(group_z),
+            "grouped shapes name their container through group_path");
+  }
+  require(child_texts.count("grouped alpha") == 1 &&
+              child_texts.count("grouped beta") == 1,
+          "grouped shape text is captured");
   require(!frame_leaked_into_shapes, "frames are not double-counted as shapes");
   require(!out_of_body_text_in_paragraphs,
           "frame and shape text stays out of body paragraphs");
@@ -1335,12 +1366,23 @@ void verify_docling_mapping() {
                      .rfind("data:image/", 0) == 0,
           "mapped picture carries a data URI");
   bool frame_group = false;
+  std::string wpg_ref;
   for (const docv1::GroupItem& group : document.groups()) {
     if (group.name() == "Frame1") {
       frame_group = group.meta().custom_fields().count("chain_next") == 1;
     }
+    if (group.name() == "WPG1") wpg_ref = group.self_ref();
   }
   require(frame_group, "mapped frame group keeps its chain name");
+  require(!wpg_ref.empty(), "mapped WPG group container exists");
+  int nested = 0;
+  for (const docv1::GroupItem& group : document.groups()) {
+    if ((group.name() == "GShape1" || group.name() == "GShape2")
+        && group.parent().ref() == wpg_ref) {
+      nested++;
+    }
+  }
+  require(nested == 2, "grouped shapes nest under the WPG group");
 
   // Every provenance box is page-local: inside its page's rectangle.
   auto box_in_page = [&](const docv1::ProvenanceItem& prov) {

@@ -650,8 +650,11 @@ void DoclingMapper::on_table(const officev1::TableData& table) {
 }
 
 void DoclingMapper::on_embedded_image(const officev1::EmbeddedImage& image) {
+  std::string parent = "#/body";
+  auto container = writer_groups_.find(image.group_path());
+  if (container != writer_groups_.end()) parent = container->second;
   docv1::PictureItem* picture = add_picture(
-      docv1::DOC_ITEM_LABEL_PICTURE, docv1::CONTENT_LAYER_BODY, "#/body",
+      docv1::DOC_ITEM_LABEL_PICTURE, docv1::CONTENT_LAYER_BODY, parent,
       nullptr);
   if (!image.name().empty()) {
     (*picture->mutable_meta()->mutable_custom_fields())["name"] =
@@ -895,8 +898,39 @@ void DoclingMapper::on_text_frame(const officev1::TextFrame& frame) {
   }
 }
 
+int DoclingMapper::page_for_point(double x, double y) const {
+  for (int index = 0; index < static_cast<int>(page_rects_.size()); index++) {
+    const officev1::PageRect& page = page_rects_[index];
+    if (x >= static_cast<double>(page.x_twips())
+        && x < static_cast<double>(page.x_twips() + page.width_twips())
+        && y >= static_cast<double>(page.y_twips())
+        && y < static_cast<double>(page.y_twips() + page.height_twips())) {
+      return index;
+    }
+  }
+  return -1;
+}
+
 void DoclingMapper::on_shape(const officev1::Shape& shape) {
-  docv1::GroupItem* group = add_group("#/body", docv1::GROUP_LABEL_UNSPECIFIED,
+  std::string parent = "#/body";
+  auto container = writer_groups_.find(shape.group_path());
+  if (container != writer_groups_.end()) parent = container->second;
+
+  if (shape.is_group()) {
+    docv1::GroupItem* group = add_group(parent,
+                                        docv1::GROUP_LABEL_PICTURE_AREA,
+                                        shape.name(),
+                                        docv1::CONTENT_LAYER_BODY);
+    (*group->mutable_meta()->mutable_custom_fields())["shape_type"] =
+        str_value(shape.shape_type());
+    std::string child_path = shape.group_path().empty()
+        ? std::to_string(shape.z_order())
+        : shape.group_path() + "/" + std::to_string(shape.z_order());
+    writer_groups_[child_path] = group->self_ref();
+    return;
+  }
+
+  docv1::GroupItem* group = add_group(parent, docv1::GROUP_LABEL_UNSPECIFIED,
                                       shape.name(), docv1::CONTENT_LAYER_BODY);
   auto* fields = group->mutable_meta()->mutable_custom_fields();
   (*fields)["shape_type"] = str_value(shape.shape_type());
@@ -918,6 +952,17 @@ void DoclingMapper::on_shape(const officev1::Shape& shape) {
              static_cast<double>(shape.anchor().y()),
              static_cast<double>(shape.anchor().x() + shape.width_twips()),
              static_cast<double>(shape.anchor().y() + shape.height_twips()),
+             0, runs_length(shape.runs()));
+  } else if (shape.has_position()) {
+    // Group children carry a model position instead of a caret anchor; the
+    // page resolves from the position, which shares the document-absolute
+    // space of the page rectangles.
+    double l = static_cast<double>(shape.position().x());
+    double t = static_cast<double>(shape.position().y());
+    double r = l + static_cast<double>(shape.width_twips());
+    double b = t + static_cast<double>(shape.height_twips());
+    add_prov(handle.base->mutable_prov(),
+             page_for_point((l + r) / 2, (t + b) / 2), false, l, t, r, b,
              0, runs_length(shape.runs()));
   }
 }

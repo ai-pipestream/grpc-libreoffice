@@ -810,31 +810,53 @@ void encode_graphic(const Reference<css::graphic::XGraphic>& graphic,
   }
 }
 
-// Walks the text document's single draw page once and classifies each
-// shape: graphic objects emit EmbeddedImage (gated on IMAGES), draw-page
-// SwXTextFrame flys are skipped because emit_text_frames owns them, and the
-// remaining text-bearing shapes (custom shapes, text shapes, imported
-// textboxes whose XText resolves to their hidden backing frame) emit Shape
-// events (gated on SHAPES). Control shapes and empty-text shapes are
-// skipped silently.
-bool emit_draw_shapes(const Reference<css::text::XTextDocument>& text_doc,
-                      const Reference<css::uno::XComponentContext>& context,
-                      const Reference<css::text::XTextViewCursor>& cursor,
-                      CaretSpace* space, const PartSelection& parts,
-                      SelectionProbe* probe, const EmitFn& emit_fn,
-                      Warner& warner) {
-  Reference<css::drawing::XDrawPageSupplier> supplier(text_doc, UNO_QUERY);
-  if (!supplier.is()) return true;
-  Reference<css::container::XIndexAccess> shapes(supplier->getDrawPage(), UNO_QUERY);
-  if (!shapes.is()) return true;
-  bool want_images = parts.wants(officev1::DOCUMENT_PART_IMAGES);
-  bool want_shapes = parts.wants(officev1::DOCUMENT_PART_SHAPES);
+// Shared state of one Writer draw-page walk, threaded through the group
+// recursion so image and shape numbering stay document-global.
+struct WriterShapeWalk {
+  Reference<css::text::XTextViewCursor> cursor;
+  CaretSpace* space = nullptr;
+  SelectionProbe* probe = nullptr;
   Reference<css::graphic::XGraphicProvider> provider;
-  if (want_images) provider = graphic_provider(context, warner);
+  bool want_images = false;
+  bool want_shapes = false;
   int32_t image_index = 0;
   int32_t shape_index = 0;
+};
+
+// Sets the shape model's position, converted to twips, on out. Group
+// children have no caret anchor, so this is their geometry anchor; for
+// anchored top-level shapes it rides along as model geometry.
+void fill_shape_position(const Reference<css::drawing::XShape>& shape,
+                         const std::string& label, officev1::TwipsPoint* out,
+                         Warner& warner) {
+  if (!shape.is()) return;
+  try {
+    css::awt::Point position = shape->getPosition();
+    out->set_x(hundredth_mm_to_twips(position.X));
+    out->set_y(hundredth_mm_to_twips(position.Y));
+  } catch (const css::uno::Exception& error) {
+    warner.warn(label + " position query failed", error);
+  }
+}
+
+// Walks one shape container of the text document's draw page in paint
+// order and classifies each shape: graphic objects emit EmbeddedImage
+// (gated on IMAGES), draw-page SwXTextFrame flys are skipped because
+// emit_text_frames owns them, group containers emit a Shape event with
+// is_group set (gated on SHAPES) and are recursed so grouped content is
+// never dropped, and the remaining text-bearing shapes (custom shapes,
+// text shapes, imported textboxes whose XText resolves to their hidden
+// backing frame) emit Shape events (gated on SHAPES). Control shapes and
+// empty-text shapes are skipped silently. group_path names the ancestor
+// chain, empty at the top level; groups are recursed even when only IMAGES
+// is selected so nested image shapes are found.
+bool emit_writer_shapes(const Reference<css::container::XIndexAccess>& shapes,
+                        const std::string& group_path, WriterShapeWalk* walk,
+                        const EmitFn& emit_fn, Warner& warner) {
   for (sal_Int32 i = 0; i < shapes->getCount(); i++) {
-    std::string label = "shape " + std::to_string(i);
+    std::string slot = group_path.empty()
+        ? std::to_string(i) : group_path + "/" + std::to_string(i);
+    std::string label = "shape " + slot;
     Reference<css::beans::XPropertySet> props;
     try {
       props = Reference<css::beans::XPropertySet>(shapes->getByIndex(i), UNO_QUERY);
@@ -846,9 +868,56 @@ bool emit_draw_shapes(const Reference<css::text::XTextDocument>& text_doc,
     Reference<css::lang::XServiceInfo> services(props, UNO_QUERY);
     if (!services.is()) continue;
 
+    if (services->supportsService("com.sun.star.drawing.GroupShape")) {
+      if (walk->want_shapes) {
+        officev1::StreamPagesResponse event;
+        officev1::Shape* out = event.mutable_shape();
+        out->set_index(walk->shape_index);
+        out->set_page_index(-1);
+        out->set_z_order(i);
+        out->set_group_path(group_path);
+        out->set_is_group(true);
+        Reference<css::container::XNamed> named(props, UNO_QUERY);
+        if (named.is()) out->set_name(utf8(named->getName()));
+        Reference<css::drawing::XShape> shape(props, UNO_QUERY);
+        if (shape.is()) {
+          out->set_shape_type(utf8(shape->getShapeType()));
+          try {
+            css::awt::Size size = shape->getSize();
+            out->set_width_twips(hundredth_mm_to_twips(size.Width));
+            out->set_height_twips(hundredth_mm_to_twips(size.Height));
+          } catch (const css::uno::Exception& error) {
+            warner.warn(label + " geometry query failed", error);
+          }
+          fill_shape_position(shape, label, out->mutable_position(), warner);
+        }
+        // Only a top-level group is a text content with a caret anchor.
+        try {
+          Reference<css::text::XTextContent> content(props, UNO_QUERY);
+          if (content.is()) {
+            int32_t page_index = -1;
+            caret_at(walk->cursor, content->getAnchor(), label + " anchor",
+                     walk->space, out->mutable_anchor(), &page_index, warner);
+            out->set_page_index(page_index);
+          }
+        } catch (const css::uno::Exception& error) {
+          warner.warn(label + " anchor query failed", error);
+        }
+        if (!emit_fn(event)) return false;
+        walk->shape_index++;
+      }
+      Reference<css::container::XIndexAccess> children(props, UNO_QUERY);
+      if (children.is()) {
+        if (!emit_writer_shapes(children, slot, walk, emit_fn, warner)) {
+          return false;
+        }
+      }
+      continue;
+    }
+
     if (services->supportsService("com.sun.star.text.TextGraphicObject") ||
         services->supportsService("com.sun.star.drawing.GraphicObjectShape")) {
-      if (!want_images) continue;
+      if (!walk->want_images) continue;
       Reference<css::graphic::XGraphic> graphic;
       try {
         props->getPropertyValue("Graphic") >>= graphic;
@@ -860,49 +929,64 @@ bool emit_draw_shapes(const Reference<css::text::XTextDocument>& text_doc,
 
       officev1::StreamPagesResponse event;
       officev1::EmbeddedImage* out = event.mutable_embedded_image();
-      out->set_index(image_index);
+      out->set_index(walk->image_index);
       out->set_page_index(-1);
+      out->set_group_path(group_path);
       Reference<css::container::XNamed> named(props, UNO_QUERY);
       if (named.is()) out->set_name(utf8(named->getName()));
-      std::string image_label = "image " + std::to_string(image_index);
+      std::string image_label = "image " + std::to_string(walk->image_index);
 
-      encode_graphic(graphic, provider, image_label, out->mutable_mime_type(),
-                     out->mutable_data(), warner);
+      encode_graphic(graphic, walk->provider, image_label,
+                     out->mutable_mime_type(), out->mutable_data(), warner);
 
       try {
         Reference<css::text::XTextContent> content(props, UNO_QUERY);
         if (content.is()) {
           int32_t page_index = -1;
-          caret_at(cursor, content->getAnchor(), image_label + " anchor",
-                   space, out->mutable_anchor(), &page_index, warner);
+          caret_at(walk->cursor, content->getAnchor(), image_label + " anchor",
+                   walk->space, out->mutable_anchor(), &page_index, warner);
           out->set_page_index(page_index);
           // Best effort: select over the anchor character so an as-char
           // image yields its line box. Floating anchors keep width, height,
           // and anchor as the authoritative geometry.
-          if (probe != nullptr && probe->reschedule != nullptr && cursor.is()) {
+          if (walk->probe != nullptr && walk->probe->reschedule != nullptr &&
+              walk->cursor.is()) {
             Reference<css::text::XTextRange> anchor = content->getAnchor();
             if (anchor.is()) {
-              probe->last_payload.clear();
-              cursor->gotoRange(anchor->getStart(), false);
-              cursor->goRight(1, true);
-              probe->flush();
-              collect_line_rects(probe, out->mutable_line_rects());
-              cursor->gotoRange(anchor->getStart(), false);
-              probe->flush();
-              probe->last_payload.clear();
+              walk->probe->last_payload.clear();
+              walk->cursor->gotoRange(anchor->getStart(), false);
+              walk->cursor->goRight(1, true);
+              walk->probe->flush();
+              collect_line_rects(walk->probe, out->mutable_line_rects());
+              walk->cursor->gotoRange(anchor->getStart(), false);
+              walk->probe->flush();
+              walk->probe->last_payload.clear();
             }
           }
         }
-        css::awt::Size layout_size;
-        props->getPropertyValue("LayoutSize") >>= layout_size;
-        out->set_width_twips(hundredth_mm_to_twips(layout_size.Width));
-        out->set_height_twips(hundredth_mm_to_twips(layout_size.Height));
+        // Grouped graphic shapes are not text contents and carry no
+        // LayoutSize property; their model size is the laid-out size.
+        Reference<css::beans::XPropertySetInfo> info =
+            props->getPropertySetInfo();
+        if (info.is() && info->hasPropertyByName("LayoutSize")) {
+          css::awt::Size layout_size;
+          props->getPropertyValue("LayoutSize") >>= layout_size;
+          out->set_width_twips(hundredth_mm_to_twips(layout_size.Width));
+          out->set_height_twips(hundredth_mm_to_twips(layout_size.Height));
+        } else {
+          Reference<css::drawing::XShape> shape(props, UNO_QUERY);
+          if (shape.is()) {
+            css::awt::Size size = shape->getSize();
+            out->set_width_twips(hundredth_mm_to_twips(size.Width));
+            out->set_height_twips(hundredth_mm_to_twips(size.Height));
+          }
+        }
       } catch (const css::uno::Exception& error) {
         warner.warn(image_label + " geometry query failed", error);
       }
 
       if (!emit_fn(event)) return false;
-      image_index++;
+      walk->image_index++;
       continue;
     }
 
@@ -910,7 +994,7 @@ bool emit_draw_shapes(const Reference<css::text::XTextDocument>& text_doc,
     // emit_text_frames owns them, so skipping here is the dedup that keeps
     // each frame a single event.
     if (services->supportsService("com.sun.star.text.TextFrame")) continue;
-    if (!want_shapes) continue;
+    if (!walk->want_shapes) continue;
     if (services->supportsService("com.sun.star.drawing.ControlShape")) {
       continue;
     }
@@ -927,8 +1011,10 @@ bool emit_draw_shapes(const Reference<css::text::XTextDocument>& text_doc,
 
     officev1::StreamPagesResponse event;
     officev1::Shape* out = event.mutable_shape();
-    out->set_index(shape_index);
+    out->set_index(walk->shape_index);
     out->set_page_index(-1);
+    out->set_z_order(i);
+    out->set_group_path(group_path);
     Reference<css::container::XNamed> named(props, UNO_QUERY);
     if (named.is()) out->set_name(utf8(named->getName()));
     Reference<css::drawing::XShape> shape(props, UNO_QUERY);
@@ -941,13 +1027,14 @@ bool emit_draw_shapes(const Reference<css::text::XTextDocument>& text_doc,
       } catch (const css::uno::Exception& error) {
         warner.warn(label + " geometry query failed", error);
       }
+      fill_shape_position(shape, label, out->mutable_position(), warner);
     }
     try {
       Reference<css::text::XTextContent> content(props, UNO_QUERY);
       if (content.is()) {
         int32_t page_index = -1;
-        caret_at(cursor, content->getAnchor(), label + " anchor", space,
-                 out->mutable_anchor(), &page_index, warner);
+        caret_at(walk->cursor, content->getAnchor(), label + " anchor",
+                 walk->space, out->mutable_anchor(), &page_index, warner);
         out->set_page_index(page_index);
       }
     } catch (const css::uno::Exception& error) {
@@ -972,9 +1059,31 @@ bool emit_draw_shapes(const Reference<css::text::XTextDocument>& text_doc,
     }
     flatten_text_runs(text, label, out->mutable_runs(), warner);
     if (!emit_fn(event)) return false;
-    shape_index++;
+    walk->shape_index++;
   }
   return true;
+}
+
+// Entry point of the draw-page walk: resolves the page and the graphic
+// provider, then hands the top-level container to the group recursion.
+bool emit_draw_shapes(const Reference<css::text::XTextDocument>& text_doc,
+                      const Reference<css::uno::XComponentContext>& context,
+                      const Reference<css::text::XTextViewCursor>& cursor,
+                      CaretSpace* space, const PartSelection& parts,
+                      SelectionProbe* probe, const EmitFn& emit_fn,
+                      Warner& warner) {
+  Reference<css::drawing::XDrawPageSupplier> supplier(text_doc, UNO_QUERY);
+  if (!supplier.is()) return true;
+  Reference<css::container::XIndexAccess> shapes(supplier->getDrawPage(), UNO_QUERY);
+  if (!shapes.is()) return true;
+  WriterShapeWalk walk;
+  walk.cursor = cursor;
+  walk.space = space;
+  walk.probe = probe;
+  walk.want_images = parts.wants(officev1::DOCUMENT_PART_IMAGES);
+  walk.want_shapes = parts.wants(officev1::DOCUMENT_PART_SHAPES);
+  if (walk.want_images) walk.provider = graphic_provider(context, warner);
+  return emit_writer_shapes(shapes, "", &walk, emit_fn, warner);
 }
 
 // Emits every Writer text frame with its runs, chain names, layout anchor,
