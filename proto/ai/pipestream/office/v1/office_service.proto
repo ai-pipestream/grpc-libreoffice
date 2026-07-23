@@ -1,0 +1,188 @@
+// The office render contract: office documents in, rendered pages or PDF out,
+// through per-document LibreOfficeKit worker processes.
+syntax = "proto3";
+
+package ai.pipestream.office.v1;
+
+option go_package = "github.com/ai-pipestream/grpc-libreoffice/gen/go/ai/pipestream/office/v1;officev1";
+option java_multiple_files = true;
+option java_outer_classname = "OfficeServiceProto";
+option java_package = "ai.pipestream.office.v1";
+
+// OfficeRenderService renders office documents through LibreOfficeKit,
+// entirely in memory-backed storage. Bytes stream in; rendered pages or a PDF
+// stream out. Every document is handled by its own short-lived worker
+// process, so a crash or hang in the office core costs one document, never
+// the server.
+//
+// Error model (gRPC status codes):
+//   INVALID_ARGUMENT   - no document bytes, the stream ended without a chunk
+//                        marked complete, the source format could not be
+//                        determined from the filename or content type, or the
+//                        office core could not load the document.
+//   RESOURCE_EXHAUSTED - the document exceeds the configured byte cap.
+//   DEADLINE_EXCEEDED  - the worker exceeded the per-document timeout and
+//                        was killed.
+//   INTERNAL           - the worker crashed or failed mid-render.
+service OfficeRenderService {
+  // StreamPages renders every page of the uploaded document as a PNG image.
+  // The client streams the document as chunks, marking the last one complete.
+  // The server responds with DocumentInfo, then one PageImage per page in
+  // page order, then one final RenderStatus. No intermediate PDF exists.
+  rpc StreamPages(stream StreamPagesRequest) returns (stream StreamPagesResponse);
+
+  // ConvertToPdf renders the uploaded document to a single PDF. The upload
+  // contract matches StreamPages; the server responds with DocumentInfo, the
+  // PDF as ordered PdfChunk events, then one final RenderStatus.
+  rpc ConvertToPdf(stream ConvertToPdfRequest) returns (stream ConvertToPdfResponse);
+
+  // GetServiceInfo reports versions, limits, and the source formats the
+  // render core accepts. Intended for orchestrators and tool facades doing
+  // capability discovery.
+  rpc GetServiceInfo(GetServiceInfoRequest) returns (GetServiceInfoResponse);
+}
+
+// DocumentChunk is one chunk of an uploaded document. The identity fields
+// (document_id, filename, content_type) may be sent on any chunk; the first
+// non-empty value of each wins. The filename extension is the primary
+// source-format hint, the content type the fallback.
+message DocumentChunk {
+  // Caller-chosen identifier, echoed back unchanged in DocumentInfo. May be
+  // empty.
+  string document_id = 1;
+  // Original filename; its extension is the primary source-format hint.
+  string filename = 2;
+  // Advisory MIME type; the fallback source-format hint.
+  string content_type = 3;
+  // The chunk's document bytes.
+  bytes data = 4;
+  // Set on the last chunk. A stream that ends without it is rejected with
+  // INVALID_ARGUMENT.
+  bool complete = 5;
+}
+
+// StreamPagesRequest carries one upload chunk of a StreamPages call.
+message StreamPagesRequest {
+  // The upload chunk.
+  DocumentChunk chunk = 1;
+}
+
+// StreamPagesResponse is one event of a StreamPages response stream:
+// DocumentInfo first, then one PageImage per page, then RenderStatus.
+message StreamPagesResponse {
+  // Exactly one event per response message.
+  oneof event {
+    // The resolved document identity; always the first event.
+    DocumentInfo document_info = 1;
+    // One rendered page, in page order.
+    PageImage page_image = 2;
+    // The final event of a successful stream.
+    RenderStatus status = 3;
+  }
+}
+
+// ConvertToPdfRequest carries one upload chunk of a ConvertToPdf call.
+message ConvertToPdfRequest {
+  // The upload chunk.
+  DocumentChunk chunk = 1;
+}
+
+// ConvertToPdfResponse is one event of a ConvertToPdf response stream:
+// DocumentInfo first, then ordered PdfChunk events, then RenderStatus.
+message ConvertToPdfResponse {
+  // Exactly one event per response message.
+  oneof event {
+    // The resolved document identity; always the first event.
+    DocumentInfo document_info = 1;
+    // One chunk of the produced PDF, in order.
+    PdfChunk pdf_chunk = 2;
+    // The final event of a successful stream.
+    RenderStatus status = 3;
+  }
+}
+
+// DocumentInfo describes the document the render core loaded; always the
+// first response event.
+message DocumentInfo {
+  // Echo of the caller's document_id, unchanged.
+  string document_id = 1;
+  // The source format extension the server resolved (for example "docx").
+  string source_format = 2;
+  // Pages that will be emitted (StreamPages) or rendered into the PDF. For
+  // spreadsheets this counts sheets, for presentations slides.
+  int32 page_count = 3;
+  // The office core's document class: "text", "spreadsheet", "presentation",
+  // "drawing", or "other".
+  string document_type = 4;
+}
+
+// PageImage is one rendered page. Pages arrive in page order, one event per
+// page.
+message PageImage {
+  // Zero-based page index (sheet index for spreadsheets, slide index for
+  // presentations).
+  int32 index = 1;
+  // Rendered width in pixels.
+  int32 width_px = 2;
+  // Rendered height in pixels.
+  int32 height_px = 3;
+  // The DPI the page was rendered at. May be lower than the requested DPI
+  // when a page would otherwise exceed the configured pixel bound.
+  int32 dpi = 4;
+  // The page encoded as a PNG.
+  bytes png = 5;
+}
+
+// PdfChunk is one chunk of a produced PDF, in order. Concatenating every
+// data field yields the complete PDF.
+message PdfChunk {
+  // The chunk's PDF bytes.
+  bytes data = 1;
+}
+
+// RenderStatus is the final event of a successful response stream, carrying
+// outcome counters. Failures arrive as gRPC status codes instead.
+message RenderStatus {
+  // State is the terminal outcome of the render.
+  enum State {
+    // Unset; never emitted by the server.
+    STATE_UNSPECIFIED = 0;
+    // The render completed and every event was emitted.
+    STATE_OK = 1;
+  }
+  // The terminal outcome.
+  State state = 1;
+  // Human-readable non-fatal findings, for example substituted fonts.
+  repeated string warnings = 2;
+  // Total uploaded document bytes.
+  int64 input_bytes = 3;
+  // Total bytes emitted: PNG bytes for StreamPages, PDF bytes for
+  // ConvertToPdf.
+  int64 output_bytes = 4;
+  // Wall-clock render time in milliseconds, measured in the worker.
+  int64 render_millis = 5;
+}
+
+// GetServiceInfoRequest asks for the service's capabilities.
+message GetServiceInfoRequest {}
+
+// GetServiceInfoResponse reports the service's capabilities and limits.
+message GetServiceInfoResponse {
+  // Semantic version of this server.
+  string service_version = 1;
+  // LibreOffice core version string, when known.
+  string libreoffice_version = 2;
+  // Version of the wire contract, currently "v1".
+  string api_version = 3;
+  // Canonical extensions of the source formats the render core accepts.
+  repeated string supported_formats = 4;
+  // Per-document byte cap; uploads above it are rejected with
+  // RESOURCE_EXHAUSTED.
+  int64 max_document_bytes = 5;
+  // Historical pool fields from the process-pool era of this contract.
+  reserved 6, 7;
+  // Documents rendered concurrently, each in its own worker process.
+  int32 max_concurrent_documents = 8;
+  // Requested render DPI for StreamPages.
+  int32 render_dpi = 9;
+}
