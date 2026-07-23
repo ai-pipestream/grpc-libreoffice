@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "ai/pipestream/office/v1/office_service.pb.h"
+#include "docling_map.h"
 #include "worker_runner.h"
 
 namespace {
@@ -1191,6 +1192,101 @@ void verify_embedded_objects() {
           "embedded-only emits no pages, metadata, or paragraphs");
 }
 
+// Feeds a real worker event stream through the consumer-side docling mapper
+// and checks the produced Document: page rectangles on the wire, a well
+// formed ref tree, and the flagship label and layer mappings.
+void verify_docling_mapping() {
+  std::vector<std::string> payloads;
+  auto outcome = run("pages", "fodt", kTypedFodt, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "docling source render ok: " + outcome.detail);
+  grlibre::DoclingMapper mapper;
+  officev1::DocumentInfo info;
+  for (const std::string& payload : payloads) {
+    officev1::StreamPagesResponse event;
+    require(event.ParseFromString(payload), "docling source event parses");
+    if (event.has_document_info()) info = event.document_info();
+    mapper.consume(event);
+  }
+  require(info.page_rects_size() == info.page_count(),
+          "DocumentInfo carries one page rect per page");
+  require(info.page_rects_size() > 0
+              && info.page_rects(0).width_twips() > 0
+              && info.page_rects(0).height_twips() > 0,
+          "page rects have real dimensions");
+  require(mapper.finished(), "mapper consumed the terminal status");
+
+  const auto& document = mapper.document();
+  std::vector<std::string> errors = grlibre::docling_integrity_errors(document);
+  for (const std::string& error : errors) {
+    std::cerr << "integrity: " << error << "\n";
+  }
+  require(errors.empty(), "mapped document ref tree is well formed");
+  require(document.pages_size() == info.page_count(),
+          "one PageItem per page");
+
+  namespace docv1 = ai::pipestream::document::v1;
+  bool heading_ok = false;
+  bool header_ok = false;
+  bool footnote_ok = false;
+  for (const docv1::BaseTextItem& item : document.texts()) {
+    if (item.item_case() == docv1::BaseTextItem::kSectionHeader) {
+      const docv1::SectionHeaderItem& heading = item.section_header();
+      if (heading.base().text() == "Heading One") {
+        heading_ok = heading.level() == 1
+            && heading.base().content_layer() == docv1::CONTENT_LAYER_BODY;
+      }
+    }
+    if (item.item_case() == docv1::BaseTextItem::kText) {
+      const docv1::TextItemBase& base = item.text().base();
+      if (base.label() == docv1::DOC_ITEM_LABEL_PAGE_HEADER) {
+        header_ok = base.text() == "Header text"
+            && base.content_layer() == docv1::CONTENT_LAYER_FURNITURE
+            && base.parent().ref() == "#/furniture";
+      }
+      if (base.label() == docv1::DOC_ITEM_LABEL_FOOTNOTE) {
+        footnote_ok = base.text() == "Footnote text."
+            && base.content_layer() == docv1::CONTENT_LAYER_BODY;
+      }
+    }
+  }
+  require(heading_ok, "mapped heading is a body SectionHeaderItem level 1");
+  require(header_ok, "mapped header is furniture PAGE_HEADER");
+  require(footnote_ok, "mapped footnote keeps the FOOTNOTE label in body");
+  require(document.tables_size() >= 1
+              && document.tables(0).data().num_rows() == 2
+              && document.tables(0).data().num_cols() == 2,
+          "mapped table keeps its grid dimensions");
+  require(document.pictures_size() >= 1
+              && document.pictures(0).image().uri()
+                     .rfind("data:image/", 0) == 0,
+          "mapped picture carries a data URI");
+  bool frame_group = false;
+  for (const docv1::GroupItem& group : document.groups()) {
+    if (group.name() == "Frame1") {
+      frame_group = group.meta().custom_fields().count("chain_next") == 1;
+    }
+  }
+  require(frame_group, "mapped frame group keeps its chain name");
+
+  // Every provenance box is page-local: inside its page's rectangle.
+  auto box_in_page = [&](const docv1::ProvenanceItem& prov) {
+    if (prov.page_no() < 1 || prov.page_no() > info.page_rects_size()) {
+      return false;
+    }
+    const officev1::PageRect& page = info.page_rects(prov.page_no() - 1);
+    return prov.bbox().l() >= 0 && prov.bbox().t() >= 0
+        && prov.bbox().r() <= page.width_twips()
+        && prov.bbox().b() <= page.height_twips();
+  };
+  for (const docv1::BaseTextItem& item : document.texts()) {
+    if (item.item_case() != docv1::BaseTextItem::kText) continue;
+    for (const docv1::ProvenanceItem& prov : item.text().base().prov()) {
+      require(box_in_page(prov), "text prov box is page-local");
+    }
+  }
+}
+
 void verify_corrupt_zip_is_load_failure() {
   // Plain ASCII garbage would not do here: the office core content-sniffs
   // it as text and loads it. A broken zip container is genuinely unloadable
@@ -1220,6 +1316,7 @@ int main() {
   verify_part_selection();
   verify_embedded_objects();
   verify_line_rects();
+  verify_docling_mapping();
   verify_corrupt_zip_is_load_failure();
   std::cout << "worker-render-test passed\n";
   return 0;

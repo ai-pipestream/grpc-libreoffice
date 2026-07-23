@@ -111,7 +111,8 @@ target_link_libraries(office_proto PUBLIC grpc++)
 add_library(grlibre_core
   src/event_frame.cpp
   src/worker_runner.cpp
-  src/render_service.cpp)
+  src/render_service.cpp
+  src/docling_map.cpp)
 target_include_directories(grlibre_core PUBLIC src)
 target_link_libraries(grlibre_core
   PUBLIC office_proto Threads::Threads
@@ -154,7 +155,7 @@ if(GRLIBRE_TCMALLOC)
 endif()
 
 if(BUILD_TESTING)
-  set(GRLIBRE_TESTS event-frame-test png-encode-test worker-render-test render-service-test)
+  set(GRLIBRE_TESTS event-frame-test png-encode-test worker-render-test render-service-test docling-map-test)
   add_executable(event-frame-test tests/event_frame_test.cpp src/event_frame.cpp)
   target_include_directories(event-frame-test PRIVATE src)
   target_link_libraries(event-frame-test PRIVATE Threads::Threads grlibre_flags)
@@ -168,6 +169,9 @@ if(BUILD_TESTING)
 
   add_executable(render-service-test tests/render_service_test.cpp)
   target_link_libraries(render-service-test PRIVATE grlibre_core grlibre_flags)
+
+  add_executable(docling-map-test tests/docling_map_test.cpp)
+  target_link_libraries(docling-map-test PRIVATE grlibre_core grlibre_flags)
 
   foreach(test_name ${GRLIBRE_TESTS})
     add_test(NAME ${test_name} COMMAND ${test_name})
