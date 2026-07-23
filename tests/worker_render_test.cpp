@@ -264,6 +264,161 @@ void verify_typed_content() {
           "typed extraction produced no warnings");
 }
 
+// A flat ODG with, on one page: a rectangle with text, an ellipse, a text
+// box with a bold span, a line, a group of two shapes, and an embedded 1x1
+// PNG. Flat XML keeps the fixture diskless and reviewable.
+const char kDrawFodg[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+ xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
+ office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.graphics">
+ <office:automatic-styles>
+  <style:style style:name="B1" style:family="text">
+   <style:text-properties fo:font-weight="bold"/>
+  </style:style>
+  <style:page-layout style:name="PM0">
+   <style:page-layout-properties fo:page-width="21cm" fo:page-height="29.7cm"
+    fo:margin-top="1cm" fo:margin-bottom="1cm" fo:margin-left="1cm" fo:margin-right="1cm"/>
+  </style:page-layout>
+ </office:automatic-styles>
+ <office:master-styles>
+  <style:master-page style:name="Default" style:page-layout-name="PM0"/>
+ </office:master-styles>
+ <office:body><office:drawing>
+  <draw:page draw:name="page1" draw:master-page-name="Default">
+   <draw:rect draw:name="Rect1" svg:x="1cm" svg:y="1cm" svg:width="4cm" svg:height="2cm">
+    <text:p>Rect text</text:p>
+   </draw:rect>
+   <draw:ellipse draw:name="Ell1" svg:x="6cm" svg:y="1cm" svg:width="3cm" svg:height="3cm"/>
+   <draw:frame draw:name="Text1" svg:x="1cm" svg:y="5cm" svg:width="5cm" svg:height="2cm">
+    <draw:text-box><text:p>Plain <text:span text:style-name="B1">bold</text:span></text:p></draw:text-box>
+   </draw:frame>
+   <draw:line draw:name="Line1" svg:x1="1cm" svg:y1="8cm" svg:x2="8cm" svg:y2="9cm"/>
+   <draw:g draw:name="Group1">
+    <draw:rect draw:name="GRect" svg:x="10cm" svg:y="1cm" svg:width="2cm" svg:height="1cm"/>
+    <draw:ellipse draw:name="GEll" svg:x="10cm" svg:y="3cm" svg:width="2cm" svg:height="1cm"/>
+   </draw:g>
+   <draw:frame draw:name="Img1" svg:x="10cm" svg:y="6cm" svg:width="1cm" svg:height="1cm">
+    <draw:image><office:binary-data>iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==</office:binary-data></draw:image>
+   </draw:frame>
+  </draw:page>
+ </office:drawing></office:body>
+</office:document>
+)";
+
+void verify_draw_shapes() {
+  std::vector<std::string> payloads;
+  auto outcome = run("pages", "fodg", kDrawFodg, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "draw fodg renders ok: " + outcome.detail);
+  officev1::StreamPagesResponse first;
+  require(first.ParseFromString(payloads.front()), "draw info parses");
+  require(first.document_info().document_type() == "drawing",
+          "fodg is a drawing document");
+  std::vector<officev1::DrawingShape> shapes;
+  int metadata = 0;
+  bool image_ok = false;
+  officev1::StreamPagesResponse event;
+  for (const std::string& payload : payloads) {
+    require(event.ParseFromString(payload), "draw event parses");
+    if (event.has_metadata()) metadata++;
+    if (event.has_drawing_shape()) shapes.push_back(event.drawing_shape());
+    if (event.has_embedded_image()) {
+      const officev1::EmbeddedImage& image = event.embedded_image();
+      const std::string& data = image.data();
+      image_ok = !image.mime_type().empty() && data.size() > 8 &&
+                 data[1] == 'P' && data[2] == 'N' && data[3] == 'G' &&
+                 image.page_index() == 0 && image.width_twips() > 0;
+    }
+  }
+  require(metadata == 1, "one draw metadata event");
+  // Six top-level shapes, one of them a group node with two children.
+  require(shapes.size() == 8, "eight drawing shapes, got " +
+                                  std::to_string(shapes.size()));
+  int group_index = -1;
+  std::vector<int> top_level_orders;
+  for (const officev1::DrawingShape& shape : shapes) {
+    require(shape.page_index() == 0, "shape on page 0");
+    if (shape.group_path().empty()) {
+      top_level_orders.push_back(shape.z_order());
+      if (shape.is_group()) {
+        require(shape.shape_type() == "com.sun.star.drawing.GroupShape",
+                "group node has the group shape type");
+        require(shape.name() == "Group1", "group node keeps its name");
+        group_index = shape.z_order();
+      }
+    }
+  }
+  require(group_index >= 0, "group node emitted");
+  require(top_level_orders == std::vector<int>({0, 1, 2, 3, 4, 5}),
+          "top-level z order contiguous in paint order");
+  std::vector<int> child_orders;
+  for (const officev1::DrawingShape& shape : shapes) {
+    if (shape.group_path() == std::to_string(group_index)) {
+      child_orders.push_back(shape.z_order());
+      require(!shape.is_group(), "group children are leaves");
+    } else {
+      require(shape.group_path().empty(), "no unexpected nesting");
+    }
+  }
+  require(child_orders == std::vector<int>({0, 1}),
+          "two group children with restarted z order");
+  bool rect_ok = false;
+  bool ellipse_ok = false;
+  bool text_ok = false;
+  bool line_ok = false;
+  bool graphic_ok = false;
+  for (const officev1::DrawingShape& shape : shapes) {
+    if (shape.name() == "Rect1") {
+      std::string text;
+      for (const officev1::TextRun& text_run : shape.runs()) text += text_run.text();
+      rect_ok = shape.shape_type() == "com.sun.star.drawing.RectangleShape" &&
+                shape.has_text() && text == "Rect text" &&
+                shape.position().x() > 0 && shape.position().y() > 0 &&
+                shape.width_twips() > 0 && shape.height_twips() > 0;
+    }
+    if (shape.name() == "Ell1") {
+      ellipse_ok = shape.shape_type() == "com.sun.star.drawing.EllipseShape" &&
+                   shape.width_twips() > 0 && shape.height_twips() > 0;
+    }
+    if (shape.name() == "Text1") {
+      bool bold_run = false;
+      for (const officev1::TextRun& text_run : shape.runs()) {
+        require(text_run.char_offset() == -1,
+                "shape runs are outside the annotation space");
+        if (text_run.text() == "bold" && text_run.weight() >= 150.0f) {
+          bold_run = true;
+        }
+      }
+      text_ok = shape.shape_type() == "com.sun.star.drawing.TextShape" &&
+                shape.has_text() && bold_run;
+    }
+    if (shape.name() == "Line1") {
+      line_ok = shape.shape_type() == "com.sun.star.drawing.LineShape";
+    }
+    if (shape.name() == "Img1") {
+      graphic_ok =
+          shape.shape_type() == "com.sun.star.drawing.GraphicObjectShape";
+    }
+  }
+  require(rect_ok, "rectangle with text, geometry, and shape type");
+  require(ellipse_ok, "ellipse with geometry");
+  require(text_ok, "text box with a bold run and out-of-body offsets");
+  require(line_ok, "line shape emitted");
+  require(graphic_ok, "graphic object shape emitted");
+  require(image_ok, "image shape bytes extracted with page index and size");
+  officev1::StreamPagesResponse last;
+  require(last.ParseFromString(payloads.back()), "draw last event parses");
+  require(last.has_status(), "draw stream ends with status");
+  require(last.status().state() == officev1::RenderStatus::STATE_OK,
+          "draw status ok");
+  require(last.status().warnings().empty(),
+          "draw extraction produced no warnings");
+}
+
 void verify_corrupt_zip_is_load_failure() {
   // Plain ASCII garbage would not do here: the office core content-sniffs
   // it as text and loads it. A broken zip container is genuinely unloadable
@@ -287,6 +442,7 @@ int main() {
   verify_csv_is_spreadsheet();
   verify_pdf_mode();
   verify_typed_content();
+  verify_draw_shapes();
   verify_corrupt_zip_is_load_failure();
   std::cout << "worker-render-test passed\n";
   return 0;

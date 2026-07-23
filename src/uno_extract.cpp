@@ -24,6 +24,10 @@
 #include <com/sun/star/document/XDocumentProperties.hpp>
 #include <com/sun/star/document/XDocumentPropertiesSupplier.hpp>
 #include <com/sun/star/drawing/XDrawPageSupplier.hpp>
+#include <com/sun/star/drawing/XDrawPages.hpp>
+#include <com/sun/star/drawing/XDrawPagesSupplier.hpp>
+#include <com/sun/star/drawing/XShape.hpp>
+#include <com/sun/star/drawing/XShapes.hpp>
 #include <com/sun/star/frame/Desktop.hpp>
 #include <com/sun/star/style/XStyle.hpp>
 #include <com/sun/star/style/XStyleFamiliesSupplier.hpp>
@@ -496,14 +500,11 @@ bool emit_table(const Reference<css::text::XTextTable>& table, int32_t index,
   return emit_fn(event);
 }
 
-bool emit_images(const Reference<css::text::XTextDocument>& text_doc,
-                 const Reference<css::uno::XComponentContext>& context,
-                 const Reference<css::text::XTextViewCursor>& cursor,
-                 const EmitFn& emit_fn, Warner& warner) {
-  Reference<css::drawing::XDrawPageSupplier> supplier(text_doc, UNO_QUERY);
-  if (!supplier.is()) return true;
-  Reference<css::container::XIndexAccess> shapes(supplier->getDrawPage(), UNO_QUERY);
-  if (!shapes.is()) return true;
+// Creates the office core's graphic provider. Warns and returns an empty
+// reference when unavailable, so callers still emit image metadata without
+// bytes.
+Reference<css::graphic::XGraphicProvider> graphic_provider(
+    const Reference<css::uno::XComponentContext>& context, Warner& warner) {
   Reference<css::graphic::XGraphicProvider> provider;
   try {
     provider = Reference<css::graphic::XGraphicProvider>(
@@ -514,6 +515,65 @@ bool emit_images(const Reference<css::text::XTextDocument>& text_doc,
     warner.warn("graphic provider unavailable, image bytes will be missing",
                 error);
   }
+  return provider;
+}
+
+// Re-encodes a graphic through the provider entirely in memory, preferring
+// the graphic's source format and falling back to PNG. Leaves mime_type and
+// data empty when no encoding succeeds or no provider is available.
+void encode_graphic(const Reference<css::graphic::XGraphic>& graphic,
+                    const Reference<css::graphic::XGraphicProvider>& provider,
+                    const std::string& label, std::string* mime_type,
+                    std::string* data, Warner& warner) {
+  if (!provider.is()) return;
+  rtl::OUString mime;
+  try {
+    Reference<css::beans::XPropertySet> graphic_props(graphic, UNO_QUERY);
+    if (graphic_props.is()) graphic_props->getPropertyValue("MimeType") >>= mime;
+  } catch (const css::beans::UnknownPropertyException&) {
+    // Expected probe result: not every graphic knows its source format.
+  } catch (const css::uno::Exception& error) {
+    warner.warn(label + " mime type query failed", error);
+  }
+  if (mime.isEmpty()) mime = "image/png";
+  rtl::Reference<MemoryStream> sink(new MemoryStream);
+  css::uno::Sequence<css::beans::PropertyValue> store_args(2);
+  css::beans::PropertyValue* args = store_args.getArray();
+  args[0].Name = "OutputStream";
+  args[0].Value <<= Reference<css::io::XStream>(sink.get());
+  args[1].Name = "MimeType";
+  args[1].Value <<= mime;
+  try {
+    provider->storeGraphic(graphic, store_args);
+    *mime_type = utf8(mime);
+    *data = sink->bytes();
+  } catch (const css::uno::Exception& original_error) {
+    warner.warn(label + " does not round-trip as " + utf8(mime) +
+                    ", re-encoding as image/png",
+                original_error);
+    rtl::Reference<MemoryStream> png_sink(new MemoryStream);
+    args[0].Value <<= Reference<css::io::XStream>(png_sink.get());
+    args[1].Value <<= rtl::OUString("image/png");
+    try {
+      provider->storeGraphic(graphic, store_args);
+      *mime_type = "image/png";
+      *data = png_sink->bytes();
+    } catch (const css::uno::Exception& error) {
+      warner.warn(label + " could not be encoded at all", error);
+    }
+  }
+}
+
+bool emit_images(const Reference<css::text::XTextDocument>& text_doc,
+                 const Reference<css::uno::XComponentContext>& context,
+                 const Reference<css::text::XTextViewCursor>& cursor,
+                 const EmitFn& emit_fn, Warner& warner) {
+  Reference<css::drawing::XDrawPageSupplier> supplier(text_doc, UNO_QUERY);
+  if (!supplier.is()) return true;
+  Reference<css::container::XIndexAccess> shapes(supplier->getDrawPage(), UNO_QUERY);
+  if (!shapes.is()) return true;
+  Reference<css::graphic::XGraphicProvider> provider =
+      graphic_provider(context, warner);
   int32_t emitted = 0;
   for (sal_Int32 i = 0; i < shapes->getCount(); i++) {
     std::string label = "shape " + std::to_string(i);
@@ -550,44 +610,8 @@ bool emit_images(const Reference<css::text::XTextDocument>& text_doc,
     if (named.is()) out->set_name(utf8(named->getName()));
     std::string image_label = "image " + std::to_string(emitted);
 
-    if (provider.is()) {
-      rtl::OUString mime;
-      try {
-        Reference<css::beans::XPropertySet> graphic_props(graphic, UNO_QUERY);
-        if (graphic_props.is()) graphic_props->getPropertyValue("MimeType") >>= mime;
-      } catch (const css::beans::UnknownPropertyException&) {
-        // Expected probe result: not every graphic knows its source format.
-      } catch (const css::uno::Exception& error) {
-        warner.warn(image_label + " mime type query failed", error);
-      }
-      if (mime.isEmpty()) mime = "image/png";
-      rtl::Reference<MemoryStream> sink(new MemoryStream);
-      css::uno::Sequence<css::beans::PropertyValue> store_args(2);
-      css::beans::PropertyValue* args = store_args.getArray();
-      args[0].Name = "OutputStream";
-      args[0].Value <<= Reference<css::io::XStream>(sink.get());
-      args[1].Name = "MimeType";
-      args[1].Value <<= mime;
-      try {
-        provider->storeGraphic(graphic, store_args);
-        out->set_mime_type(utf8(mime));
-        out->set_data(sink->bytes());
-      } catch (const css::uno::Exception& original_error) {
-        warner.warn(image_label + " does not round-trip as " + utf8(mime) +
-                        ", re-encoding as image/png",
-                    original_error);
-        rtl::Reference<MemoryStream> png_sink(new MemoryStream);
-        args[0].Value <<= Reference<css::io::XStream>(png_sink.get());
-        args[1].Value <<= rtl::OUString("image/png");
-        try {
-          provider->storeGraphic(graphic, store_args);
-          out->set_mime_type("image/png");
-          out->set_data(png_sink->bytes());
-        } catch (const css::uno::Exception& error) {
-          warner.warn(image_label + " could not be encoded at all", error);
-        }
-      }
-    }
+    encode_graphic(graphic, provider, image_label, out->mutable_mime_type(),
+                   out->mutable_data(), warner);
 
     try {
       Reference<css::text::XTextContent> content(props, UNO_QUERY);
@@ -625,6 +649,137 @@ void flatten_text_runs(const Reference<css::text::XText>& text,
         paragraphs->nextElement(), UNO_QUERY);
     if (paragraph.is()) fill_runs(paragraph, label, runs, nullptr, warner);
   }
+}
+
+// Walks one shape container in paint order, emitting a DrawingShape per
+// shape and recursing through groups. The container-scoped contract (one
+// call per XShapes, group_path carrying nesting) is what presentation
+// extraction will reuse. image_counter numbers the EmbeddedImage events
+// emitted for image shapes across the whole document.
+bool emit_shapes(const Reference<css::drawing::XShapes>& shapes,
+                 int32_t page_index, const std::string& group_path,
+                 const Reference<css::graphic::XGraphicProvider>& provider,
+                 int32_t* image_counter, const EmitFn& emit_fn, Warner& warner) {
+  for (sal_Int32 i = 0; i < shapes->getCount(); i++) {
+    std::string shape_path = group_path.empty()
+                                 ? std::to_string(i)
+                                 : group_path + "/" + std::to_string(i);
+    std::string label =
+        "page " + std::to_string(page_index) + " shape " + shape_path;
+    Reference<css::drawing::XShape> shape;
+    try {
+      shape = Reference<css::drawing::XShape>(shapes->getByIndex(i), UNO_QUERY);
+    } catch (const css::uno::Exception& error) {
+      warner.warn(label + " is not reachable", error);
+      continue;
+    }
+    if (!shape.is()) continue;
+    officev1::StreamPagesResponse event;
+    officev1::DrawingShape* out = event.mutable_drawing_shape();
+    out->set_page_index(page_index);
+    out->set_z_order(i);
+    out->set_group_path(group_path);
+    std::string shape_type = utf8(shape->getShapeType());
+    out->set_shape_type(shape_type);
+    Reference<css::container::XNamed> named(shape, UNO_QUERY);
+    if (named.is()) out->set_name(utf8(named->getName()));
+    try {
+      css::awt::Point position = shape->getPosition();
+      css::awt::Size size = shape->getSize();
+      out->mutable_position()->set_x(hundredth_mm_to_twips(position.X));
+      out->mutable_position()->set_y(hundredth_mm_to_twips(position.Y));
+      out->set_width_twips(hundredth_mm_to_twips(size.Width));
+      out->set_height_twips(hundredth_mm_to_twips(size.Height));
+    } catch (const css::uno::Exception& error) {
+      warner.warn(label + " geometry query failed", error);
+    }
+    Reference<css::beans::XPropertySet> props(shape, UNO_QUERY);
+    if (props.is()) {
+      try {
+        sal_Int32 rotation = 0;
+        props->getPropertyValue("RotateAngle") >>= rotation;
+        out->set_rotation(rotation);
+      } catch (const css::beans::UnknownPropertyException&) {
+        // Expected probe result: embedded objects and form controls carry no
+        // rotation property.
+      } catch (const css::uno::Exception& error) {
+        warner.warn(label + " rotation query failed", error);
+      }
+    }
+    Reference<css::text::XText> text(shape, UNO_QUERY);
+    if (text.is()) {
+      out->set_has_text(!text->getString().isEmpty());
+      flatten_text_runs(text, label, out->mutable_runs(), warner);
+    }
+    Reference<css::drawing::XShapes> children;
+    if (shape_type == "com.sun.star.drawing.GroupShape") {
+      children = Reference<css::drawing::XShapes>(shape, UNO_QUERY);
+    }
+    out->set_is_group(children.is());
+    if (!emit_fn(event)) return false;
+    if (children.is()) {
+      if (!emit_shapes(children, page_index, shape_path, provider,
+                       image_counter, emit_fn, warner)) {
+        return false;
+      }
+      continue;
+    }
+    if (shape_type == "com.sun.star.drawing.GraphicObjectShape" && props.is()) {
+      Reference<css::graphic::XGraphic> graphic;
+      try {
+        props->getPropertyValue("Graphic") >>= graphic;
+      } catch (const css::uno::Exception& error) {
+        warner.warn(label + " graphic query failed", error);
+      }
+      if (graphic.is()) {
+        officev1::StreamPagesResponse image_event;
+        officev1::EmbeddedImage* image = image_event.mutable_embedded_image();
+        image->set_index((*image_counter)++);
+        image->set_page_index(page_index);
+        image->set_name(out->name());
+        image->set_width_twips(out->width_twips());
+        image->set_height_twips(out->height_twips());
+        encode_graphic(graphic, provider,
+                       "image " + std::to_string(image->index()),
+                       image->mutable_mime_type(), image->mutable_data(),
+                       warner);
+        if (!emit_fn(image_event)) return false;
+      }
+    }
+  }
+  return true;
+}
+
+// Emits every shape of a drawing document, page by page, walking the model
+// the render pass already loaded and laid out. page_index is the draw-page
+// index and matches PageImage.index.
+bool emit_drawing_content(
+    const Reference<css::drawing::XDrawPagesSupplier>& supplier,
+    const Reference<css::uno::XComponentContext>& context,
+    const EmitFn& emit_fn, Warner& warner) {
+  Reference<css::drawing::XDrawPages> pages = supplier->getDrawPages();
+  if (!pages.is()) {
+    warner.warn("drawing document has no draw pages");
+    return true;
+  }
+  Reference<css::graphic::XGraphicProvider> provider =
+      graphic_provider(context, warner);
+  int32_t image_counter = 0;
+  for (sal_Int32 p = 0; p < pages->getCount(); p++) {
+    Reference<css::drawing::XShapes> page;
+    try {
+      page = Reference<css::drawing::XShapes>(pages->getByIndex(p), UNO_QUERY);
+    } catch (const css::uno::Exception& error) {
+      warner.warn("draw page " + std::to_string(p) + " is not reachable", error);
+      continue;
+    }
+    if (!page.is()) continue;
+    if (!emit_shapes(page, static_cast<int32_t>(p), "", provider,
+                     &image_counter, emit_fn, warner)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool emit_notes(const Reference<css::text::XTextDocument>& text_doc,
@@ -904,6 +1059,14 @@ bool emit_typed_content(const EmitFn& emit_fn, std::vector<std::string>* warning
     Reference<css::text::XTextDocument> text_doc(model, UNO_QUERY);
     if (text_doc.is()) {
       return emit_text_content(text_doc, context, emit_fn, warner);
+    }
+    // Draw, Impress, and Calc models all supply draw pages, so gate on the
+    // DrawingDocument service, which the office core reports only for Draw.
+    Reference<css::lang::XServiceInfo> info(model, UNO_QUERY);
+    if (info.is() &&
+        info->supportsService("com.sun.star.drawing.DrawingDocument")) {
+      Reference<css::drawing::XDrawPagesSupplier> draw(model, UNO_QUERY);
+      if (draw.is()) return emit_drawing_content(draw, context, emit_fn, warner);
     }
     return true;
   } catch (const css::uno::Exception& error) {

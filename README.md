@@ -41,9 +41,11 @@ at STANDARD plus COMMENTS):
   `Footnote` events (label, anchor, content runs), `HeaderFooter` content
   per page style, `PageStyleInfo` (page size, margins, columns, in twips),
   and `DocumentIndex` events (tables of contents and other generated
-  indexes). Body runs carry character offsets in a documented annotation
-  text space, so standoff annotations (NLP spans) anchor to the stream
-  directly.
+  indexes). Drawing documents emit `DrawingShape` events (shape type, name,
+  position and size in twips, rotation, group nesting, text runs) in
+  page-then-paint order, plus `EmbeddedImage` events for image shapes. Body
+  runs carry character offsets in a documented annotation text space, so
+  standoff annotations (NLP spans) anchor to the stream directly.
   Every event is emitted the moment it exists, so a caller can process page
   images while typed content is still streaming. Extraction problems degrade
   to `RenderStatus.warnings`, never a failed render.
@@ -64,8 +66,8 @@ timeout, worker killed), `INTERNAL` (worker crash). Health checking and
 reflection are registered.
 
 Accepted formats also include PDF, which the core imports through Draw;
-PDF pages rasterize like any other document, typed extraction for
-Draw-model documents is not wired yet.
+PDF pages rasterize like any other document and, because the import
+produces a drawing model, emit `DrawingShape` typed content.
 
 The repo also carries `ai.pipestream.document.v1`, the typed document
 structure schema (tracking docling-core v2 for interoperability). A mapper
