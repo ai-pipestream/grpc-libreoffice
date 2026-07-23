@@ -1049,18 +1049,38 @@ void verify_line_rects() {
       }
       if (text == "Head") {
         heading_ok = para.line_rects_size() == 1 &&
-                     para.line_rects(0).height_twips() > 0;
+                     para.line_rects(0).height_twips() > 0 &&
+                     para.line_rects(0).char_start() == 0 &&
+                     para.line_rects(0).char_end() == 4;
       }
       if (text.compare(0, 4, "wrap") == 0) {
         wrap_ok = para.line_rects_size() > 3;
-        // Within one page, line boxes descend in reading order.
-        for (int i = 1; i < para.line_rects_size(); i++) {
-          if (para.line_rects(i).page_index() ==
-              para.line_rects(i - 1).page_index()) {
-            wrap_ok = wrap_ok && para.line_rects(i).y_twips() >
-                                     para.line_rects(i - 1).y_twips();
+        // Within one page, line boxes descend in reading order, and the
+        // measured character boundaries tile the paragraph: the first line
+        // starts at 0, boundaries advance monotonically (a soft wrap may
+        // consume its whitespace), and the last line ends at the
+        // paragraph's code-point length.
+        for (int i = 0; i < para.line_rects_size(); i++) {
+          const officev1::LineBox& box = para.line_rects(i);
+          wrap_ok = wrap_ok && box.char_start() >= 0 &&
+                    box.char_end() > box.char_start();
+          if (i == 0) {
+            wrap_ok = wrap_ok && box.char_start() == 0;
+            continue;
+          }
+          // Consecutive boxes tile the text: at most the soft wrap's one
+          // consumed whitespace character may separate them.
+          wrap_ok = wrap_ok &&
+                    box.char_start() >= para.line_rects(i - 1).char_end() &&
+                    box.char_start() <= para.line_rects(i - 1).char_end() + 1;
+          if (box.page_index() == para.line_rects(i - 1).page_index()) {
+            wrap_ok = wrap_ok &&
+                      box.y_twips() > para.line_rects(i - 1).y_twips();
           }
         }
+        wrap_ok = wrap_ok &&
+                  para.line_rects(para.line_rects_size() - 1).char_end() ==
+                      static_cast<int64_t>(text.size());
         // The caret start and the first line box describe the same spot in
         // the same document-absolute space.
         // The caret round-trips through 1/100 mm inside the office core, so

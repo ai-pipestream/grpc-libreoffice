@@ -143,12 +143,18 @@ void verify_writer_stream() {
     first->set_y_twips(1417);
     first->set_width_twips(9000);
     first->set_height_twips(276);
+    // Measured character boundaries: the first line is "Body text", the
+    // wrap consuming the space after it.
+    first->set_char_start(0);
+    first->set_char_end(9);
     officev1::LineBox* second = paragraph->add_line_rects();
     second->set_page_index(1);
     second->set_x_twips(1417);
     second->set_y_twips(18109);
     second->set_width_twips(4000);
     second->set_height_twips(276);
+    // Boundaries left at the default [0, 0): the mapper must treat this
+    // like the -1 sentinel and keep the full item span.
     mapper.consume(event);
   }
   {
@@ -379,8 +385,11 @@ void verify_writer_stream() {
                   <= document.pages().at(2).size().height(),
           "writer: page-local box inside the page");
   require(body->prov(0).charspan().start() == 33
-              && body->prov(0).charspan().end() == 54,
-          "writer: body charspan in annotation space");
+              && body->prov(0).charspan().end() == 42,
+          "writer: measured line narrows its charspan in annotation space");
+  require(body->prov(1).charspan().start() == 33
+              && body->prov(1).charspan().end() == 54,
+          "writer: unmeasured line keeps the full item charspan");
 
   // Table folding.
   require(document.tables_size() == 1, "writer: one TableItem");
