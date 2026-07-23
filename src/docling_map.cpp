@@ -202,6 +202,15 @@ void DoclingMapper::link_child(const std::string& parent_ref,
   group_by_ref(parent_ref)->add_children()->set_ref(child_ref);
 }
 
+void DoclingMapper::stamp_collector_source(
+    google::protobuf::RepeatedPtrField<docv1::SourceType>* source) {
+  // Every item this mapper creates is attributable: additive merges with
+  // other collectors' output rely on the tag to never collide silently.
+  docv1::CollectorSource* collector = source->Add()->mutable_collector();
+  collector->set_collector("libreoffice");
+  collector->set_model("lok");
+}
+
 docv1::GroupItem* DoclingMapper::add_group(const std::string& parent_ref,
                                            docv1::GroupLabel label,
                                            const std::string& name,
@@ -245,6 +254,7 @@ DoclingMapper::TextHandle DoclingMapper::add_text(TextKind kind,
   handle.base->mutable_parent()->set_ref(parent_ref);
   handle.base->set_label(label);
   handle.base->set_content_layer(layer);
+  stamp_collector_source(handle.base->mutable_source());
   link_child(parent_ref, handle.ref);
   return handle;
 }
@@ -259,6 +269,7 @@ docv1::PictureItem* DoclingMapper::add_picture(docv1::DocItemLabel label,
   picture->mutable_parent()->set_ref(parent_ref);
   picture->set_label(label);
   picture->set_content_layer(layer);
+  stamp_collector_source(picture->mutable_source());
   link_child(parent_ref, ref);
   if (ref_out != nullptr) *ref_out = ref;
   return picture;
@@ -273,6 +284,7 @@ docv1::TableItem* DoclingMapper::add_table(docv1::ContentLayer layer,
   table->mutable_parent()->set_ref(parent_ref);
   table->set_label(docv1::DOC_ITEM_LABEL_TABLE);
   table->set_content_layer(layer);
+  stamp_collector_source(table->mutable_source());
   link_child(parent_ref, ref);
   if (ref_out != nullptr) *ref_out = ref;
   return table;
