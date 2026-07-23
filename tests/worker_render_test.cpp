@@ -1422,6 +1422,173 @@ void verify_docling_mapping() {
   }
 }
 
+// A flat ODT exercising every annotation mark: a hyperlink, a point and a
+// ranged comment, point and ranged bookmarks, a tracked insertion and a
+// tracked deletion, checkbox and text fieldmarks, and a draw-page form
+// control. Flat XML keeps the fixture diskless and reviewable.
+const char kMarkedFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+ xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:xlink="http://www.w3.org/1999/xlink"
+ xmlns:form="urn:oasis:names:tc:opendocument:xmlns:form:1.0"
+ xmlns:xml="http://www.w3.org/XML/1998/namespace"
+ xmlns:field="urn:openoffice:names:experimental:ooo-ms-interop:xmlns:field:1.0"
+ office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:automatic-styles/>
+ <office:body><office:text>
+  <office:forms form:automatic-focus="false" form:apply-design-mode="false">
+   <form:form form:name="F1">
+    <form:checkbox form:name="CB1" form:id="ctl1" xml:id="ctl1"
+     form:label="Agree" form:current-state="checked"/>
+   </form:form>
+  </office:forms>
+  <text:tracked-changes>
+   <text:changed-region xml:id="ins1" text:id="ins1">
+    <text:insertion><office:change-info><dc:creator>Bob</dc:creator><dc:date>2024-02-03T04:05:06</dc:date></office:change-info></text:insertion>
+   </text:changed-region>
+   <text:changed-region xml:id="del1" text:id="del1">
+    <text:deletion><office:change-info><dc:creator>Cara</dc:creator><dc:date>2024-02-04T05:06:07</dc:date></office:change-info><text:p>gone words</text:p></text:deletion>
+   </text:changed-region>
+  </text:tracked-changes>
+  <text:p>Visit <text:a xlink:href="https://example.test/go" office:target-frame-name="_blank">linked words</text:a> today.</text:p>
+  <text:p>Point<office:annotation office:name="cp1"><dc:creator>Alice</dc:creator><dc:date>2024-01-02T03:04:05</dc:date><text:p>A point comment</text:p></office:annotation> anchor here.</text:p>
+  <text:p>Range <office:annotation office:name="cr1"><dc:creator>Bea</dc:creator><dc:date>2024-01-03T04:05:06</dc:date><text:p>A ranged comment</text:p></office:annotation>target words<office:annotation-end office:name="cr1"/> end.</text:p>
+  <text:p><text:bookmark text:name="bmPoint"/>Bookmark <text:bookmark-start text:name="bmRange"/>marked words<text:bookmark-end text:name="bmRange"/> tail.</text:p>
+  <text:p>Change <text:change-start text:change-id="ins1"/>added words<text:change-end text:change-id="ins1"/> and <text:change text:change-id="del1"/> after.</text:p>
+  <text:p>Check: <field:fieldmark text:name="check1" field:type="vnd.oasis.opendocument.field.FORMCHECKBOX"><field:param field:name="Checkbox_Checked" field:value="true"/></field:fieldmark> Text: <field:fieldmark-start text:name="txt1" field:type="vnd.oasis.opendocument.field.FORMTEXT"/>filled value<field:fieldmark-end/> done.</text:p>
+  <text:p><draw:control text:anchor-type="as-char" svg:width="2cm" svg:height="0.6cm" draw:control="ctl1"/></text:p>
+ </office:text></office:body>
+</office:document>
+)";
+
+void verify_marks_content() {
+  std::vector<std::string> payloads;
+  auto outcome = run("pages", "fodt", kMarkedFodt, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "marked fodt renders ok: " + outcome.detail);
+
+  bool hyperlink_ok = false;
+  bool point_comment_ok = false;
+  bool ranged_comment_ok = false;
+  bool point_bookmark_ok = false;
+  bool ranged_bookmark_ok = false;
+  bool insert_change_ok = false;
+  bool delete_change_ok = false;
+  bool checkbox_ok = false;
+  bool text_field_ok = false;
+  bool control_ok = false;
+  std::vector<std::string> warnings;
+  officev1::StreamPagesResponse event;
+  for (const std::string& payload : payloads) {
+    require(event.ParseFromString(payload), "marked event parses");
+    switch (event.event_case()) {
+      case officev1::StreamPagesResponse::kParagraph: {
+        for (const officev1::TextRun& run : event.paragraph().runs()) {
+          if (run.text() == "linked words") {
+            hyperlink_ok =
+                run.hyperlink_url() == "https://example.test/go" &&
+                run.hyperlink_target() == "_blank" && run.char_offset() >= 0;
+          }
+        }
+        break;
+      }
+      case officev1::StreamPagesResponse::kComment: {
+        const officev1::Comment& comment = event.comment();
+        if (comment.author() == "Alice") {
+          point_comment_ok = comment.text() == "A point comment" &&
+                             comment.char_start() >= 0 &&
+                             comment.char_end() == comment.char_start() &&
+                             comment.epoch_ms() > 0 &&
+                             comment.page_index() == 0;
+        }
+        if (comment.author() == "Bea") {
+          ranged_comment_ok = comment.text() == "A ranged comment" &&
+                              comment.char_start() >= 0 &&
+                              comment.char_end() - comment.char_start() == 12 &&
+                              comment.anchored_text() == "target words";
+        }
+        break;
+      }
+      case officev1::StreamPagesResponse::kBookmark: {
+        const officev1::Bookmark& bookmark = event.bookmark();
+        if (bookmark.name() == "bmPoint") {
+          point_bookmark_ok = bookmark.char_start() >= 0 &&
+                              bookmark.char_end() == bookmark.char_start();
+        }
+        if (bookmark.name() == "bmRange") {
+          ranged_bookmark_ok =
+              bookmark.char_start() >= 0 &&
+              bookmark.char_end() - bookmark.char_start() == 12 &&
+              bookmark.covered_text() == "marked words";
+        }
+        break;
+      }
+      case officev1::StreamPagesResponse::kTrackedChange: {
+        const officev1::TrackedChange& change = event.tracked_change();
+        if (change.kind() == officev1::TRACKED_CHANGE_KIND_INSERT) {
+          insert_change_ok = change.author() == "Bob" &&
+                             change.char_start() >= 0 &&
+                             change.char_end() - change.char_start() == 11 &&
+                             change.changed_text() == "added words" &&
+                             change.epoch_ms() > 0;
+        }
+        if (change.kind() == officev1::TRACKED_CHANGE_KIND_DELETE) {
+          delete_change_ok =
+              change.author() == "Cara" &&
+              change.changed_text().find("gone words") != std::string::npos;
+        }
+        break;
+      }
+      case officev1::StreamPagesResponse::kFormField: {
+        const officev1::FormField& field = event.form_field();
+        if (field.name() == "check1") {
+          checkbox_ok = field.kind() == officev1::FORM_FIELD_KIND_CHECKBOX &&
+                        field.checked() && !field.control() &&
+                        field.char_start() >= 0;
+        }
+        if (field.name() == "txt1") {
+          text_field_ok = field.kind() == officev1::FORM_FIELD_KIND_TEXT &&
+                          field.text() == "filled value" &&
+                          field.char_start() >= 0 &&
+                          field.char_end() - field.char_start() == 12;
+        }
+        if (field.control()) {
+          control_ok = field.kind() == officev1::FORM_FIELD_KIND_CHECKBOX &&
+                       field.checked() && field.label() == "Agree" &&
+                       field.width_twips() > 0;
+        }
+        break;
+      }
+      case officev1::StreamPagesResponse::kStatus: {
+        warnings.assign(event.status().warnings().begin(),
+                        event.status().warnings().end());
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  for (const std::string& warning : warnings) {
+    std::cerr << "marked warning: " << warning << "\n";
+  }
+  require(hyperlink_ok, "hyperlink url, target, and span on the linked run");
+  require(point_comment_ok, "point comment with author, date, and anchor");
+  require(ranged_comment_ok, "ranged comment with span and anchored text");
+  require(point_bookmark_ok, "point bookmark with a collapsed span");
+  require(ranged_bookmark_ok, "ranged bookmark with span and covered text");
+  require(insert_change_ok, "tracked insertion with author, span, and text");
+  require(delete_change_ok, "tracked deletion with author and deleted text");
+  require(checkbox_ok, "checkbox fieldmark with its checked state");
+  require(text_field_ok, "text fieldmark with its content and span");
+  require(control_ok, "form control with label, state, and geometry");
+  require(warnings.empty(), "marked extraction produced no warnings");
+}
+
 void verify_corrupt_zip_is_load_failure() {
   // Plain ASCII garbage would not do here: the office core content-sniffs
   // it as text and loads it. A broken zip container is genuinely unloadable
@@ -1452,6 +1619,7 @@ int main() {
   verify_embedded_objects();
   verify_line_rects();
   verify_docling_mapping();
+  verify_marks_content();
   verify_corrupt_zip_is_load_failure();
   std::cout << "worker-render-test passed\n";
   return 0;
