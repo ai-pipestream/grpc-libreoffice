@@ -658,8 +658,8 @@ void parse_cell_name(const std::string& name, int32_t* row, int32_t* column) {
 
 bool emit_table(const Reference<css::text::XTextTable>& table, int32_t index,
                 const Reference<css::text::XTextViewCursor>& cursor,
-                CaretSpace* space, SelectionProbe* probe,
-                const EmitFn& emit_fn, Warner& warner) {
+                CaretSpace* space, const PartSelection& parts,
+                SelectionProbe* probe, const EmitFn& emit_fn, Warner& warner) {
   officev1::StreamPagesResponse event;
   officev1::TableData* out = event.mutable_table();
   out->set_index(index);
@@ -669,6 +669,19 @@ bool emit_table(const Reference<css::text::XTextTable>& table, int32_t index,
     out->set_rows(table->getRows()->getCount());
     out->set_columns(table->getColumns()->getCount());
     css::uno::Sequence<rtl::OUString> names = table->getCellNames();
+    // A whole-table selection is impossible through the view cursor (the
+    // office core forbids expanding a selection across cell boundaries), so
+    // line rectangles are measured cell by cell, once per cell, and routed
+    // to the requested targets. The table-level pool is bounded to small
+    // tables so its cost under the default part selection stays negligible;
+    // the explicit per-cell part carries no bound because its cost was
+    // opted into.
+    bool measurable = probe != nullptr && probe->reschedule != nullptr;
+    bool want_cell = measurable &&
+        parts.explicit_wants(officev1::DOCUMENT_PART_CELL_LINE_RECTS);
+    bool want_pool = measurable &&
+        parts.wants(officev1::DOCUMENT_PART_LINE_RECTS) &&
+        names.getLength() <= 64;
     for (const rtl::OUString& name : names) {
       Reference<css::text::XText> cell(table->getCellByName(name), UNO_QUERY);
       if (!cell.is()) {
@@ -684,6 +697,17 @@ bool emit_table(const Reference<css::text::XTextTable>& table, int32_t index,
       cell_out->set_column(column);
       cell_out->set_name(cell_name);
       cell_out->set_text(utf8(cell->getString()));
+      if (want_cell || want_pool) {
+        auto* target = want_cell ? cell_out->mutable_line_rects()
+                                 : out->mutable_line_rects();
+        measure_line_rects(cursor, cell->getStart(), cell->getEnd(), probe,
+                           label + " cell " + cell_name, target, warner);
+        if (want_cell && want_pool) {
+          for (const officev1::LineBox& box : cell_out->line_rects()) {
+            *out->add_line_rects() = box;
+          }
+        }
+      }
     }
     if (names.hasElements()) {
       Reference<css::text::XText> first(table->getCellByName(names[0]), UNO_QUERY);
@@ -699,21 +723,6 @@ bool emit_table(const Reference<css::text::XTextTable>& table, int32_t index,
                  out->mutable_end(), nullptr, warner);
       }
       out->set_page_index(page_index);
-      // A whole-table selection is impossible through the view cursor (the
-      // office core forbids expanding a selection across cell boundaries),
-      // so the table's line rectangles are collected cell by cell, bounded
-      // to small tables so the per-cell selection cost stays negligible.
-      if (probe != nullptr && probe->reschedule != nullptr &&
-          names.getLength() <= 64) {
-        for (const rtl::OUString& cell_name : names) {
-          Reference<css::text::XText> cell(table->getCellByName(cell_name),
-                                           UNO_QUERY);
-          if (!cell.is()) continue;
-          measure_line_rects(cursor, cell->getStart(), cell->getEnd(), probe,
-                             label + " cell " + utf8(cell_name),
-                             out->mutable_line_rects(), warner);
-        }
-      }
     }
   } catch (const css::uno::Exception& error) {
     warner.warn(label + " extraction failed", error);
@@ -2558,6 +2567,10 @@ bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
 
   bool want_paragraphs = parts.wants(officev1::DOCUMENT_PART_PARAGRAPHS);
   bool want_tables = parts.wants(officev1::DOCUMENT_PART_TABLES);
+  // The probe may be live for the explicit per-cell table part alone; the
+  // paragraph and image measurements still key on LINE_RECTS.
+  SelectionProbe* line_probe =
+      parts.wants(officev1::DOCUMENT_PART_LINE_RECTS) ? probe : nullptr;
   if (want_paragraphs || want_tables) {
     Reference<css::container::XEnumerationAccess> body(text_doc->getText(),
                                                        UNO_QUERY);
@@ -2574,8 +2587,8 @@ bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
       Reference<css::text::XTextTable> table(element, UNO_QUERY);
       if (table.is()) {
         if (want_tables) {
-          if (!emit_table(table, table_index, cursor, &caret_space, probe,
-                          emit_fn, warner)) {
+          if (!emit_table(table, table_index, cursor, &caret_space, parts,
+                          probe, emit_fn, warner)) {
             return false;
           }
         }
@@ -2585,7 +2598,7 @@ bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
       if (!want_paragraphs) continue;
       officev1::StreamPagesResponse event;
       if (!fill_paragraph(element, paragraph_index, cursor, &caret_space,
-                          &annotation_offset, probe,
+                          &annotation_offset, line_probe,
                           event.mutable_paragraph(), warner)) {
         continue;
       }
@@ -2619,7 +2632,7 @@ bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
   if (parts.wants(officev1::DOCUMENT_PART_IMAGES) ||
       parts.wants(officev1::DOCUMENT_PART_SHAPES)) {
     return emit_draw_shapes(text_doc, context, cursor, &caret_space, parts,
-                            probe, emit_fn, warner);
+                            line_probe, emit_fn, warner);
   }
   return true;
 }

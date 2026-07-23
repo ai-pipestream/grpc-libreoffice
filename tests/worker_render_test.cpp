@@ -1045,6 +1045,10 @@ void verify_line_rects() {
       const officev1::TableData& table = event.table();
       table_ok = table.line_rects_size() >= 1 &&
                  table.line_rects(0).page_index() >= 0;
+      // The per-cell part is never implied by the "all" default.
+      for (const officev1::TableCellData& cell : table.cells()) {
+        table_ok = table_ok && cell.line_rects_size() == 0;
+      }
     }
     if (event.has_embedded_image()) {
       const officev1::EmbeddedImage& image = event.embedded_image();
@@ -1066,6 +1070,56 @@ void verify_line_rects() {
           "line rects stream ends ok");
   require(last.status().warnings().empty(),
           "line rects extraction produced no warnings");
+
+  // The explicit per-cell part: cells carry their own rectangles, the
+  // table-level pool stays keyed to LINE_RECTS, and paragraph measurement
+  // does not ride along.
+  std::vector<std::string> cell_payloads;
+  outcome = run_with_parts("pages", "fodt", kLineRectsFodt, "3,4,16",
+                           &cell_payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "cell line rects render ok: " + outcome.detail);
+  bool cells_ok = false;
+  for (const std::string& payload : cell_payloads) {
+    require(event.ParseFromString(payload), "cell line rects event parses");
+    if (event.has_paragraph()) {
+      require(event.paragraph().line_rects_size() == 0,
+              "cell-only selection leaves paragraphs unmeasured");
+    }
+    if (event.has_table()) {
+      const officev1::TableData& table = event.table();
+      require(table.line_rects_size() == 0,
+              "cell-only selection leaves the table pool empty");
+      cells_ok = table.cells_size() == 4;
+      for (const officev1::TableCellData& cell : table.cells()) {
+        cells_ok = cells_ok && cell.line_rects_size() >= 1 &&
+                   cell.line_rects(0).page_index() >= 0 &&
+                   cell.line_rects(0).width_twips() > 0 &&
+                   cell.line_rects(0).height_twips() > 0;
+      }
+    }
+  }
+  require(cells_ok, "every table cell carries its own line rectangles");
+
+  // Both parts together: one measurement per cell serves both targets.
+  cell_payloads.clear();
+  outcome = run_with_parts("pages", "fodt", kLineRectsFodt, "4,15,16",
+                           &cell_payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "combined line rects render ok: " + outcome.detail);
+  bool combined_ok = false;
+  for (const std::string& payload : cell_payloads) {
+    require(event.ParseFromString(payload), "combined line rects event parses");
+    if (event.has_table()) {
+      const officev1::TableData& table = event.table();
+      int cell_boxes = 0;
+      for (const officev1::TableCellData& cell : table.cells()) {
+        cell_boxes += cell.line_rects_size();
+      }
+      combined_ok = cell_boxes > 0 && table.line_rects_size() == cell_boxes;
+    }
+  }
+  require(combined_ok, "pool and per-cell rectangles agree when both selected");
 }
 
 // A flat ODT with three embedded objects: a Math formula, a bar chart with

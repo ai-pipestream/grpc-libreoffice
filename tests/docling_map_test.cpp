@@ -166,6 +166,23 @@ void verify_writer_stream() {
       cell->set_name(names[i]);
       cell->set_text("cell " + std::string(names[i]));
     }
+    {
+      // Per-cell line rectangles on A1: two lines whose union becomes the
+      // cell bbox, page-local.
+      officev1::TableCellData* a1 = table->mutable_cells(0);
+      officev1::LineBox* first = a1->add_line_rects();
+      first->set_page_index(0);
+      first->set_x_twips(1500);
+      first->set_y_twips(5000);
+      first->set_width_twips(2000);
+      first->set_height_twips(276);
+      officev1::LineBox* second = a1->add_line_rects();
+      second->set_page_index(0);
+      second->set_x_twips(1500);
+      second->set_y_twips(5276);
+      second->set_width_twips(1200);
+      second->set_height_twips(276);
+    }
     officev1::TableCellData* split = table->add_cells();
     split->set_row(-1);
     split->set_column(-1);
@@ -333,6 +350,22 @@ void verify_writer_stream() {
           "writer: grid populated");
   require(table.meta().custom_fields().count("cell:B2.1") == 1,
           "writer: split cell rides custom fields by name");
+  {
+    // A1 carried per-cell line rectangles; its bbox is the page-local union
+    // of both lines, on table_cells and the grid copy alike.
+    const docv1::TableCell& a1 = table.data().table_cells(0);
+    require(a1.has_bbox() && a1.bbox().l() == 1500.0 - 284.0
+                && a1.bbox().t() == 5000.0 - 284.0
+                && a1.bbox().r() == 3500.0 - 284.0
+                && a1.bbox().b() == 5552.0 - 284.0
+                && a1.bbox().coord_origin() == docv1::COORD_ORIGIN_TOPLEFT,
+            "writer: per-cell bbox is the page-local line union");
+    require(table.data().grid(0).cells(0).has_bbox()
+                && table.data().grid(0).cells(0).bbox().l() == a1.bbox().l(),
+            "writer: grid copy keeps the cell bbox");
+    require(!table.data().table_cells(1).has_bbox(),
+            "writer: cells without line rectangles carry no bbox");
+  }
 
   // Pictures: embedded image plus the chart.
   require(document.pictures_size() == 2,

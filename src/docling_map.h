@@ -112,9 +112,16 @@ class DoclingMapper {
 
   // Folds an office TableData cell grid into a docling TableItem: grid
   // dimensions, placed cells, and split or merged cells that do not map to
-  // the base grid as custom_fields keyed by their office cell name.
+  // the base grid as custom_fields keyed by their office cell name. Cells
+  // carrying per-cell line rectangles get a page-local bbox.
   void fold_table(const ai::pipestream::office::v1::TableData& table,
                   ai::pipestream::document::v1::TableItem* item);
+
+  // The page-local union of a cell's line rectangles on their first page;
+  // false when there is nothing to measure.
+  bool cell_bbox(const google::protobuf::RepeatedPtrField<
+                     ai::pipestream::office::v1::LineBox>& lines,
+                 ai::pipestream::document::v1::BoundingBox* box);
 
   void on_document_info(const ai::pipestream::office::v1::DocumentInfo& info);
   void on_page_image(const ai::pipestream::office::v1::PageImage& page);

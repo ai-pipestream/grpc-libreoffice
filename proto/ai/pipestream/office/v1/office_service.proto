@@ -64,8 +64,10 @@ message DocumentChunk {
 // DocumentPart names one class of content the server can emit for a
 // StreamPages call. A request lists the parts it wants and the server emits
 // only those, skipping the extraction work behind unselected parts. An empty
-// list means every part. The identity event DocumentInfo and the terminal
-// RenderStatus are always emitted and are not part of this selection.
+// list means every part except DOCUMENT_PART_CELL_LINE_RECTS, which is only
+// emitted when listed explicitly. The identity event DocumentInfo and the
+// terminal RenderStatus are always emitted and are not part of this
+// selection.
 enum DocumentPart {
   // Unset; ignored if it appears in a parts list.
   DOCUMENT_PART_UNSPECIFIED = 0;
@@ -101,6 +103,12 @@ enum DocumentPart {
   // part. A modifier: it only adds geometry to selected events, and the
   // per-line measurement is skipped when this part is not requested.
   DOCUMENT_PART_LINE_RECTS = 15;
+  // Per-cell line rectangles on TableCellData for tables already selected
+  // by DOCUMENT_PART_TABLES. A modifier like DOCUMENT_PART_LINE_RECTS, with
+  // one exception to the empty-list rule: per-cell measurement costs one
+  // selection round-trip per cell with no size cap, so this part is emitted
+  // only when listed explicitly, never implied by an empty parts list.
+  DOCUMENT_PART_CELL_LINE_RECTS = 16;
 }
 
 // StreamOptions selects which document parts a StreamPages call emits. It
@@ -109,8 +117,10 @@ enum DocumentPart {
 // (document_id, filename, content_type) are resolved. When no request
 // carries a non-empty list, every part is emitted.
 message StreamOptions {
-  // The parts to emit. Empty means every part. DOCUMENT_PART_UNSPECIFIED
-  // entries are ignored; order and duplicates do not matter.
+  // The parts to emit. Empty means every part except
+  // DOCUMENT_PART_CELL_LINE_RECTS, which must be listed explicitly.
+  // DOCUMENT_PART_UNSPECIFIED entries are ignored; order and duplicates do
+  // not matter.
   repeated DocumentPart parts = 1;
 }
 
@@ -535,6 +545,12 @@ message TableCellData {
   string name = 3;
   // The cell's plain text.
   string text = 4;
+  // Per-line bounding rectangles of this cell's text from the live layout,
+  // in reading order. Emitted only when DOCUMENT_PART_CELL_LINE_RECTS is
+  // listed explicitly, since per-cell measurement costs one selection
+  // round-trip per cell; empty otherwise or when the layout could not be
+  // measured.
+  repeated LineBox line_rects = 5;
 }
 
 // TableData is one table of a text document, in reading order, with its cell
@@ -558,7 +574,9 @@ message TableData {
   // collected cell by cell in cell-name order, because the office core
   // cannot select across cell boundaries. Bounded to tables of at most 64
   // cells; empty for larger tables or when line rectangles were not
-  // requested.
+  // requested. DOCUMENT_PART_CELL_LINE_RECTS attributes the same
+  // measurements to their cells (TableCellData.line_rects) without the size
+  // cap.
   repeated LineBox line_rects = 8;
 }
 

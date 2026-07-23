@@ -74,8 +74,11 @@ at STANDARD plus COMMENTS):
 
   A request can select which parts are emitted through `StreamOptions`
   (`DocumentPart` values, page images included). An empty selection means
-  every part, and the work behind an unselected part is skipped, not just
-  its emission. `DocumentInfo` and `RenderStatus` are always sent.
+  every part except `DOCUMENT_PART_CELL_LINE_RECTS`, which attributes line
+  rectangles to individual table cells (`TableCellData.line_rects`) at one
+  selection round-trip per cell and therefore must be listed explicitly.
+  The work behind an unselected part is skipped, not just its emission.
+  `DocumentInfo` and `RenderStatus` are always sent.
   `DocumentInfo` also carries the layout rectangle of every page in the
   same twips space the typed positions use, so a consumer can map any
   document-absolute position to page-local coordinates.

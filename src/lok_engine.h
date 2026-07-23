@@ -19,6 +19,13 @@ struct PartSelection {
   bool wants(int part) const {
     return all || (part > 0 && part < 32 && (mask & (1u << part)) != 0);
   }
+
+  // Whether the caller listed the given DocumentPart value explicitly. The
+  // "all" default does not count: parts whose cost must be opted into
+  // (DOCUMENT_PART_CELL_LINE_RECTS) gate on this instead of wants().
+  bool explicit_wants(int part) const {
+    return part > 0 && part < 32 && (mask & (1u << part)) != 0;
+  }
 };
 
 // Everything one worker process needs to render one document.
