@@ -161,6 +161,8 @@ const char kTypedFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
    </table:table-row>
   </table:table>
   <text:p><draw:frame draw:name="Img1" svg:width="1cm" svg:height="1cm"><draw:image><office:binary-data>iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==</office:binary-data></draw:image></draw:frame></text:p>
+  <text:p><draw:frame draw:name="Frame1" text:anchor-type="paragraph" svg:width="5cm" svg:height="2cm"><draw:text-box draw:chain-next-name="Frame2"><text:p>frame body with a <text:span text:style-name="B1">bold</text:span> run</text:p></draw:text-box></draw:frame><draw:frame draw:name="Frame2" text:anchor-type="paragraph" svg:x="8cm" svg:width="5cm" svg:height="2cm"><draw:text-box/></draw:frame></text:p>
+  <text:p><draw:custom-shape draw:name="Shape1" text:anchor-type="paragraph" svg:width="4cm" svg:height="2cm"><text:p>shape text</text:p><draw:enhanced-geometry draw:type="rectangle"/></draw:custom-shape></text:p>
  </office:text></office:body>
 </office:document>
 )";
@@ -181,6 +183,11 @@ void verify_typed_content() {
   bool footnote_ok = false;
   bool header_ok = false;
   bool page_style_ok = false;
+  bool frame1_ok = false;
+  bool frame2_ok = false;
+  bool shape_ok = false;
+  bool frame_leaked_into_shapes = false;
+  bool out_of_body_text_in_paragraphs = false;
   officev1::StreamPagesResponse event;
   for (const std::string& payload : payloads) {
     require(event.ParseFromString(payload), "typed event parses");
@@ -197,11 +204,59 @@ void verify_typed_content() {
           saw_heading = para.outline_level() == 1 && para.page_index() == 0 &&
                         !para.runs(0).font().empty() && para.runs(0).size_pt() > 0;
         }
+        std::string para_text;
         for (const officev1::TextRun& text_run : para.runs()) {
+          para_text += text_run.text();
           if (text_run.text() == "bold" && text_run.weight() >= 150.0f &&
               text_run.char_offset() == 17 && text_run.char_length() == 4) {
             saw_bold_run = true;
           }
+        }
+        // Frame and shape text is out of the body flow and must not leak
+        // into body paragraphs.
+        if (para_text.find("frame body") != std::string::npos ||
+            para_text.find("shape text") != std::string::npos) {
+          out_of_body_text_in_paragraphs = true;
+        }
+        break;
+      }
+      case officev1::StreamPagesResponse::kTextFrame: {
+        const officev1::TextFrame& frame = event.text_frame();
+        if (frame.name() == "Frame1") {
+          std::string text;
+          bool offsets_ok = true;
+          bool bold_ok = false;
+          for (const officev1::TextRun& text_run : frame.runs()) {
+            text += text_run.text();
+            offsets_ok = offsets_ok && text_run.char_offset() == -1;
+            if (text_run.text() == "bold" && text_run.weight() >= 150.0f) {
+              bold_ok = true;
+            }
+          }
+          frame1_ok = frame.chain_next() == "Frame2" &&
+                      frame.width_twips() > 0 && frame.height_twips() > 0 &&
+                      text == "frame body with a bold run" && offsets_ok &&
+                      bold_ok;
+        }
+        if (frame.name() == "Frame2") {
+          frame2_ok = frame.chain_prev() == "Frame1";
+        }
+        break;
+      }
+      case officev1::StreamPagesResponse::kShape: {
+        const officev1::Shape& shape = event.shape();
+        if (shape.name() == "Frame1" || shape.name() == "Frame2") {
+          frame_leaked_into_shapes = true;
+        }
+        if (shape.name() == "Shape1") {
+          std::string text;
+          bool offsets_ok = true;
+          for (const officev1::TextRun& text_run : shape.runs()) {
+            text += text_run.text();
+            offsets_ok = offsets_ok && text_run.char_offset() == -1;
+          }
+          shape_ok = !shape.shape_type().empty() && text == "shape text" &&
+                     offsets_ok && shape.width_twips() > 0;
         }
         break;
       }
@@ -269,6 +324,12 @@ void verify_typed_content() {
   require(footnote_ok, "footnote with label, page, and out-of-body offsets");
   require(header_ok, "header content for the Standard page style");
   require(page_style_ok, "page geometry with margins and column count");
+  require(frame1_ok, "text frame with chain, geometry, and styled runs");
+  require(frame2_ok, "chained frame carries its back link");
+  require(shape_ok, "text-bearing shape with runs and geometry");
+  require(!frame_leaked_into_shapes, "frames are not double-counted as shapes");
+  require(!out_of_body_text_in_paragraphs,
+          "frame and shape text stays out of body paragraphs");
   officev1::StreamPagesResponse last;
   require(last.ParseFromString(payloads.back()), "typed last event parses");
   require(last.has_status(), "typed stream ends with status");
