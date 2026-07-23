@@ -69,7 +69,8 @@ at STANDARD plus COMMENTS):
   additionally carry true per-line bounding rectangles (`LineBox`, in
   document-absolute twips) measured from the same layout the pages were
   painted from: a wrapping or page-straddling paragraph yields one box per
-  laid-out line in reading order.
+  laid-out line in reading order, and body paragraph lines also carry the
+  item-local code-point boundaries of each line's characters.
   Every event is emitted the moment it exists, so a caller can process page
   images while typed content is still streaming. Extraction problems degrade
   to `RenderStatus.warnings`, never a failed render.
@@ -110,9 +111,9 @@ consumer-side mapper (`src/docling_map.h`, built into the server library)
 that folds a `StreamPages` event stream into one such `Document`: items in
 typed arenas linked by JSON Pointer refs, groups per sheet, slide, frame,
 and drawing group, headers and footers as furniture, speaker notes on the
-notes layer, and per-line page-local bounding boxes as provenance. The
-mapper never touches LibreOffice and builds a valid document from any part
-selection.
+notes layer, and per-line page-local bounding boxes with exact per-line
+charspans as provenance. The mapper never touches LibreOffice and builds a
+valid document from any part selection.
 
 ## Process model
 

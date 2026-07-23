@@ -314,9 +314,10 @@ message TwipsPoint {
 // LineBox is the bounding rectangle of one laid-out line of a text range,
 // measured from the same layout the page images were painted from. A range
 // that wraps or straddles a page break yields one LineBox per line, in
-// reading order. Coordinates are twips in the same document-absolute space
-// as TwipsPoint; subtract the containing page's origin for page-local
-// coordinates.
+// reading order, except that the office core's region compression merges
+// vertically adjacent equal-width lines into one taller box. Coordinates
+// are twips in the same document-absolute space as TwipsPoint; subtract the
+// containing page's origin for page-local coordinates.
 message LineBox {
   // Zero-based page the line sits on; matches PageImage.index. -1 when the
   // page could not be resolved.
@@ -329,6 +330,17 @@ message LineBox {
   int64 width_twips = 4;
   // Height in twips.
   int64 height_twips = 5;
+  // Code-point offset of the box's first character in the containing
+  // item's plain text, zero-based and item-local; -1 when line boundaries
+  // were not measured. Currently measured for body paragraphs, where the
+  // plain text equals the concatenated run space for paragraphs of plain
+  // text portions. A box that covers several merged visual lines spans all
+  // their characters, and a soft wrap consumes the break's whitespace, so
+  // the next box's char_start may exceed this box's char_end.
+  int64 char_start = 6;
+  // Code-point offset one past the box's last character in the same space;
+  // -1 when line boundaries were not measured.
+  int64 char_end = 7;
 }
 
 // DocumentMetadata carries the document's stored properties. Emitted once,

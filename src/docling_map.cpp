@@ -307,12 +307,26 @@ void DoclingMapper::add_line_prov(
     const google::protobuf::RepeatedPtrField<officev1::LineBox>& lines,
     long long span_start, long long span_end) {
   for (const officev1::LineBox& line : lines) {
+    // A line carrying measured character boundaries narrows its charspan to
+    // its own characters, offset into the item's span space; unmeasured
+    // lines keep the full item span. char_end must exceed char_start so the
+    // -1 sentinel and a defaulted [0, 0) both fall back.
+    long long start = span_start;
+    long long end = span_end;
+    if (line.char_start() >= 0 && line.char_end() > line.char_start()) {
+      start = span_start + line.char_start();
+      end = span_start + line.char_end();
+      if (span_end > span_start) {
+        start = std::min(start, span_end);
+        end = std::min(end, span_end);
+      }
+    }
     add_prov(prov, line.page_index(), false,
              static_cast<double>(line.x_twips()),
              static_cast<double>(line.y_twips()),
              static_cast<double>(line.x_twips() + line.width_twips()),
              static_cast<double>(line.y_twips() + line.height_twips()),
-             span_start, span_end);
+             start, end);
   }
 }
 

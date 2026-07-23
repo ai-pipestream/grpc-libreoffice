@@ -94,7 +94,10 @@ class DoclingMapper {
           ai::pipestream::document::v1::ProvenanceItem>* prov,
       int page_index, bool page_local, double l, double t, double r, double b,
       long long span_start, long long span_end);
-  // Appends one ProvenanceItem per LineBox, each on its line's page.
+  // Appends one ProvenanceItem per LineBox, each on its line's page. A line
+  // with measured character boundaries gets its exact charspan, offset from
+  // span_start; unmeasured lines keep the full [span_start, span_end) item
+  // span.
   void add_line_prov(
       google::protobuf::RepeatedPtrField<
           ai::pipestream::document::v1::ProvenanceItem>* prov,

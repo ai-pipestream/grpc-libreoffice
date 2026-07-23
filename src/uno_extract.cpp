@@ -119,6 +119,8 @@
 #include <com/sun/star/lang/Locale.hpp>
 #include <com/sun/star/util/Date.hpp>
 #include <com/sun/star/util/DateTime.hpp>
+#include <com/sun/star/view/XLineCursor.hpp>
+#include <com/sun/star/view/XViewCursor.hpp>
 #include <cppuhelper/implbase4.hxx>
 #include <rtl/ref.hxx>
 
@@ -465,6 +467,10 @@ void collect_line_rects(
     box->set_width_twips(parsed.width);
     box->set_height_twips(parsed.height);
     box->set_page_index(-1);
+    // Character boundaries are a separate measurement; -1 until it runs, so
+    // an unmeasured pair is never mistaken for a real [0, 0).
+    box->set_char_start(-1);
+    box->set_char_end(-1);
     long mid = parsed.y + parsed.height / 2;
     for (size_t page = 0; page < probe->pages.size(); page++) {
       const PageBox& rect = probe->pages[page];
@@ -509,6 +515,106 @@ int64_t codepoints(const std::string& utf8_text) {
     if ((byte & 0xC0) != 0x80) count++;
   }
   return count;
+}
+
+// Attributes item-local [char_start, char_end) code-point offsets to the
+// measured line rectangles by walking the layout's visual lines: the view
+// cursor answers XLineCursor (start and end of the current line) and
+// XViewCursor (down one line), a model cursor from the range's start to the
+// view cursor position converts each stop into a code-point offset, and the
+// caret's document-absolute y locates the rectangle the visual line lives
+// in. A rectangle covers several visual lines when the office core's
+// region compression merged equal-width neighbours, so each rectangle
+// accumulates the offsets of every visual line it contains. A walk that
+// cannot finish (or fails, or leaves a visual line without a rectangle)
+// keeps every boundary at -1, so geometry never degrades. Leaves the view
+// cursor collapsed at start.
+void measure_line_boundaries(
+    const Reference<css::text::XTextViewCursor>& cursor,
+    const Reference<css::text::XTextRange>& start,
+    const Reference<css::text::XTextRange>& end, CaretSpace* space,
+    const std::string& what,
+    google::protobuf::RepeatedPtrField<officev1::LineBox>* lines,
+    Warner& warner) {
+  if (lines->empty()) return;
+  if (!cursor.is() || !start.is() || !end.is()) return;
+  try {
+    Reference<css::view::XLineCursor> line_cursor(cursor, UNO_QUERY);
+    Reference<css::view::XViewCursor> view_cursor(cursor, UNO_QUERY);
+    Reference<css::text::XText> text = start->getText();
+    if (!line_cursor.is() || !view_cursor.is() || !text.is()) return;
+    Reference<css::text::XTextCursor> model =
+        text->createTextCursorByRange(start);
+    if (!model.is()) return;
+    auto offset_of = [&](const Reference<css::text::XTextRange>& to) {
+      model->gotoRange(start, false);
+      model->gotoRange(to, true);
+      return codepoints(utf8(model->getString()));
+    };
+    int64_t total = offset_of(end);
+    struct Span {
+      int64_t start = -1;
+      int64_t end = -1;
+    };
+    std::vector<Span> spans(lines->size());
+    bool finished = false;
+    cursor->gotoRange(start, false);
+    line_cursor->gotoStartOfLine(false);
+    // The bound covers any reasonable paragraph; a walk still unfinished at
+    // the bound (or a cursor that stops advancing) discards everything.
+    constexpr int kMaxVisualLines = 512;
+    int64_t previous_end = -1;
+    for (int guard = 0; guard < kMaxVisualLines; guard++) {
+      int64_t line_start = offset_of(cursor->getStart());
+      // The caret sits at the visual line's start; its document-absolute y
+      // picks the rectangle, with the same conversion slack caret readers
+      // use because the caret round-trips through 1/100 mm.
+      css::awt::Point position = cursor->getPosition();
+      std::pair<long, long> origin =
+          space != nullptr ? space->origin_for(cursor, warner)
+                           : std::pair<long, long>{0, 0};
+      long y = hundredth_mm_to_twips(position.Y) + origin.second;
+      line_cursor->gotoEndOfLine(false);
+      int64_t line_end = offset_of(cursor->getStart());
+      if (line_end < line_start || line_start < previous_end) break;
+      previous_end = line_end;
+      int box_index = -1;
+      for (int i = 0; i < lines->size(); i++) {
+        const officev1::LineBox& box = lines->Get(i);
+        if (y >= box.y_twips() - 30
+            && y < box.y_twips() + box.height_twips()) {
+          box_index = i;
+          break;
+        }
+      }
+      if (box_index < 0) break;
+      Span& span = spans[box_index];
+      if (span.start < 0 || line_start < span.start) span.start = line_start;
+      if (line_end > span.end) span.end = line_end;
+      if (line_end >= total) {
+        finished = true;
+        break;
+      }
+      // Advance to the next visual line. A soft wrap's end-of-line caret
+      // shares its text position with the next line's start, so
+      // gotoStartOfLine from it already lands there; only an explicit line
+      // break, where the position stays on this line, needs the step down.
+      line_cursor->gotoStartOfLine(false);
+      if (offset_of(cursor->getStart()) <= line_start) {
+        if (!view_cursor->goDown(1, false)) break;
+        line_cursor->gotoStartOfLine(false);
+      }
+    }
+    cursor->gotoRange(start, false);
+    if (!finished) return;
+    for (int i = 0; i < lines->size(); i++) {
+      if (spans[i].start < 0) continue;
+      lines->Mutable(i)->set_char_start(spans[i].start);
+      lines->Mutable(i)->set_char_end(spans[i].end);
+    }
+  } catch (const css::uno::Exception& error) {
+    warner.warn("line boundaries of " + what + " failed", error);
+  }
 }
 
 // Appends one run per uniformly formatted text portion. When offset is null
@@ -628,6 +734,8 @@ bool fill_paragraph(const css::uno::Any& element, int32_t index,
     out->set_page_index(page_index);
     measure_line_rects(cursor, range->getStart(), range->getEnd(), probe,
                        label, out->mutable_line_rects(), warner);
+    measure_line_boundaries(cursor, range->getStart(), range->getEnd(), space,
+                            label, out->mutable_line_rects(), warner);
   }
   fill_runs(paragraph, label, out->mutable_runs(), offset, warner);
   if (offset != nullptr) *offset += 1;  // The newline after each body paragraph.
