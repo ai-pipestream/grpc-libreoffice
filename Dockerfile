@@ -3,7 +3,7 @@
 FROM ubuntu:26.04 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
       g++ cmake ninja-build git ca-certificates libgoogle-perftools-dev \
-      libreofficekit-dev \
+      libreofficekit-dev libreoffice-dev \
       libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-draw \
       fonts-liberation fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*

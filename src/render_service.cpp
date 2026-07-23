@@ -17,10 +17,11 @@ const std::vector<std::string> kExtensions = {
     "doc", "docx", "dot", "dotx", "rtf", "txt", "html", "odt", "ott", "fodt", "wpd",
     "xls", "xlsx", "xlt", "xltx", "csv", "tsv", "ods", "ots", "fods",
     "ppt", "pptx", "pot", "potx", "odp", "otp", "fodp",
-    "odg", "fodg", "vsd", "vsdx"};
+    "odg", "fodg", "vsd", "vsdx", "pdf"};
 
 // Fallback resolution when the filename has no usable extension.
 const std::unordered_map<std::string, std::string> kContentTypes = {
+    {"application/pdf", "pdf"},
     {"application/msword", "doc"},
     {"application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"},
     {"application/rtf", "rtf"},
@@ -207,7 +208,8 @@ grpc::Status RenderServiceImpl::ConvertToPdf(
 grpc::Status RenderServiceImpl::GetServiceInfo(
     grpc::ServerContext*, const officev1::GetServiceInfoRequest*,
     officev1::GetServiceInfoResponse* response) {
-  response->set_service_version("0.2.0");
+  response->set_service_version("0.3.0");
+  response->set_typed_content(true);
   response->set_libreoffice_version(config_.libreoffice_version);
   response->set_api_version("v1");
   for (const std::string& format : supported_formats_) {
