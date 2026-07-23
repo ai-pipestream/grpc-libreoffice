@@ -5,6 +5,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -42,12 +43,17 @@ std::string make_work_dir() {
   return buffer.data();
 }
 
-grlibre::WorkerOutcome run(const std::string& mode, const std::string& extension,
-                           const std::string& document,
-                           std::vector<std::string>* payloads) {
+// parts_token is the worker's 8th argv token: "all" or comma-joined
+// DocumentPart numbers.
+grlibre::WorkerOutcome run_with_parts(const std::string& mode,
+                                      const std::string& extension,
+                                      const std::string& document,
+                                      const std::string& parts_token,
+                                      std::vector<std::string>* payloads) {
   std::string work_dir = make_work_dir();
   std::vector<std::string> argv = {
-      worker_path(), mode, extension, "96", "2048", work_dir, lo_install_path()};
+      worker_path(), mode, extension, "96", "2048",
+      work_dir, lo_install_path(), parts_token};
   grlibre::WorkerOutcome outcome = grlibre::run_worker(
       argv, document, std::chrono::milliseconds(120000), 256u * 1024 * 1024,
       [&](std::string&& payload) {
@@ -57,6 +63,12 @@ grlibre::WorkerOutcome run(const std::string& mode, const std::string& extension
   std::error_code ignored;
   std::filesystem::remove_all(work_dir, ignored);
   return outcome;
+}
+
+grlibre::WorkerOutcome run(const std::string& mode, const std::string& extension,
+                           const std::string& document,
+                           std::vector<std::string>* payloads) {
+  return run_with_parts(mode, extension, document, "all", payloads);
 }
 
 void verify_text_pages() {
@@ -419,6 +431,118 @@ void verify_draw_shapes() {
           "draw extraction produced no warnings");
 }
 
+// Counts events by case for one selection run and checks the envelope:
+// DocumentInfo first, RenderStatus STATE_OK last, no warnings.
+std::map<int, int> run_selection(const std::string& extension,
+                                 const std::string& document,
+                                 const std::string& parts_token,
+                                 const std::string& what) {
+  std::vector<std::string> payloads;
+  auto outcome = run_with_parts("pages", extension, document, parts_token,
+                                &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          what + " renders ok: " + outcome.detail);
+  std::map<int, int> counts;
+  officev1::StreamPagesResponse event;
+  for (const std::string& payload : payloads) {
+    require(event.ParseFromString(payload), what + " event parses");
+    counts[event.event_case()]++;
+  }
+  officev1::StreamPagesResponse first;
+  require(first.ParseFromString(payloads.front()), what + " first parses");
+  require(first.has_document_info(), what + " starts with DocumentInfo");
+  require(first.document_info().page_count() >= 1,
+          what + " keeps a page count");
+  officev1::StreamPagesResponse last;
+  require(last.ParseFromString(payloads.back()), what + " last parses");
+  require(last.has_status(), what + " ends with RenderStatus");
+  require(last.status().state() == officev1::RenderStatus::STATE_OK,
+          what + " status ok");
+  require(last.status().warnings().empty(), what + " produced no warnings");
+  return counts;
+}
+
+void verify_part_selection() {
+  using Response = officev1::StreamPagesResponse;
+  // METADATA only: no pages painted, no text content walked.
+  std::map<int, int> counts =
+      run_selection("fodt", kTypedFodt, "2", "metadata-only");
+  require(counts[Response::kMetadata] == 1, "metadata-only emits metadata");
+  require(counts[Response::kPageImage] == 0, "metadata-only paints no pages");
+  require(counts[Response::kParagraph] == 0 && counts[Response::kTable] == 0 &&
+              counts[Response::kEmbeddedImage] == 0 &&
+              counts[Response::kFootnote] == 0 &&
+              counts[Response::kHeaderFooter] == 0 &&
+              counts[Response::kPageStyle] == 0,
+          "metadata-only emits no text content");
+
+  // PAGES only: images but zero typed content.
+  counts = run_selection("fodt", kTypedFodt, "1", "pages-only");
+  require(counts[Response::kPageImage] >= 1, "pages-only paints pages");
+  require(counts[Response::kMetadata] == 0 &&
+              counts[Response::kParagraph] == 0 &&
+              counts[Response::kTable] == 0 &&
+              counts[Response::kEmbeddedImage] == 0,
+          "pages-only emits no typed content");
+
+  // PARAGRAPHS plus TABLES: text flow only, offsets intact.
+  std::vector<std::string> payloads;
+  auto outcome = run_with_parts("pages", "fodt", kTypedFodt, "3,4", &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "paragraphs+tables renders ok: " + outcome.detail);
+  bool saw_heading = false;
+  bool saw_bold_run = false;
+  bool table_ok = false;
+  int forbidden = 0;
+  officev1::StreamPagesResponse event;
+  for (const std::string& payload : payloads) {
+    require(event.ParseFromString(payload), "selection event parses");
+    switch (event.event_case()) {
+      case Response::kParagraph: {
+        const officev1::Paragraph& para = event.paragraph();
+        if (!para.runs().empty() && para.runs(0).text() == "Heading One") {
+          saw_heading = para.outline_level() == 1;
+        }
+        for (const officev1::TextRun& text_run : para.runs()) {
+          if (text_run.text() == "bold" && text_run.weight() >= 150.0f &&
+              text_run.char_offset() == 17) {
+            saw_bold_run = true;
+          }
+        }
+        break;
+      }
+      case Response::kTable:
+        table_ok = event.table().rows() == 2 && event.table().columns() == 2;
+        break;
+      case Response::kEmbeddedImage:
+      case Response::kFootnote:
+      case Response::kHeaderFooter:
+      case Response::kPageStyle:
+      case Response::kMetadata:
+        forbidden++;
+        break;
+      default:
+        break;
+    }
+  }
+  require(saw_heading, "selected paragraphs keep the heading");
+  require(saw_bold_run, "selected paragraphs keep stable char offsets");
+  require(table_ok, "selected tables keep the 2x2 grid");
+  require(forbidden == 0, "unselected parts stay silent");
+
+  // Draw gating: SHAPES without IMAGES emits shape nodes but no bytes.
+  counts = run_selection("fodg", kDrawFodg, "12", "shapes-only");
+  require(counts[Response::kDrawingShape] == 8, "shapes-only emits all shapes");
+  require(counts[Response::kEmbeddedImage] == 0,
+          "shapes-only skips image bytes");
+  // IMAGES without SHAPES still finds the image shape.
+  counts = run_selection("fodg", kDrawFodg, "5", "draw-images-only");
+  require(counts[Response::kDrawingShape] == 0,
+          "draw-images-only emits no shape nodes");
+  require(counts[Response::kEmbeddedImage] == 1,
+          "draw-images-only extracts the image");
+}
+
 void verify_corrupt_zip_is_load_failure() {
   // Plain ASCII garbage would not do here: the office core content-sniffs
   // it as text and loads it. A broken zip container is genuinely unloadable
@@ -443,6 +567,7 @@ int main() {
   verify_pdf_mode();
   verify_typed_content();
   verify_draw_shapes();
+  verify_part_selection();
   verify_corrupt_zip_is_load_failure();
   std::cout << "worker-render-test passed\n";
   return 0;

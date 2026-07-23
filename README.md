@@ -49,6 +49,11 @@ at STANDARD plus COMMENTS):
   Every event is emitted the moment it exists, so a caller can process page
   images while typed content is still streaming. Extraction problems degrade
   to `RenderStatus.warnings`, never a failed render.
+
+  A request can select which parts are emitted through `StreamOptions`
+  (`DocumentPart` values, page images included). An empty selection means
+  every part, and the work behind an unselected part is skipped, not just
+  its emission. `DocumentInfo` and `RenderStatus` are always sent.
 - `ConvertToPdf`: same upload contract; the response streams the PDF as
   ordered chunks instead of page images.
 - `GetServiceInfo`: versions, limits, and accepted source formats, for

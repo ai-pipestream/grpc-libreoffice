@@ -59,6 +59,27 @@ std::string resolve_extension(const std::string& filename, const std::string& co
   return found != kContentTypes.end() ? found->second : "";
 }
 
+// The part selector rides the worker argv as one token: "all" for the wire
+// default, otherwise the selected DocumentPart numeric values joined by
+// commas. Only StreamPagesRequest carries options; the first request whose
+// parts list is non-empty wins, matching the chunk identity fields.
+// DOCUMENT_PART_UNSPECIFIED entries are dropped, so a list of only zeros
+// counts as empty.
+void capture_parts(const officev1::StreamPagesRequest& request,
+                   std::string* token) {
+  if (!token->empty()) return;
+  std::string joined;
+  for (int part : request.options().parts()) {
+    if (part <= 0) continue;
+    if (!joined.empty()) joined += ",";
+    joined += std::to_string(part);
+  }
+  *token = joined;
+}
+
+// PDF mode emits no typed content, so its request carries no selector.
+void capture_parts(const officev1::ConvertToPdfRequest&, std::string*) {}
+
 // A unique writable directory for one worker, removed on destruction.
 class ScopedWorkDir {
  public:
@@ -114,6 +135,7 @@ grpc::Status RenderServiceImpl::render(
   std::string document_id;
   std::string filename;
   std::string content_type;
+  std::string parts_token;
   bool saw_complete = false;
 
   Request request;
@@ -122,6 +144,7 @@ grpc::Status RenderServiceImpl::render(
     if (document_id.empty()) document_id = chunk.document_id();
     if (filename.empty()) filename = chunk.filename();
     if (content_type.empty()) content_type = chunk.content_type();
+    capture_parts(request, &parts_token);
     if (static_cast<long>(bytes.size() + chunk.data().size()) > config_.max_document_bytes) {
       rejected++;
       return {grpc::StatusCode::RESOURCE_EXHAUSTED,
@@ -157,7 +180,8 @@ grpc::Status RenderServiceImpl::render(
   std::vector<std::string> argv = {
       config_.worker_path, mode, extension,
       std::to_string(config_.render_dpi), std::to_string(config_.max_side_px),
-      work_dir.path(), config_.install_path};
+      work_dir.path(), config_.install_path,
+      parts_token.empty() ? "all" : parts_token};
   // Frames can carry a full page PNG; bound generously above the pixel cap.
   std::uint32_t max_frame = 256u * 1024 * 1024;
   WorkerOutcome outcome = run_worker(
