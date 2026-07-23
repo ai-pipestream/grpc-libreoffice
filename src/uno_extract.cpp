@@ -72,6 +72,7 @@
 #include <com/sun/star/sheet/XDataPilotTable.hpp>
 #include <com/sun/star/sheet/XDataPilotTables.hpp>
 #include <com/sun/star/sheet/XDataPilotTablesSupplier.hpp>
+#include <com/sun/star/sheet/XDatabaseRange.hpp>
 #include <com/sun/star/sheet/XNamedRange.hpp>
 #include <com/sun/star/sheet/XPrintAreas.hpp>
 #include <com/sun/star/sheet/XSheetAnnotation.hpp>
@@ -1513,6 +1514,63 @@ bool emit_calc_content(
       // minimal model may not carry.
     } catch (const css::uno::Exception& error) {
       warner.warn("named ranges query failed", error);
+    }
+
+    // Database ranges live next to the named ranges on the model. Each one
+    // is a DatabaseRange service: XDatabaseRange for the data area, XNamed
+    // for the name, and optional boolean properties for the header, totals,
+    // and filter settings.
+    try {
+      Reference<css::beans::XPropertySet> doc_props(model, UNO_QUERY);
+      if (doc_props.is()) {
+        Reference<css::container::XIndexAccess> ranges;
+        doc_props->getPropertyValue("DatabaseRanges") >>= ranges;
+        if (ranges.is()) {
+          for (sal_Int32 i = 0; i < ranges->getCount(); i++) {
+            css::uno::Any entry = ranges->getByIndex(i);
+            Reference<css::sheet::XDatabaseRange> range(entry, UNO_QUERY);
+            if (!range.is()) continue;
+            officev1::StreamPagesResponse event;
+            officev1::SheetDatabaseRange* out =
+                event.mutable_sheet_database_range();
+            Reference<css::container::XNamed> named(entry, UNO_QUERY);
+            if (named.is()) out->set_name(utf8(named->getName()));
+            css::table::CellRangeAddress area = range->getDataArea();
+            out->set_sheet_index(area.Sheet);
+            fill_range_ref(area, out->mutable_range());
+            Reference<css::beans::XPropertySet> props(entry, UNO_QUERY);
+            if (props.is()) {
+              auto flag = [&](const char* name, bool* value) {
+                try {
+                  sal_Bool raw = false;
+                  if (props->getPropertyValue(
+                          rtl::OUString::createFromAscii(name)) >>= raw) {
+                    *value = raw;
+                  }
+                } catch (const css::beans::UnknownPropertyException&) {
+                  // Expected probe result: these are optional properties of
+                  // the DatabaseRange service.
+                }
+              };
+              bool contains_header = false;
+              bool totals_row = false;
+              bool auto_filter = false;
+              flag("ContainsHeader", &contains_header);
+              flag("TotalsRow", &totals_row);
+              flag("AutoFilter", &auto_filter);
+              out->set_contains_header(contains_header);
+              out->set_totals_row(totals_row);
+              out->set_auto_filter(auto_filter);
+            }
+            if (!emit_fn(event)) return false;
+          }
+        }
+      }
+    } catch (const css::beans::UnknownPropertyException&) {
+      // Expected probe result: DatabaseRanges is a service property that a
+      // minimal model may not carry.
+    } catch (const css::uno::Exception& error) {
+      warner.warn("database ranges query failed", error);
     }
   }
 

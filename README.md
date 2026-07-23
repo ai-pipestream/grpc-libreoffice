@@ -56,7 +56,7 @@ at STANDARD plus COMMENTS):
   only the used range's non-empty typed cells (cell type, formula, numeric
   value, display string, number-format key and code, merge span), plus
   `SheetCellComment`, `SheetChart`, and `SheetPivotTable` events per sheet
-  and `SheetNamedRange` events per workbook.
+  and `SheetNamedRange` and `SheetDatabaseRange` events per workbook.
   Presentations emit one `Slide` header per slide (name, autolayout,
   master page) followed by `SlideShape` events in paint order, each with
   its placeholder role, geometry in twips, and text paragraphs carrying
