@@ -69,6 +69,19 @@ FetchContent_MakeAvailable(grpc)
 
 find_package(Threads REQUIRED)
 
+# The PNG encoder deflates through the zlib gRPC already builds in module
+# mode and links into the worker; zlib's CMake does not propagate its include
+# dirs (gRPC carries the same workaround), so spell them out here. If the
+# gRPC pin ever stops providing the target, fail at configure time rather
+# than silently falling back to stb's weaker built-in compressor.
+if(NOT TARGET zlibstatic)
+  message(FATAL_ERROR "zlibstatic target not found; the PNG encoder requires "
+    "gRPC's module-mode bundled zlib (gRPC_ZLIB_PROVIDER=module)")
+endif()
+set(GRLIBRE_ZLIB_INCLUDE_DIRS
+  "${grpc_SOURCE_DIR}/third_party/zlib"
+  "${grpc_BINARY_DIR}/third_party/zlib")
+
 # tcmalloc's per-thread caches serve the server's concurrent streams and the
 # worker's paint/encode pipeline better than glibc malloc under contention.
 option(GRLIBRE_TCMALLOC "Link tcmalloc_minimal into the binaries" ON)
@@ -137,14 +150,20 @@ target_include_directories(grlibre-worker PRIVATE
   "${GRLIBRE_LOK_INCLUDE_DIR}/LibreOfficeKit"
   "${UNO_INCLUDE_DIR}"
   ${GRLIBRE_URE_INCLUDE_DIRS}
-  third_party/stb)
+  third_party/stb
+  ${GRLIBRE_ZLIB_INCLUDE_DIRS})
 # The UNO binary interface contract for gcc-family toolchains on Linux.
 set_source_files_properties(src/uno_extract.cpp PROPERTIES
   COMPILE_DEFINITIONS "LINUX;UNX;CPPU_ENV=gcc3")
 target_link_directories(grlibre-worker PRIVATE "${GRLIBRE_LO_SDK_DIR}/lib")
-target_link_libraries(grlibre-worker PRIVATE office_proto
+target_link_libraries(grlibre-worker PRIVATE office_proto zlibstatic
   uno_sal uno_cppu uno_cppuhelpergcc3
   ${CMAKE_DL_LIBS} Threads::Threads grlibre_flags)
+# CMake links executables with -rdynamic, which would export the bundled
+# zlib the encoder pulls in; the dlopen'd office core imports deflate* and
+# would rebind onto gRPC's zlib fork instead of the system zlib it was
+# built against. Keep the bundled copy private to this binary.
+target_link_options(grlibre-worker PRIVATE "LINKER:--exclude-libs,libz.a")
 # The URE runtime libraries live in the LibreOffice program directory, which
 # is not on the default linker search path.
 set_target_properties(grlibre-worker PROPERTIES
@@ -161,8 +180,9 @@ if(BUILD_TESTING)
   target_link_libraries(event-frame-test PRIVATE Threads::Threads grlibre_flags)
 
   add_executable(png-encode-test tests/png_encode_test.cpp src/png_encode.cpp)
-  target_include_directories(png-encode-test PRIVATE src third_party/stb)
-  target_link_libraries(png-encode-test PRIVATE grlibre_flags)
+  target_include_directories(png-encode-test PRIVATE src third_party/stb
+    ${GRLIBRE_ZLIB_INCLUDE_DIRS})
+  target_link_libraries(png-encode-test PRIVATE zlibstatic grlibre_flags)
 
   add_executable(worker-render-test tests/worker_render_test.cpp)
   target_link_libraries(worker-render-test PRIVATE grlibre_core grlibre_flags)
