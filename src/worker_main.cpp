@@ -184,5 +184,15 @@ int main(int argc, char** argv) {
   if (code != grlibre::kExitOk) {
     std::cerr << "grlibre-worker: " << error << "\n";
   }
-  return code;
+  // End the process here, skipping exit-time teardown. This worker never
+  // runs DeInitVCL, and letting exit() walk LibreOffice's atexit handlers
+  // and static destructors after a render both stalls (destroying the
+  // BufferedDecompositionFlusher's condition variable while its thread
+  // still waits on it, in exact 2 s quanta) and crashes (tcmalloc's
+  // exit-time scavenge dies after an HTML load, turning a finished render
+  // into exit 1). Nothing is left to deliver: every frame is a raw ::write
+  // to fd 1 and std::cerr is unit-buffered, and run_render returns kExitOk
+  // only after the terminal status frame was written, so the exit code
+  // stays a faithful completion signal for the parent.
+  ::_exit(code);
 }

@@ -4,6 +4,7 @@
 #include <linux/magic.h>
 #include <sys/vfs.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -1826,6 +1827,95 @@ void verify_broken_package_needs_repair_opt_in() {
   }
 }
 
+// An HTML source once burned the worker's exit path twice over: this
+// process never runs DeInitVCL, so exit()-time teardown crashed inside
+// tcmalloc's atexit scavenge after every HTML load (turning a finished
+// render into a crash report), and static destruction of the office
+// core's BufferedDecompositionFlusher stalled the exit in exact 2 s
+// steps after the terminal frame. The worker now ends with _exit, so an
+// HTML render must succeed and the outcome must follow the final frame
+// far inside the flusher's 2 s wait quantum.
+void verify_html_renders_and_exits_promptly() {
+  std::string work_dir = make_work_dir();
+  std::vector<std::string> argv = {
+      worker_path(), "pages", "html", "96", "2048",
+      work_dir, lo_install_path(), "all"};
+  std::vector<std::string> payloads;
+  auto last_frame = std::chrono::steady_clock::now();
+  auto outcome = grlibre::run_worker(
+      argv, "<html><body><h1>Title</h1><p>Hello over HTML.</p></body></html>\n",
+      std::chrono::milliseconds(120000), 256u * 1024 * 1024,
+      [&](std::string&& payload) {
+        payloads.push_back(std::move(payload));
+        last_frame = std::chrono::steady_clock::now();
+        return true;
+      });
+  auto settled = std::chrono::steady_clock::now();
+  std::error_code ignored;
+  std::filesystem::remove_all(work_dir, ignored);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "html renders ok: " + outcome.detail);
+  require(payloads.size() >= 3, "html info + page + status events");
+  officev1::StreamPagesResponse first;
+  require(first.ParseFromString(payloads.front()), "html info parses");
+  require(first.has_document_info() &&
+              first.document_info().document_type() == "text",
+          "html loads as a text document");
+  officev1::StreamPagesResponse last;
+  require(last.ParseFromString(payloads.back()), "html last event parses");
+  require(last.has_status() &&
+              last.status().state() == officev1::RenderStatus::STATE_OK,
+          "html stream ends with STATE_OK");
+  auto lag = std::chrono::duration_cast<std::chrono::milliseconds>(
+      settled - last_frame);
+  require(lag.count() < 1000,
+          "outcome follows the final frame inside the 2 s teardown quantum, "
+          "took " + std::to_string(lag.count()) + " ms");
+}
+
+// The completion signal is the terminal status frame backed by the exit
+// code: exit 0 is trusted to mean the terminal frame was written because
+// run_render only returns kExitOk after that frame's write succeeded. The
+// parent side of the contract: a worker that dies mid-stream, before the
+// terminal frame, must surface as a crash, never as kOk. A stub stands in
+// for the worker so the death is deterministic.
+void verify_death_before_status_is_crash() {
+  int frames = 0;
+  auto outcome = grlibre::run_worker(
+      {"/bin/sh", "-c", "printf '\\0\\0\\0\\0'; kill -9 $$"}, "",
+      std::chrono::milliseconds(120000), 256u * 1024 * 1024,
+      [&](std::string&&) {
+        frames++;
+        return true;
+      });
+  require(frames == 1, "the stub's one frame arrived before it died");
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kCrash,
+          "death before the terminal frame is a crash, got: " + outcome.detail);
+  require(outcome.detail.find("signal") != std::string::npos,
+          "the crash names the killing signal");
+}
+
+// A worker that hangs producing nothing must still die at the task
+// deadline: with the office core in an unknown state, the parent's kill
+// path is the only way the RPC ends. A sleeping stub stands in for a hung
+// office core.
+void verify_hung_worker_is_killed_at_deadline() {
+  auto begin = std::chrono::steady_clock::now();
+  // exec, not fork: the deadline SIGKILL goes to the pid run_worker
+  // spawned, and a forked sleep would survive its shell and hold the
+  // inherited output descriptors open long past this test.
+  auto outcome = grlibre::run_worker(
+      {"/bin/sh", "-c", "exec sleep 600"}, "", std::chrono::milliseconds(500),
+      256u * 1024 * 1024, [&](std::string&&) { return true; });
+  auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - begin);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kTimeout,
+          "hung worker times out, got: " + outcome.detail);
+  require(elapsed.count() < 5000,
+          "the deadline kill returns promptly, took "
+              + std::to_string(elapsed.count()) + " ms");
+}
+
 }  // namespace
 
 int main() {
@@ -1851,6 +1941,9 @@ int main() {
   verify_disk_work_dir_is_refused();
   verify_corrupt_zip_is_load_failure();
   verify_broken_package_needs_repair_opt_in();
+  verify_html_renders_and_exits_promptly();
+  verify_death_before_status_is_crash();
+  verify_hung_worker_is_killed_at_deadline();
   std::cout << "worker-render-test passed\n";
   return 0;
 }

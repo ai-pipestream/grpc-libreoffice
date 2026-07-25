@@ -178,6 +178,20 @@ int main() {
     require(result.got_status, "final status emitted");
   }
 
+  // An HTML upload once failed at the finish line: LibreOffice's exit-time
+  // teardown crashed after every HTML render, mapping a complete stream to
+  // INTERNAL. The worker's _exit teardown keeps the RPC OK with the full
+  // stream.
+  {
+    auto result = stream_pages(
+        channel, "<html><body><h1>T</h1><p>Hello over HTML.</p></body></html>\n",
+        "page.html", true);
+    require(result.status.ok(), "html renders: " + result.status.error_message());
+    require(result.info.document_type() == "text", "html document type");
+    require(result.pages >= 1, "html pages emitted");
+    require(result.got_status, "html final status emitted");
+  }
+
   // A repairable broken package (a stored-entry OOXML zip truncated before
   // its central directory) maps to the repair statuses: refusal naming the
   // opt-in by default, UNIMPLEMENTED when opted in, never a silent repair.
