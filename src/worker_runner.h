@@ -11,11 +11,13 @@ namespace grlibre {
 // Outcome of one worker process run.
 struct WorkerOutcome {
   enum class Kind {
-    kOk,           // exit 0, all frames delivered
-    kLoadFailure,  // office core could not load the document
-    kTimeout,      // deadline elapsed; worker was killed
-    kAborted,      // the frame consumer declined further frames
-    kCrash,        // any other exit, including signals
+    kOk,                    // exit 0, all frames delivered
+    kLoadFailure,           // office core could not load the document
+    kRepairNeedsOptIn,      // broken package; repair not opted into
+    kRepairUnimplemented,   // repair opted into but not implemented
+    kTimeout,               // deadline elapsed; worker was killed
+    kAborted,               // the frame consumer declined further frames
+    kCrash,                 // any other exit, including signals
   };
   Kind kind = Kind::kCrash;
   std::string detail;

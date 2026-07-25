@@ -21,6 +21,12 @@ option java_package = "ai.pipestream.office.v1";
 //                        determined from the filename or content type, or the
 //                        office core could not load the document.
 //   RESOURCE_EXHAUSTED - the document exceeds the configured byte cap.
+//   FAILED_PRECONDITION- the document package is broken and would need
+//                        LibreOffice's repair path, which the request did
+//                        not opt into (allow_disk_repair).
+//   UNIMPLEMENTED      - allow_disk_repair was set for a broken package,
+//                        but this server version does not implement the
+//                        repair path.
 //   DEADLINE_EXCEEDED  - the worker exceeded the per-document timeout and
 //                        was killed.
 //   INTERNAL           - the worker crashed or failed mid-render.
@@ -143,6 +149,9 @@ message StreamPagesRequest {
   // so callers should send it on the first chunk. Absent or empty means
   // every part.
   StreamOptions options = 2;
+  // Opt-in for LibreOffice's broken-package repair path; identical
+  // semantics to ConvertToPdfRequest.allow_disk_repair.
+  bool allow_disk_repair = 3;
 }
 
 // StreamPagesResponse is one event of a StreamPages response stream. Order:
@@ -251,6 +260,16 @@ message StreamPagesResponse {
 message ConvertToPdfRequest {
   // The upload chunk.
   DocumentChunk chunk = 1;
+  // Opt-in for LibreOffice's broken-package repair path, the one document
+  // path that stages a temporary copy of the document (sfx2 forces a temp
+  // file whenever RepairPackage is set). Default false: a document whose
+  // package is broken but repairable fails with FAILED_PRECONDITION naming
+  // this field instead of being repaired. May be sent on any request in the
+  // upload stream; true on any request enables it. This server version does
+  // not implement the repair interaction yet, so setting it changes that
+  // failure to UNIMPLEMENTED rather than repairing; a broken package is
+  // never repaired silently.
+  bool allow_disk_repair = 2;
 }
 
 // ConvertToPdfResponse is one event of a ConvertToPdf response stream:
@@ -1449,4 +1468,18 @@ message GetServiceInfoResponse {
   // TextFrame, Shape, EmbeddedObject, and the Sheet family) alongside page
   // images, selectable per request through StreamOptions.
   bool typed_content = 10;
+  // True when uploaded document bytes never reach persistent storage:
+  // staging, the office profile, and the office core's temp spills all live
+  // on RAM-backed tmpfs, verified at server startup and re-verified by
+  // every worker. The only path that may stage a document copy through
+  // LibreOffice's own machinery is broken-package repair, which is gated
+  // behind the allow_disk_repair opt-in.
+  bool diskless_documents = 11;
+  // LibreOffice-internal temporary artifacts that still exist during a
+  // render, named so callers can reason about their own threat model. Both
+  // live inside the per-document tmpfs work dir: an ODF load keeps one
+  // internal temp copy of the package until the document closes, and a PDF
+  // export renders through one internal temp file that LibreOffice unlinks
+  // right after the store.
+  repeated string internal_temp_artifacts = 12;
 }

@@ -74,9 +74,10 @@ constexpr char kProfileSeed[] =
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 7 && argc != 8) {
+  if (argc < 7 || argc > 9) {
     std::cerr << "usage: grlibre-worker <pages|pdf> <extension> <dpi> "
-                 "<max_side_px> <work_dir> <install_path> [parts]\n";
+                 "<max_side_px> <work_dir> <install_path> "
+                 "[parts [repair|no-repair]]\n";
     return grlibre::kExitRenderFailure;
   }
   grlibre::RenderOptions options;
@@ -87,7 +88,19 @@ int main(int argc, char** argv) {
   options.work_dir = argv[5];
   options.install_path = argv[6];
   // Absent token means every part, so older callers keep full output.
-  if (argc == 8) options.parts = parse_parts(argv[7]);
+  if (argc >= 8) options.parts = parse_parts(argv[7]);
+  // The broken-package repair opt-in. Absent means refuse, matching the
+  // wire default; an unknown token is a caller bug and fails loudly.
+  if (argc == 9) {
+    std::string repair = argv[8];
+    if (repair == "repair") {
+      options.allow_disk_repair = true;
+    } else if (repair != "no-repair") {
+      std::cerr << "grlibre-worker: unknown repair token \"" << repair
+                << "\" (expected repair or no-repair)\n";
+      return grlibre::kExitRenderFailure;
+    }
+  }
 
   std::string document = read_all_stdin();
   if (document.empty()) {

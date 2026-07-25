@@ -224,9 +224,31 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
   lok::Document* document = office->documentLoad(url.c_str(), filter_options);
   if (document == nullptr) {
     char* office_error = office->getError();
-    *error = std::string("document load failed: ")
-        + (office_error != nullptr ? office_error : "unknown");
+    std::string detail = office_error != nullptr ? office_error : "unknown";
     std::free(office_error);
+    // A refused load may be a broken package the core would only open
+    // through its repair path, which stages a temp copy of the document
+    // (sfx2 forces one whenever RepairPackage is set). That path is opt-in,
+    // so classify the refusal with the core's own broken-ZIP probe and
+    // report the opt-in instead of a generic load failure. The staged
+    // upload still exists here; it is only unlinked after a successful
+    // load.
+    std::ifstream staged(options.doc_path, std::ios::binary);
+    std::string staged_bytes((std::istreambuf_iterator<char>(staged)),
+                             std::istreambuf_iterator<char>());
+    if (!staged_bytes.empty() && is_repairable_broken_package(staged_bytes)) {
+      if (!options.allow_disk_repair) {
+        *error = "the document package is broken; the office core can only "
+                 "open it through its repair path, which stages a temp copy "
+                 "of the document and requires the allow_disk_repair opt-in";
+        return kExitRepairNeedsOptIn;
+      }
+      *error = "allow_disk_repair is set, but this version does not "
+               "implement the repair path; the broken package cannot be "
+               "loaded";
+      return kExitRepairUnimplemented;
+    }
+    *error = "document load failed: " + detail;
     return kExitLoadFailure;
   }
   // The core opened its own descriptors on the document during the load and
@@ -357,42 +379,40 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
       ok = emit(out_fd, final_event);
     }
   } else {
-    std::string pdf_path = options.work_dir + "/out.pdf";
-    std::string pdf_url = "file://" + pdf_path;
-    if (!document->saveAs(pdf_url.c_str(), "pdf", nullptr)) {
-      char* office_error = office->getError();
-      *error = std::string("PDF export failed: ")
-          + (office_error != nullptr ? office_error : "unknown");
-      std::free(office_error);
-      delete document;
-      return kExitRenderFailure;
+    // The export filter is keyed on the loaded document's class, exactly
+    // the switch LOK's own saveAs runs; the upload extension is no guide
+    // (an .odg can load as an Impress shell). All four names reach the one
+    // shared pdf filter implementation.
+    const char* pdf_filter = nullptr;
+    switch (type) {
+      case LOK_DOCTYPE_TEXT: pdf_filter = "writer_pdf_Export"; break;
+      case LOK_DOCTYPE_SPREADSHEET: pdf_filter = "calc_pdf_Export"; break;
+      case LOK_DOCTYPE_PRESENTATION: pdf_filter = "impress_pdf_Export"; break;
+      case LOK_DOCTYPE_DRAWING: pdf_filter = "draw_pdf_Export"; break;
     }
-    std::ifstream pdf(pdf_path, std::ios::binary);
-    std::string pdf_bytes((std::istreambuf_iterator<char>(pdf)),
-                          std::istreambuf_iterator<char>());
-    // The PDF lives in memory now; drop the tmpfs file before any frame
-    // streams so no document-derived file outlives the export call.
-    if (::unlink(pdf_path.c_str()) != 0) {
-      *error = "cannot remove " + pdf_path + " after export: "
-          + std::strerror(errno);
-      delete document;
-      return kExitRenderFailure;
-    }
-    if (pdf_bytes.empty()) {
-      *error = "PDF export produced no bytes";
+    if (pdf_filter == nullptr) {
+      *error = "cannot export this document type to PDF";
       delete document;
       return kExitRenderFailure;
     }
     officev1::ConvertToPdfResponse response;
     *response.mutable_document_info() = info;
     ok = emit(out_fd, response);
-    for (size_t offset = 0; ok && offset < pdf_bytes.size(); offset += kPdfChunkBytes) {
-      officev1::ConvertToPdfResponse chunk_event;
-      chunk_event.mutable_pdf_chunk()->set_data(
-          pdf_bytes.substr(offset, kPdfChunkBytes));
-      ok = emit(out_fd, chunk_event);
+    // The PDF streams straight from the export filter's output stream into
+    // PdfChunk frames: no out.pdf staging file and no whole-PDF buffer
+    // exist in the worker. A filter failure delivers no bytes first, so
+    // the stream carries no partial chunks before the error status.
+    if (ok && !export_pdf_stream(
+                  pdf_filter, kPdfChunkBytes,
+                  [&](std::string&& chunk) {
+                    officev1::ConvertToPdfResponse chunk_event;
+                    chunk_event.mutable_pdf_chunk()->set_data(std::move(chunk));
+                    return emit(out_fd, chunk_event);
+                  },
+                  &output_bytes, error)) {
+      delete document;
+      return kExitRenderFailure;
     }
-    output_bytes = static_cast<long>(pdf_bytes.size());
     if (ok) {
       officev1::ConvertToPdfResponse final_event;
       officev1::RenderStatus* status = final_event.mutable_status();

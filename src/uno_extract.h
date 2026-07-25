@@ -84,6 +84,32 @@ bool emit_typed_content(
     const std::function<bool(const google::protobuf::MessageLite&)>& emit_fn,
     std::vector<std::string>* warnings);
 
+// Exports the document currently loaded in this process's office core to
+// PDF through an in-memory output stream: no PDF ever exists as a service
+// file or as one whole buffer. filter_name selects the export filter
+// (writer_pdf_Export and friends, keyed on the document class by the
+// caller). Bytes are handed to emit_chunk in order, at most chunk_limit per
+// call; the last chunk flushes on the filter's completion signal. On
+// success *total_bytes is the exported PDF size. On failure returns false
+// with *error set; no bytes reach emit_chunk before an export failure, so
+// there is no partial output to clean up.
+//
+// One LibreOffice-internal temp file remains: the pdf filter renders into a
+// named temp file (vcl's PDF writer is file-backed, structural) and copies
+// it to the output stream, unlinking it right after. It lives under the
+// worker's TMPDIR, which the worker pins inside the tmpfs work dir.
+bool export_pdf_stream(const std::string& filter_name, size_t chunk_limit,
+                       const std::function<bool(std::string&&)>& emit_chunk,
+                       long* total_bytes, std::string* error);
+
+// Whether these document bytes are a broken ZIP package the office core
+// could only open through its repair path. Runs the same ZipPackage probe
+// LibreOffice's type detection runs before offering repair: a plain open
+// throws for a broken ZIP, and a RepairPackage-mode reopen that yields
+// content proves repairability. False for healthy packages, for non-ZIP
+// bytes, and for damage beyond repair.
+bool is_repairable_broken_package(const std::string& bytes);
+
 }  // namespace grlibre
 
 #endif

@@ -31,15 +31,41 @@ struct StreamResult {
   bool got_status = false;
 };
 
+// A stored-entry OOXML zip truncated right before its central directory:
+// the office core's broken-ZIP probe classifies it as repairable. The same
+// fixture the worker test uses; embedded as bytes because a broken zip
+// cannot be a readable fixture.
+constexpr char kRepairableDocx[] =
+    "\x50\x4b\x03\x04\x14\x00\x00\x00\x00\x00\x72\x52\xf9\x5c\xe6\xb8\x74\x6b"
+    "\x62\x00\x00\x00\x62\x00\x00\x00\x13\x00\x00\x00\x5b\x43\x6f\x6e\x74\x65"
+    "\x6e\x74\x5f\x54\x79\x70\x65\x73\x5d\x2e\x78\x6d\x6c\x3c\x3f\x78\x6d\x6c"
+    "\x20\x76\x65\x72\x73\x69\x6f\x6e\x3d\x22\x31\x2e\x30\x22\x3f\x3e\x3c\x54"
+    "\x79\x70\x65\x73\x20\x78\x6d\x6c\x6e\x73\x3d\x22\x68\x74\x74\x70\x3a\x2f"
+    "\x2f\x73\x63\x68\x65\x6d\x61\x73\x2e\x6f\x70\x65\x6e\x78\x6d\x6c\x66\x6f"
+    "\x72\x6d\x61\x74\x73\x2e\x6f\x72\x67\x2f\x70\x61\x63\x6b\x61\x67\x65\x2f"
+    "\x32\x30\x30\x36\x2f\x63\x6f\x6e\x74\x65\x6e\x74\x2d\x74\x79\x70\x65\x73"
+    "\x22\x2f\x3e\x50\x4b\x03\x04\x14\x00\x00\x00\x00\x00\x72\x52\xf9\x5c\x93"
+    "\x76\x4a\xd5\x8c\x00\x00\x00\x8c\x00\x00\x00\x11\x00\x00\x00\x77\x6f\x72"
+    "\x64\x2f\x64\x6f\x63\x75\x6d\x65\x6e\x74\x2e\x78\x6d\x6c\x3c\x3f\x78\x6d"
+    "\x6c\x20\x76\x65\x72\x73\x69\x6f\x6e\x3d\x22\x31\x2e\x30\x22\x3f\x3e\x3c"
+    "\x77\x3a\x64\x6f\x63\x75\x6d\x65\x6e\x74\x20\x78\x6d\x6c\x6e\x73\x3a\x77"
+    "\x3d\x22\x68\x74\x74\x70\x3a\x2f\x2f\x73\x63\x68\x65\x6d\x61\x73\x2e\x6f"
+    "\x70\x65\x6e\x78\x6d\x6c\x66\x6f\x72\x6d\x61\x74\x73\x2e\x6f\x72\x67\x2f"
+    "\x77\x6f\x72\x64\x70\x72\x6f\x63\x65\x73\x73\x69\x6e\x67\x6d\x6c\x2f\x32"
+    "\x30\x30\x36\x2f\x6d\x61\x69\x6e\x22\x3e\x3c\x77\x3a\x62\x6f\x64\x79\x3e"
+    "\x3c\x77\x3a\x70\x2f\x3e\x3c\x2f\x77\x3a\x62\x6f\x64\x79\x3e\x3c\x2f\x77"
+    "\x3a\x64\x6f\x63\x75\x6d\x65\x6e\x74\x3e";
+
 StreamResult stream_pages(const std::shared_ptr<grpc::Channel>& channel,
                           const std::string& bytes, const std::string& filename,
-                          bool mark_complete) {
+                          bool mark_complete, bool allow_disk_repair = false) {
   auto stub = officev1::OfficeRenderService::NewStub(channel);
   grpc::ClientContext context;
   auto stream = stub->StreamPages(&context);
   size_t chunk_size = 64 * 1024;
   for (size_t offset = 0; offset < bytes.size() || offset == 0; offset += chunk_size) {
     officev1::StreamPagesRequest request;
+    request.set_allow_disk_repair(allow_disk_repair);
     officev1::DocumentChunk* chunk = request.mutable_chunk();
     chunk->set_document_id("test-doc");
     chunk->set_filename(filename);
@@ -98,6 +124,13 @@ int main() {
     require(info.max_document_bytes() == (1 << 20), "cap reported");
     require(info.render_dpi() == 96, "dpi reported");
     require(info.supported_formats_size() > 20, "formats reported");
+    require(info.diskless_documents(), "diskless posture advertised");
+    require(info.internal_temp_artifacts_size() == 2,
+            "both LibreOffice-internal temp artifacts named");
+    require(info.internal_temp_artifacts(0).find("odf-load") != std::string::npos,
+            "ODF load residual named");
+    require(info.internal_temp_artifacts(1).find("pdf-export") != std::string::npos,
+            "PDF export residual named");
   }
 
   // Protocol error paths, no office core involved.
@@ -139,6 +172,21 @@ int main() {
     require(result.got_metadata, "metadata event relayed through the service");
     require(result.paragraphs >= 1, "paragraph events relayed through the service");
     require(result.got_status, "final status emitted");
+  }
+
+  // A repairable broken package (a stored-entry OOXML zip truncated before
+  // its central directory) maps to the repair statuses: refusal naming the
+  // opt-in by default, UNIMPLEMENTED when opted in, never a silent repair.
+  {
+    std::string broken(kRepairableDocx, sizeof kRepairableDocx - 1);
+    auto refused = stream_pages(channel, broken, "broken.docx", true);
+    require(refused.status.error_code() == grpc::StatusCode::FAILED_PRECONDITION,
+            "broken package without the opt-in is FAILED_PRECONDITION");
+    require(refused.status.error_message().find("allow_disk_repair") != std::string::npos,
+            "refusal names the opt-in field");
+    auto opted = stream_pages(channel, broken, "broken.docx", true, true);
+    require(opted.status.error_code() == grpc::StatusCode::UNIMPLEMENTED,
+            "opted-in repair is UNIMPLEMENTED in this version");
   }
 
   server->Shutdown();
