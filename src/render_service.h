@@ -23,6 +23,10 @@ struct ServiceConfig {
   int render_dpi = 144;
   int max_side_px = 4096;
   std::string libreoffice_version = "unknown";
+  // RAM-backed directory that receives the per-worker work dirs. Uploaded
+  // document bytes and the office core's spills live under it and must
+  // never reach disk; the worker refuses a work dir that is not tmpfs.
+  std::string tmpfs_dir = "/dev/shm";
 };
 
 // The gRPC face over the worker processes. Uploads accumulate in memory

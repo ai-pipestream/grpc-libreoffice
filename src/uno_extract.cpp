@@ -62,7 +62,12 @@
 #include <com/sun/star/drawing/XMasterPageTarget.hpp>
 #include <com/sun/star/drawing/XShape.hpp>
 #include <com/sun/star/drawing/XShapes.hpp>
+#include <com/sun/star/embed/StorageFormats.hpp>
 #include <com/sun/star/frame/Desktop.hpp>
+#include <com/sun/star/frame/XStorable.hpp>
+#include <com/sun/star/io/IOException.hpp>
+#include <com/sun/star/lang/XMultiComponentFactory.hpp>
+#include <com/sun/star/packages/zip/ZipIOException.hpp>
 #include <com/sun/star/presentation/XPresentationPage.hpp>
 #include <com/sun/star/style/XStyle.hpp>
 #include <com/sun/star/style/XStyleFamiliesSupplier.hpp>
@@ -134,6 +139,7 @@
 #include <com/sun/star/util/DateTime.hpp>
 #include <com/sun/star/view/XLineCursor.hpp>
 #include <com/sun/star/view/XViewCursor.hpp>
+#include <cppuhelper/implbase1.hxx>
 #include <cppuhelper/implbase4.hxx>
 #include <rtl/ref.hxx>
 
@@ -190,6 +196,28 @@ Reference<css::uno::XComponentContext> process_context() {
   Reference<css::beans::XPropertySet> props(get_factory(), UNO_QUERY);
   if (props.is()) props->getPropertyValue("DefaultContext") >>= context;
   return context;
+}
+
+// The document LibreOfficeKit loaded, found on the desktop's component
+// list. Embedded objects put their inner models on the desktop too; the
+// loaded document is the component whose URL is the loaded file, with the
+// last component as fallback.
+Reference<css::frame::XModel> find_loaded_model(
+    const Reference<css::uno::XComponentContext>& context) {
+  Reference<css::frame::XDesktop2> desktop = css::frame::Desktop::create(context);
+  Reference<css::container::XEnumerationAccess> components(
+      desktop->getComponents(), UNO_QUERY);
+  if (!components.is()) return {};
+  Reference<css::container::XEnumeration> it = components->createEnumeration();
+  Reference<css::frame::XModel> model;
+  Reference<css::frame::XModel> fallback;
+  while (it->hasMoreElements()) {
+    Reference<css::frame::XModel> candidate(it->nextElement(), UNO_QUERY);
+    if (!candidate.is()) continue;
+    fallback = candidate;
+    if (candidate->getURL().startsWith("file://")) model = candidate;
+  }
+  return model.is() ? model : fallback;
 }
 
 // Collects graphic-provider output in memory; nothing touches a filesystem.
@@ -256,6 +284,50 @@ class MemoryStream
  private:
   std::string bytes_;
   size_t position_ = 0;
+};
+
+// Receives the pdf export filter's output and frames it onward, so the PDF
+// never exists as one whole buffer here. The filter delivers everything in
+// one burst of bounded writes after the render (its internal temp file is
+// copied out in 32 KiB reads), sometimes led by a zero-length write; this
+// sink aggregates up to chunk_limit per emitted frame and treats
+// closeOutput as the completion signal. A declined emit throws, which
+// aborts the store loudly inside the filter.
+class PdfChunkSink : public cppu::WeakImplHelper1<css::io::XOutputStream> {
+ public:
+  PdfChunkSink(size_t chunk_limit,
+               const std::function<bool(std::string&&)>& emit_chunk)
+      : chunk_limit_(chunk_limit), emit_chunk_(emit_chunk) {}
+
+  void SAL_CALL writeBytes(const css::uno::Sequence<sal_Int8>& data) override {
+    buffer_.append(reinterpret_cast<const char*>(data.getConstArray()),
+                   static_cast<size_t>(data.getLength()));
+    total_ += data.getLength();
+    while (buffer_.size() >= chunk_limit_) emit_front(chunk_limit_);
+  }
+  void SAL_CALL flush() override {}
+  void SAL_CALL closeOutput() override {
+    closed_ = true;
+    if (!buffer_.empty()) emit_front(buffer_.size());
+  }
+
+  long total() const { return total_; }
+  bool closed() const { return closed_; }
+
+ private:
+  void emit_front(size_t count) {
+    std::string chunk = buffer_.substr(0, count);
+    buffer_.erase(0, count);
+    if (!emit_chunk_(std::move(chunk))) {
+      throw css::io::IOException("PDF chunk emission failed (parent gone?)");
+    }
+  }
+
+  size_t chunk_limit_;
+  std::function<bool(std::string&&)> emit_chunk_;
+  std::string buffer_;
+  long total_ = 0;
+  bool closed_ = false;
 };
 
 int64_t datetime_epoch_ms(const css::util::DateTime& value) {
@@ -3885,25 +3957,7 @@ bool emit_typed_content(const PartSelection& parts, SelectionProbe* probe,
       warner.warn("no in-process UNO context, typed content unavailable");
       return true;
     }
-    Reference<css::frame::XDesktop2> desktop = css::frame::Desktop::create(context);
-    Reference<css::container::XEnumerationAccess> components(
-        desktop->getComponents(), UNO_QUERY);
-    if (!components.is()) {
-      warner.warn("desktop has no component list, typed content unavailable");
-      return true;
-    }
-    Reference<css::container::XEnumeration> it = components->createEnumeration();
-    Reference<css::frame::XModel> model;
-    Reference<css::frame::XModel> fallback;
-    while (it->hasMoreElements()) {
-      Reference<css::frame::XModel> candidate(it->nextElement(), UNO_QUERY);
-      if (!candidate.is()) continue;
-      fallback = candidate;
-      // Embedded objects put their inner models on the desktop too; the
-      // loaded document is the component whose URL is the loaded file.
-      if (candidate->getURL().startsWith("file://")) model = candidate;
-    }
-    if (!model.is()) model = fallback;
+    Reference<css::frame::XModel> model = find_loaded_model(context);
     if (!model.is()) {
       warner.warn("loaded document not found on the desktop, typed content unavailable");
       return true;
@@ -3979,6 +4033,110 @@ bool emit_typed_content(const PartSelection& parts, SelectionProbe* probe,
   } catch (const css::uno::Exception& error) {
     warner.warn("extraction aborted", error);
     return true;
+  }
+}
+
+bool export_pdf_stream(const std::string& filter_name, size_t chunk_limit,
+                       const std::function<bool(std::string&&)>& emit_chunk,
+                       long* total_bytes, std::string* error) {
+  try {
+    Reference<css::uno::XComponentContext> context = process_context();
+    if (!context.is()) {
+      *error = "no in-process UNO context for PDF export";
+      return false;
+    }
+    Reference<css::frame::XModel> model = find_loaded_model(context);
+    Reference<css::frame::XStorable> storable(model, UNO_QUERY);
+    if (!storable.is()) {
+      *error = "loaded document not found on the desktop for PDF export";
+      return false;
+    }
+    rtl::Reference<PdfChunkSink> sink(new PdfChunkSink(chunk_limit, emit_chunk));
+    // FilterData mirrors what LOK's own saveAs sends, byte for byte. It is
+    // load-bearing: a descriptor without FilterData flips the pdf filter
+    // into the installation's configured defaults (tagged PDF among them)
+    // and changes the output. Any future filter option must be merged into
+    // this sequence, keeping it non-empty.
+    css::uno::Sequence<css::beans::PropertyValue> filter_data(1);
+    filter_data.getArray()[0].Name = "ExportBookmarks";
+    filter_data.getArray()[0].Value <<= true;
+    css::uno::Sequence<css::beans::PropertyValue> descriptor(3);
+    css::beans::PropertyValue* props = descriptor.getArray();
+    props[0].Name = "FilterName";
+    props[0].Value <<= rtl::OUString::createFromAscii(filter_name.c_str());
+    props[1].Name = "OutputStream";
+    props[1].Value <<= Reference<css::io::XOutputStream>(sink.get());
+    props[2].Name = "FilterData";
+    props[2].Value <<= filter_data;
+    // private:stream routes the store to the OutputStream instead of a URL;
+    // the same idiom LOK uses for shape rendering.
+    storable->storeToURL("private:stream", descriptor);
+    if (sink->total() == 0) {
+      *error = "PDF export produced no bytes";
+      return false;
+    }
+    if (!sink->closed()) {
+      // Without closeOutput the sink's buffered tail was never flushed, so
+      // whatever reached the wire is an incomplete PDF.
+      *error = "PDF filter delivered bytes but never closed the output "
+               "stream; the export is incomplete";
+      return false;
+    }
+    *total_bytes = sink->total();
+    return true;
+  } catch (const css::uno::Exception& failure) {
+    *error = "PDF export failed: " + utf8(failure.Message);
+    return false;
+  }
+}
+
+bool is_repairable_broken_package(const std::string& bytes) {
+  try {
+    Reference<css::uno::XComponentContext> context = process_context();
+    if (!context.is()) return false;
+    Reference<css::lang::XMultiComponentFactory> manager =
+        context->getServiceManager();
+    if (!manager.is()) return false;
+    rtl::Reference<MemoryStream> stream(new MemoryStream());
+    stream->writeBytes(css::uno::Sequence<sal_Int8>(
+        reinterpret_cast<const sal_Int8*>(bytes.data()),
+        static_cast<sal_Int32>(bytes.size())));
+    stream->seek(0);
+    // The identical probe the office core's type detection runs before
+    // offering its repair path (filter TypeDetection::isBrokenZIP): a plain
+    // ZipPackage open throws for broken-or-not-ZIP bytes, and a
+    // RepairPackage-mode reopen that yields content proves repairability.
+    css::uno::Sequence<css::uno::Any> plain(3);
+    css::uno::Any* args = plain.getArray();
+    args[0] <<= Reference<css::io::XInputStream>(stream.get());
+    args[1] <<= css::beans::NamedValue("AllowRemoveOnInsert",
+                                       css::uno::Any(false));
+    args[2] <<= css::beans::NamedValue(
+        "StorageFormat", css::uno::Any(css::embed::StorageFormats::ZIP));
+    try {
+      manager->createInstanceWithArgumentsAndContext(
+          "com.sun.star.packages.comp.ZipPackage", plain, context);
+      return false;
+    } catch (const css::packages::zip::ZipIOException&) {
+    }
+    stream->seek(0);
+    css::uno::Sequence<css::uno::Any> repair(plain);
+    repair.realloc(4);
+    repair.getArray()[3] <<=
+        css::beans::NamedValue("RepairPackage", css::uno::Any(true));
+    Reference<css::beans::XPropertySet> package(
+        manager->createInstanceWithArgumentsAndContext(
+            "com.sun.star.packages.comp.ZipPackage", repair, context),
+        UNO_QUERY);
+    bool has_elements = false;
+    if (package.is()) {
+      package->getPropertyValue("HasElements") >>= has_elements;
+    }
+    return has_elements;
+  } catch (const css::uno::Exception&) {
+    // Anything the probe cannot classify is treated as a plain load
+    // failure, never as repairable.
+    return false;
   }
 }
 

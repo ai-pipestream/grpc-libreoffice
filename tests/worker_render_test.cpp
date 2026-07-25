@@ -1,6 +1,9 @@
 // Runs the real grlibre-worker binary against a headless LibreOffice.
 // Skips (exit 77) when soffice is not installed.
 
+#include <linux/magic.h>
+#include <sys/vfs.h>
+
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -36,9 +39,12 @@ std::string lo_install_path() {
   return configured != nullptr ? configured : "/usr/lib/libreoffice/program";
 }
 
+// Work dirs live on tmpfs, mirroring the service: the worker refuses a
+// disk-backed work dir outright.
 std::string make_work_dir() {
-  const char* base = std::getenv("TMPDIR");
-  std::string pattern = std::string(base != nullptr ? base : "/tmp") + "/grlibre-test-XXXXXX";
+  const char* base = std::getenv("GRLIBRE_TMPFS_DIR");
+  std::string pattern = std::string(base != nullptr && *base != '\0' ? base : "/dev/shm")
+      + "/grlibre-test-XXXXXX";
   std::vector<char> buffer(pattern.begin(), pattern.end());
   buffer.push_back('\0');
   require(::mkdtemp(buffer.data()) != nullptr, "mkdtemp");
@@ -108,19 +114,84 @@ void verify_csv_is_spreadsheet() {
   require(first.document_info().document_type() == "spreadsheet", "csv is spreadsheet");
 }
 
+void verify_tsv_is_spreadsheet() {
+  std::vector<std::string> payloads;
+  auto outcome = run("pages", "tsv", "a\tb\n1\t2\n", &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "tsv renders ok: " + outcome.detail);
+  officev1::StreamPagesResponse first;
+  require(first.ParseFromString(payloads.front()), "tsv info parses");
+  require(first.document_info().document_type() == "spreadsheet", "tsv is spreadsheet");
+}
+
+// The PDF now streams straight from the export filter into PdfChunk
+// frames, so the checks are structural: complete PDF envelope, event
+// order, chunk bounds, and byte accounting. Byte identity with any other
+// export route is deliberately not asserted; the produced PDF differs in
+// timestamps and document id on every run.
 void verify_pdf_mode() {
   std::vector<std::string> payloads;
   auto outcome = run("pdf", "txt", "PDF output please.\n", &payloads);
   require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
           "pdf mode ok: " + outcome.detail);
+  require(payloads.size() >= 3, "pdf info + chunk + status events");
   std::string pdf;
-  officev1::ConvertToPdfResponse event;
-  for (const std::string& payload : payloads) {
-    require(event.ParseFromString(payload), "pdf event parses");
-    if (event.has_pdf_chunk()) pdf.append(event.pdf_chunk().data());
+  long reported_bytes = -1;
+  for (size_t i = 0; i < payloads.size(); i++) {
+    officev1::ConvertToPdfResponse event;
+    require(event.ParseFromString(payloads[i]), "pdf event parses");
+    if (i == 0) require(event.has_document_info(), "first pdf event is DocumentInfo");
+    if (i + 1 == payloads.size()) {
+      require(event.has_status(), "last pdf event is status");
+      reported_bytes = event.status().output_bytes();
+    }
+    if (event.has_pdf_chunk()) {
+      require(event.pdf_chunk().data().size() <= 256 * 1024,
+              "pdf chunk within the frame bound");
+      pdf.append(event.pdf_chunk().data());
+    }
   }
   require(pdf.size() > 500, "PDF has substance");
   require(pdf.compare(0, 5, "%PDF-") == 0, "PDF magic");
+  require(pdf.rfind("%%EOF") != std::string::npos &&
+              pdf.rfind("%%EOF") + 10 > pdf.size(),
+          "PDF ends with its EOF marker");
+  require(reported_bytes == static_cast<long>(pdf.size()),
+          "status output_bytes matches the streamed PDF size");
+}
+
+// A document big enough that the PDF spans several chunks proves the
+// streaming aggregation: every chunk but the last is exactly the frame
+// bound, and the concatenation is one valid PDF.
+void verify_pdf_chunk_streaming() {
+  std::string csv;
+  for (int row = 0; row < 9000; row++) {
+    for (int column = 0; column < 6; column++) {
+      csv += "row-" + std::to_string(row) + "-col-" + std::to_string(column);
+      csv += column + 1 < 6 ? ',' : '\n';
+    }
+  }
+  std::vector<std::string> payloads;
+  auto outcome = run("pdf", "csv", csv, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "big csv pdf ok: " + outcome.detail);
+  std::vector<size_t> chunk_sizes;
+  std::string pdf;
+  for (const std::string& payload : payloads) {
+    officev1::ConvertToPdfResponse event;
+    require(event.ParseFromString(payload), "big pdf event parses");
+    if (event.has_pdf_chunk()) {
+      chunk_sizes.push_back(event.pdf_chunk().data().size());
+      pdf.append(event.pdf_chunk().data());
+    }
+  }
+  require(chunk_sizes.size() >= 2, "PDF spans several chunks");
+  for (size_t i = 0; i + 1 < chunk_sizes.size(); i++) {
+    require(chunk_sizes[i] == 256 * 1024, "every full chunk is the frame bound");
+  }
+  require(pdf.compare(0, 5, "%PDF-") == 0 &&
+              pdf.rfind("%%EOF") != std::string::npos,
+          "chunk concatenation is one PDF");
 }
 
 // A flat ODT with a heading, a bold span, a 2x2 table, and an embedded 1x1
@@ -1589,16 +1660,170 @@ void verify_marks_content() {
   require(warnings.empty(), "marked extraction produced no warnings");
 }
 
+// The edict behind the diskless path: no document-named file may exist in
+// the work dir while frames are flowing or after the run. The first frame
+// is emitted only after the load, by which point the upload must already be
+// unlinked; in pdf mode the staged out.pdf must be gone before its chunks
+// stream. The fixture carries an embedded image so the check also proves
+// the core's lazy storage reads survive the unlink.
+void verify_work_dir_stays_documentless() {
+  for (const std::string& mode : {std::string("pages"), std::string("pdf")}) {
+    std::string work_dir = make_work_dir();
+    std::vector<std::string> argv = {
+        worker_path(), mode, "fodt", "96", "2048",
+        work_dir, lo_install_path(), "all"};
+    auto document_files = [&] {
+      std::vector<std::string> found;
+      for (const auto& entry : std::filesystem::directory_iterator(work_dir)) {
+        std::string name = entry.path().filename().string();
+        if (name.rfind("doc.", 0) == 0 || name == "out.pdf") found.push_back(name);
+      }
+      return found;
+    };
+    int frames = 0;
+    bool clean_during = true;
+    auto outcome = grlibre::run_worker(
+        argv, kTypedFodt, std::chrono::milliseconds(120000),
+        256u * 1024 * 1024, [&](std::string&&) {
+          frames++;
+          clean_during = clean_during && document_files().empty();
+          return true;
+        });
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            mode + " documentless render ok: " + outcome.detail);
+    require(frames > 0, mode + " streamed frames");
+    require(clean_during, mode + " work dir holds no document file while streaming");
+    require(document_files().empty(), mode + " work dir holds no document file after");
+    std::error_code ignored;
+    std::filesystem::remove_all(work_dir, ignored);
+  }
+}
+
+// A work dir off tmpfs would put uploaded bytes on disk; the worker must
+// refuse outright instead of falling back.
+void verify_disk_work_dir_is_refused() {
+  // The build tree's own directory is the most reliable disk-backed
+  // candidate: on hosts where every temp path is tmpfs, the sources still
+  // live on real storage.
+  std::string base;
+  for (const char* candidate : {"/var/tmp", "/tmp", "."}) {
+    struct statfs fs;
+    if (::statfs(candidate, &fs) == 0 && fs.f_type != TMPFS_MAGIC) {
+      base = candidate;
+      break;
+    }
+  }
+  require(!base.empty(),
+          "no disk-backed directory found to exercise the refusal check");
+  std::string pattern = base + "/grlibre-disk-XXXXXX";
+  std::vector<char> buffer(pattern.begin(), pattern.end());
+  buffer.push_back('\0');
+  require(::mkdtemp(buffer.data()) != nullptr, "mkdtemp on disk");
+  std::string work_dir = buffer.data();
+  std::vector<std::string> payloads;
+  std::vector<std::string> argv = {
+      worker_path(), "pages", "txt", "96", "2048",
+      work_dir, lo_install_path(), "all"};
+  auto outcome = grlibre::run_worker(
+      argv, "must not land on disk\n", std::chrono::milliseconds(120000),
+      256u * 1024 * 1024, [&](std::string&& payload) {
+        payloads.push_back(std::move(payload));
+        return true;
+      });
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kWorkDirNotTmpfs,
+          "disk work dir is refused, got detail: " + outcome.detail);
+  require(payloads.empty(), "refusal happens before any frame");
+  require(!std::filesystem::exists(work_dir + "/doc.txt"),
+          "no document bytes were written to the disk work dir");
+  std::error_code ignored;
+  std::filesystem::remove_all(work_dir, ignored);
+}
+
 void verify_corrupt_zip_is_load_failure() {
   // Plain ASCII garbage would not do here: the office core content-sniffs
   // it as text and loads it. A broken zip container is genuinely unloadable
   // and, before the Batch load option, hung on the repair interaction.
+  // This one is damage beyond repair (no valid entry survives), so it stays
+  // a plain load failure rather than a repair refusal.
   std::string corrupt = "PK\x03\x04";
   for (int i = 0; i < 4096; i++) corrupt.push_back(static_cast<char>(i * 131 % 251));
   std::vector<std::string> payloads;
   auto outcome = run("pages", "docx", corrupt, &payloads);
   require(outcome.kind == grlibre::WorkerOutcome::Kind::kLoadFailure,
           "corrupt docx is a load failure, got detail: " + outcome.detail);
+}
+
+// A stored-entry OOXML zip truncated right before its central directory:
+// the office core's own broken-ZIP probe classifies it as repairable, so
+// loading it must surface the allow_package_repair opt-in instead of a
+// generic load failure. Embedded as bytes because a broken zip cannot be a
+// readable fixture; two intact local file entries ([Content_Types].xml and
+// a minimal word/document.xml), no central directory.
+constexpr char kRepairableDocx[] =
+    "\x50\x4b\x03\x04\x14\x00\x00\x00\x00\x00\x72\x52\xf9\x5c\xe6\xb8\x74\x6b"
+    "\x62\x00\x00\x00\x62\x00\x00\x00\x13\x00\x00\x00\x5b\x43\x6f\x6e\x74\x65"
+    "\x6e\x74\x5f\x54\x79\x70\x65\x73\x5d\x2e\x78\x6d\x6c\x3c\x3f\x78\x6d\x6c"
+    "\x20\x76\x65\x72\x73\x69\x6f\x6e\x3d\x22\x31\x2e\x30\x22\x3f\x3e\x3c\x54"
+    "\x79\x70\x65\x73\x20\x78\x6d\x6c\x6e\x73\x3d\x22\x68\x74\x74\x70\x3a\x2f"
+    "\x2f\x73\x63\x68\x65\x6d\x61\x73\x2e\x6f\x70\x65\x6e\x78\x6d\x6c\x66\x6f"
+    "\x72\x6d\x61\x74\x73\x2e\x6f\x72\x67\x2f\x70\x61\x63\x6b\x61\x67\x65\x2f"
+    "\x32\x30\x30\x36\x2f\x63\x6f\x6e\x74\x65\x6e\x74\x2d\x74\x79\x70\x65\x73"
+    "\x22\x2f\x3e\x50\x4b\x03\x04\x14\x00\x00\x00\x00\x00\x72\x52\xf9\x5c\x93"
+    "\x76\x4a\xd5\x8c\x00\x00\x00\x8c\x00\x00\x00\x11\x00\x00\x00\x77\x6f\x72"
+    "\x64\x2f\x64\x6f\x63\x75\x6d\x65\x6e\x74\x2e\x78\x6d\x6c\x3c\x3f\x78\x6d"
+    "\x6c\x20\x76\x65\x72\x73\x69\x6f\x6e\x3d\x22\x31\x2e\x30\x22\x3f\x3e\x3c"
+    "\x77\x3a\x64\x6f\x63\x75\x6d\x65\x6e\x74\x20\x78\x6d\x6c\x6e\x73\x3a\x77"
+    "\x3d\x22\x68\x74\x74\x70\x3a\x2f\x2f\x73\x63\x68\x65\x6d\x61\x73\x2e\x6f"
+    "\x70\x65\x6e\x78\x6d\x6c\x66\x6f\x72\x6d\x61\x74\x73\x2e\x6f\x72\x67\x2f"
+    "\x77\x6f\x72\x64\x70\x72\x6f\x63\x65\x73\x73\x69\x6e\x67\x6d\x6c\x2f\x32"
+    "\x30\x30\x36\x2f\x6d\x61\x69\x6e\x22\x3e\x3c\x77\x3a\x62\x6f\x64\x79\x3e"
+    "\x3c\x77\x3a\x70\x2f\x3e\x3c\x2f\x77\x3a\x62\x6f\x64\x79\x3e\x3c\x2f\x77"
+    "\x3a\x64\x6f\x63\x75\x6d\x65\x6e\x74\x3e";
+
+void verify_broken_package_needs_repair_opt_in() {
+  std::string broken(kRepairableDocx, sizeof kRepairableDocx - 1);
+  // Default: refused with the status naming the opt-in; no frame precedes
+  // the refusal.
+  {
+    std::string work_dir = make_work_dir();
+    std::vector<std::string> payloads;
+    std::vector<std::string> argv = {
+        worker_path(), "pages", "docx", "96", "2048",
+        work_dir, lo_install_path(), "all", "no-repair"};
+    auto outcome = grlibre::run_worker(
+        argv, broken, std::chrono::milliseconds(120000), 256u * 1024 * 1024,
+        [&](std::string&& payload) {
+          payloads.push_back(std::move(payload));
+          return true;
+        });
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kRepairNeedsOptIn,
+            "broken package needs the repair opt-in, got detail: " + outcome.detail);
+    require(outcome.detail.find("allow_package_repair") != std::string::npos,
+            "refusal names the opt-in field");
+    require(payloads.empty(), "refusal happens before any frame");
+    std::error_code ignored;
+    std::filesystem::remove_all(work_dir, ignored);
+  }
+  // Opted in: this version does not implement the repair interaction, so
+  // the load still fails, loudly, and never repairs silently.
+  {
+    std::string work_dir = make_work_dir();
+    std::vector<std::string> payloads;
+    std::vector<std::string> argv = {
+        worker_path(), "pages", "docx", "96", "2048",
+        work_dir, lo_install_path(), "all", "repair"};
+    auto outcome = grlibre::run_worker(
+        argv, broken, std::chrono::milliseconds(120000), 256u * 1024 * 1024,
+        [&](std::string&& payload) {
+          payloads.push_back(std::move(payload));
+          return true;
+        });
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kRepairUnimplemented,
+            "opted-in repair is reported unimplemented, got detail: " + outcome.detail);
+    require(payloads.empty(), "unimplemented repair emits no frames");
+    std::error_code ignored;
+    std::filesystem::remove_all(work_dir, ignored);
+  }
 }
 
 }  // namespace
@@ -1610,7 +1835,9 @@ int main() {
   }
   verify_text_pages();
   verify_csv_is_spreadsheet();
+  verify_tsv_is_spreadsheet();
   verify_pdf_mode();
+  verify_pdf_chunk_streaming();
   verify_typed_content();
   verify_typed_spreadsheet();
   verify_draw_shapes();
@@ -1620,7 +1847,10 @@ int main() {
   verify_line_rects();
   verify_docling_mapping();
   verify_marks_content();
+  verify_work_dir_stays_documentless();
+  verify_disk_work_dir_is_refused();
   verify_corrupt_zip_is_load_failure();
+  verify_broken_package_needs_repair_opt_in();
   std::cout << "worker-render-test passed\n";
   return 0;
 }

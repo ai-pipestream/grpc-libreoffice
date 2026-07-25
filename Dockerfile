@@ -16,7 +16,9 @@ RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGRLIBRE_WERROR=ON 
          -R 'event-frame-test|png-encode-test|worker-render-test|render-service-test|docling-map-test'
 
 # Runtime: LibreOffice, fonts, and the two binaries. All writable paths live
-# under /tmp, so the container runs read-only with a tmpfs at /tmp.
+# under /tmp, so the container runs read-only with a tmpfs at /tmp; the
+# server verifies at startup that it really is tmpfs (uploaded documents
+# stay in RAM, never on disk) and refuses to run otherwise.
 FROM ubuntu:26.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-draw \
@@ -28,5 +30,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=build /src/build/grlibre-server /src/build/grlibre-worker /opt/grlibre/
 USER grlibre
 ENV HOME=/tmp/grlibre
+ENV GRLIBRE_TMPFS_DIR=/tmp
 EXPOSE 50053
 ENTRYPOINT ["/opt/grlibre/grlibre-server"]

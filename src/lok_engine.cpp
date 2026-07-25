@@ -7,12 +7,15 @@
 #include <LibreOfficeKit/LibreOfficeKitEnums.h>
 
 #include <dlfcn.h>
+#include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <fstream>
 #include <mutex>
@@ -221,10 +224,55 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
   lok::Document* document = office->documentLoad(url.c_str(), filter_options);
   if (document == nullptr) {
     char* office_error = office->getError();
-    *error = std::string("document load failed: ")
-        + (office_error != nullptr ? office_error : "unknown");
+    std::string detail = office_error != nullptr ? office_error : "unknown";
     std::free(office_error);
+    // A refused load may be a broken package the core would only open
+    // through its repair path, which rebuilds a rewritten copy of the
+    // document (sfx2 stages one whenever RepairPackage is set). That path
+    // is opt-in, so classify the refusal with the core's own broken-ZIP
+    // probe and report the opt-in instead of a generic load failure. The
+    // staged upload still exists here; it is only unlinked after a
+    // successful load. Every package format is a ZIP, so four magic bytes
+    // decide whether the full re-read for the probe can pay off at all;
+    // anything else skips it, keeping garbage uploads at one RAM copy.
+    std::string staged_bytes;
+    {
+      std::ifstream staged(options.doc_path, std::ios::binary);
+      char magic[4] = {0, 0, 0, 0};
+      staged.read(magic, sizeof magic);
+      if (staged.gcount() == sizeof magic && magic[0] == 'P' &&
+          magic[1] == 'K') {
+        staged.seekg(0);
+        staged_bytes.assign(std::istreambuf_iterator<char>(staged),
+                            std::istreambuf_iterator<char>());
+      }
+    }
+    if (!staged_bytes.empty() && is_repairable_broken_package(staged_bytes)) {
+      if (!options.allow_package_repair) {
+        *error = "the document package is broken; the office core can only "
+                 "open it through its repair path, which rebuilds a rewritten "
+                 "copy of the document and requires the allow_package_repair "
+                 "opt-in";
+        return kExitRepairNeedsOptIn;
+      }
+      *error = "allow_package_repair is set, but this version does not "
+               "implement the repair path; the broken package cannot be "
+               "loaded";
+      return kExitRepairUnimplemented;
+    }
+    *error = "document load failed: " + detail;
     return kExitLoadFailure;
+  }
+  // The core opened its own descriptors on the document during the load and
+  // reads through them from here on, lazy pulls of embedded media included,
+  // so the directory entry is already dead weight. Removing it now bounds
+  // the upload's presence in the work dir to the load call alone; nothing
+  // may recreate it.
+  if (::unlink(options.doc_path.c_str()) != 0) {
+    *error = "cannot remove " + options.doc_path + " after load: "
+        + std::strerror(errno);
+    delete document;
+    return kExitRenderFailure;
   }
   document->initializeForRendering(nullptr);
 
@@ -343,34 +391,40 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
       ok = emit(out_fd, final_event);
     }
   } else {
-    std::string pdf_path = options.work_dir + "/out.pdf";
-    std::string pdf_url = "file://" + pdf_path;
-    if (!document->saveAs(pdf_url.c_str(), "pdf", nullptr)) {
-      char* office_error = office->getError();
-      *error = std::string("PDF export failed: ")
-          + (office_error != nullptr ? office_error : "unknown");
-      std::free(office_error);
-      delete document;
-      return kExitRenderFailure;
+    // The export filter is keyed on the loaded document's class, exactly
+    // the switch LOK's own saveAs runs; the upload extension is no guide
+    // (an .odg can load as an Impress shell). All four names reach the one
+    // shared pdf filter implementation.
+    const char* pdf_filter = nullptr;
+    switch (type) {
+      case LOK_DOCTYPE_TEXT: pdf_filter = "writer_pdf_Export"; break;
+      case LOK_DOCTYPE_SPREADSHEET: pdf_filter = "calc_pdf_Export"; break;
+      case LOK_DOCTYPE_PRESENTATION: pdf_filter = "impress_pdf_Export"; break;
+      case LOK_DOCTYPE_DRAWING: pdf_filter = "draw_pdf_Export"; break;
     }
-    std::ifstream pdf(pdf_path, std::ios::binary);
-    std::string pdf_bytes((std::istreambuf_iterator<char>(pdf)),
-                          std::istreambuf_iterator<char>());
-    if (pdf_bytes.empty()) {
-      *error = "PDF export produced no bytes";
+    if (pdf_filter == nullptr) {
+      *error = "cannot export this document type to PDF";
       delete document;
       return kExitRenderFailure;
     }
     officev1::ConvertToPdfResponse response;
     *response.mutable_document_info() = info;
     ok = emit(out_fd, response);
-    for (size_t offset = 0; ok && offset < pdf_bytes.size(); offset += kPdfChunkBytes) {
-      officev1::ConvertToPdfResponse chunk_event;
-      chunk_event.mutable_pdf_chunk()->set_data(
-          pdf_bytes.substr(offset, kPdfChunkBytes));
-      ok = emit(out_fd, chunk_event);
+    // The PDF streams straight from the export filter's output stream into
+    // PdfChunk frames: no out.pdf staging file and no whole-PDF buffer
+    // exist in the worker. A filter failure delivers no bytes first, so
+    // the stream carries no partial chunks before the error status.
+    if (ok && !export_pdf_stream(
+                  pdf_filter, kPdfChunkBytes,
+                  [&](std::string&& chunk) {
+                    officev1::ConvertToPdfResponse chunk_event;
+                    chunk_event.mutable_pdf_chunk()->set_data(std::move(chunk));
+                    return emit(out_fd, chunk_event);
+                  },
+                  &output_bytes, error)) {
+      delete document;
+      return kExitRenderFailure;
     }
-    output_bytes = static_cast<long>(pdf_bytes.size());
     if (ok) {
       officev1::ConvertToPdfResponse final_event;
       officev1::RenderStatus* status = final_event.mutable_status();

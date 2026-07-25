@@ -21,6 +21,12 @@ option java_package = "ai.pipestream.office.v1";
 //                        determined from the filename or content type, or the
 //                        office core could not load the document.
 //   RESOURCE_EXHAUSTED - the document exceeds the configured byte cap.
+//   FAILED_PRECONDITION- the document package is broken and would need
+//                        LibreOffice's repair path, which the request did
+//                        not opt into (allow_package_repair).
+//   UNIMPLEMENTED      - allow_package_repair was set for a broken package,
+//                        but this server version does not implement the
+//                        repair path.
 //   DEADLINE_EXCEEDED  - the worker exceeded the per-document timeout and
 //                        was killed.
 //   INTERNAL           - the worker crashed or failed mid-render.
@@ -143,6 +149,9 @@ message StreamPagesRequest {
   // so callers should send it on the first chunk. Absent or empty means
   // every part.
   StreamOptions options = 2;
+  // Opt-in for LibreOffice's broken-package repair path; identical
+  // semantics to ConvertToPdfRequest.allow_package_repair.
+  bool allow_package_repair = 3;
 }
 
 // StreamPagesResponse is one event of a StreamPages response stream. Order:
@@ -251,6 +260,19 @@ message StreamPagesResponse {
 message ConvertToPdfRequest {
   // The upload chunk.
   DocumentChunk chunk = 1;
+  // Opt-in for LibreOffice's broken-package repair path. Repair rebuilds
+  // the document from whatever the office core can salvage, so the caller
+  // is accepting a rewritten and possibly lossy copy of the upload; it also
+  // stages that copy through the office core's own temp machinery (sfx2
+  // forces a staging file whenever RepairPackage is set, placed under the
+  // same tmpfs as every other temp spill in this deployment). Default
+  // false: a document whose package is broken but repairable fails with
+  // FAILED_PRECONDITION naming this field instead of being repaired. May be
+  // sent on any request in the upload stream; true on any request enables
+  // it. This server version does not implement the repair interaction yet,
+  // so setting it changes that failure to UNIMPLEMENTED rather than
+  // repairing; a broken package is never repaired silently.
+  bool allow_package_repair = 2;
 }
 
 // ConvertToPdfResponse is one event of a ConvertToPdf response stream:
@@ -1449,4 +1471,19 @@ message GetServiceInfoResponse {
   // TextFrame, Shape, EmbeddedObject, and the Sheet family) alongside page
   // images, selectable per request through StreamOptions.
   bool typed_content = 10;
+  // True when uploaded document bytes never reach persistent storage:
+  // staging, the office profile, and the office core's temp spills all live
+  // on RAM-backed tmpfs, verified at server startup and re-verified by
+  // every worker. Broken-package repair, which stages a rewritten copy
+  // through LibreOffice's own machinery, is gated behind the
+  // allow_package_repair opt-in. tmpfs pages are swappable, so a host with
+  // swap enabled may still page document bytes to the swap device; the
+  // guarantee is about filesystems, not about RAM never leaving the DIMMs.
+  bool diskless_documents = 11;
+  // LibreOffice-internal temporary artifacts that can exist during a
+  // render, one entry per artifact class, named so callers can reason
+  // about their own threat model. Every class lives inside the
+  // per-document tmpfs work dir and is removed with it when the worker
+  // exits.
+  repeated string internal_temp_artifacts = 12;
 }

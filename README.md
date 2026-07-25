@@ -13,9 +13,18 @@ The server exists for three reasons:
 2. Crash isolation. Every document is rendered by its own short-lived worker
    process that loads the core, renders, and exits. A crash or hang in the
    core kills one worker; the server maps it to a gRPC status and moves on.
-3. Document bytes should not touch persistent disk. All writable paths (the
-   uploaded document, the office user profile, PDF output) live under a
-   memory-backed tmpfs; the container runs with a read-only root filesystem.
+3. Document bytes never touch persistent disk. All per-document writable
+   paths (the uploaded document, the office user profile, the office core's
+   temp spills) live under a memory-backed tmpfs, verified at startup and
+   again by every worker; the uploaded document is deleted the moment the
+   office core has loaded it, and a produced PDF streams from the export
+   filter without ever being staged as a file. The container runs with a
+   read-only root filesystem. One honest limit: tmpfs pages are swappable,
+   so on a host with swap enabled the kernel may page document bytes to the
+   swap device; run swapless or with encrypted swap where that matters.
+   LibreOffice's broken-package repair, which rewrites the upload through
+   the core's own staging, is an explicit per-request opt-in
+   (`allow_package_repair`) and off by default.
 
 ## API
 
@@ -96,9 +105,14 @@ at STANDARD plus COMMENTS):
   same twips space the typed positions use, so a consumer can map any
   document-absolute position to page-local coordinates.
 - `ConvertToPdf`: same upload contract; the response streams the PDF as
-  ordered chunks instead of page images.
+  ordered chunks instead of page images. The PDF flows straight from the
+  export filter's output stream into the chunk events, so it never exists
+  as a service file or as one whole buffer in the worker.
 - `GetServiceInfo`: versions, limits, and accepted source formats, for
-  orchestrators and tool facades.
+  orchestrators and tool facades. It also advertises the diskless posture
+  (`diskless_documents`) and names the LibreOffice-internal temp artifacts
+  (`internal_temp_artifacts`) so callers can reason about their own threat
+  model.
 
 The source format resolves from the filename extension first and the content
 type second; unresolvable documents are rejected with `INVALID_ARGUMENT`.
@@ -107,9 +121,21 @@ legacy), the OpenDocument families, RTF, CSV, HTML, and plain text.
 
 Errors are gRPC status codes: `INVALID_ARGUMENT` (no bytes, missing complete
 flag, unresolvable format, or the core cannot load the document),
-`RESOURCE_EXHAUSTED` (over the byte cap), `DEADLINE_EXCEEDED` (per-document
-timeout, worker killed), `INTERNAL` (worker crash). Health checking and
-reflection are registered.
+`RESOURCE_EXHAUSTED` (over the byte cap), `FAILED_PRECONDITION` (broken
+package needing repair without the `allow_package_repair` opt-in),
+`UNIMPLEMENTED` (`allow_package_repair` set, repair path not implemented in
+this version), `DEADLINE_EXCEEDED` (per-document timeout, worker killed),
+`INTERNAL` (worker crash). Health checking and reflection are registered.
+
+A document whose zip package is broken but repairable is a special case:
+LibreOffice can only open it through its repair path, which rebuilds the
+package from what it can salvage and stages that copy through the core's
+own temp machinery. Accepting a rewritten document is gated behind the
+explicit `allow_package_repair` request field (default false). By default such
+a document fails with `FAILED_PRECONDITION` naming the field; the current
+version does not implement the repair interaction itself, so opting in
+turns the failure into `UNIMPLEMENTED` rather than repairing. A broken
+package is never repaired silently.
 
 Accepted formats also include PDF, which the core imports through Draw;
 PDF pages rasterize like any other document and, because the import
@@ -135,6 +161,25 @@ gRPC stream as they arrive. A concurrency gate bounds simultaneous workers;
 a deadline kills workers that hang. Worker exit codes distinguish "could not
 load the document" (client error) from crashes (server error).
 
+Uploaded document bytes never touch disk. Each worker gets a private 0700
+work dir on a RAM-backed tmpfs (`GRLIBRE_TMPFS_DIR`, default `/dev/shm`);
+the server refuses to start when that directory is not tmpfs, and the
+worker refuses a work dir that is not tmpfs, with no disk fallback either
+way. The document is staged there just long enough for the office core to
+open it and is unlinked the moment the load returns (the core keeps its own
+descriptors, so lazy reads of embedded media keep working). The core's own
+temp spills (`TMPDIR`) are pinned inside the same tmpfs: an ODF load keeps
+a full package copy there for the document's lifetime, a PDF upload is
+staged in full by the office core's PDF import, and embedded media
+spill their raw bytes plus derived bitmaps, so size the tmpfs for the
+document plus those spills, times the number of concurrent workers. In pdf
+mode the PDF streams straight from the export filter's output stream into
+chunk events; the one remaining materialization is LibreOffice-internal
+(the pdf filter renders into a named temp file and copies it out, unlinking
+it right after), and it lives in the same tmpfs `TMPDIR`. File locking is
+disabled through the worker profile, so no `.~lock` siblings are written
+anywhere.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -146,6 +191,7 @@ load the document" (client error) from crashes (server error).
 | `GRLIBRE_RENDER_DPI` | `144` | Requested page render DPI |
 | `GRLIBRE_MAX_PAGE_PIXELS` | `4096` | Per-side pixel bound; pages downscale to fit |
 | `GRLIBRE_LO_PATH` | `/usr/lib/libreoffice/program` | LibreOffice installation |
+| `GRLIBRE_TMPFS_DIR` | `/dev/shm` | tmpfs for per-worker work dirs; startup fails if it is not tmpfs |
 | `GRLIBRE_METRICS_INTERVAL_SECONDS` | `60` | Metrics line interval, `0` disables |
 
 ## Build and run

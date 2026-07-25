@@ -48,6 +48,22 @@ WorkerOutcome finish(pid_t pid, bool kill_first, WorkerOutcome::Kind kind_on_exi
     } else if (code == kExitLoadFailure) {
       outcome.kind = WorkerOutcome::Kind::kLoadFailure;
       outcome.detail = "the office core could not load the document";
+    } else if (code == kExitRepairNeedsOptIn) {
+      outcome.kind = WorkerOutcome::Kind::kRepairNeedsOptIn;
+      outcome.detail = "the document package is broken; opening it needs the "
+                       "office core's repair path, which rebuilds a rewritten "
+                       "copy of the document and requires the "
+                       "allow_package_repair opt-in";
+    } else if (code == kExitRepairUnimplemented) {
+      outcome.kind = WorkerOutcome::Kind::kRepairUnimplemented;
+      outcome.detail = "allow_package_repair is set, but this server does not "
+                       "implement the repair path; the broken package cannot "
+                       "be loaded";
+    } else if (code == kExitWorkDirNotTmpfs) {
+      outcome.kind = WorkerOutcome::Kind::kWorkDirNotTmpfs;
+      outcome.detail = "the worker's work dir is not on tmpfs; the server "
+                       "refuses to stage document bytes on disk (check "
+                       "GRLIBRE_TMPFS_DIR)";
     } else {
       outcome.kind = WorkerOutcome::Kind::kCrash;
       outcome.detail = "worker exited with code " + std::to_string(code);

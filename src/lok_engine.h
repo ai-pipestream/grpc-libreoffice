@@ -35,9 +35,13 @@ struct RenderOptions {
   std::string mode;
   // Canonical source extension; also the loaded file's extension.
   std::string extension;
-  // Absolute path of the document to load.
+  // Absolute path of the document to load, inside work_dir. The engine
+  // unlinks it as soon as the load completes.
   std::string doc_path;
-  // Writable per-worker directory (PDF output, office user profile).
+  // Writable per-worker directory on tmpfs (document staging, office user
+  // profile, the core's TMPDIR spills). Uploaded bytes never exist outside
+  // RAM; the produced PDF streams from the export filter and is never
+  // staged here.
   std::string work_dir;
   // LibreOffice installation program directory.
   std::string install_path;
@@ -49,12 +53,25 @@ struct RenderOptions {
   long input_bytes = 0;
   // Which parts to emit; defaults to every part.
   PartSelection parts;
+  // Caller opt-in for the office core's broken-package repair path, the one
+  // document path that stages a temp copy of the document. Off by default;
+  // a repair-needing document then fails naming the opt-in.
+  bool allow_package_repair = false;
 };
 
 // Worker process exit codes, mapped to gRPC status codes by the parent.
 inline constexpr int kExitOk = 0;
 inline constexpr int kExitLoadFailure = 4;
 inline constexpr int kExitRenderFailure = 5;
+// The package is broken but repairable, and the caller did not opt into the
+// rewriting repair path.
+inline constexpr int kExitRepairNeedsOptIn = 6;
+// The caller opted into repair, but this version does not implement the
+// repair interaction; the broken package stays unloadable.
+inline constexpr int kExitRepairUnimplemented = 7;
+// The work dir handed to the worker is not on tmpfs; the worker refuses to
+// stage the upload rather than write document bytes to disk.
+inline constexpr int kExitWorkDirNotTmpfs = 8;
 
 // Loads the document through LibreOfficeKit and writes framed response
 // events to out_fd. Returns a worker exit code; on failure *error names the
