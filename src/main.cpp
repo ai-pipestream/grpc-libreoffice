@@ -1,10 +1,14 @@
 // grpc-libreoffice server: gRPC front over per-document LibreOfficeKit
-// worker processes. All writable paths live under TMPDIR; the container
-// runs read-only with a tmpfs at /tmp.
+// worker processes. Every per-document writable path lives under a
+// RAM-backed tmpfs (GRLIBRE_TMPFS_DIR, default /dev/shm): uploaded
+// document bytes never reach disk, and the server refuses to start
+// without a real tmpfs rather than fall back.
 
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
 #include <grpcpp/health_check_service_interface.h>
+#include <linux/magic.h>
 #include <signal.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 #include <climits>
@@ -92,6 +96,16 @@ int main() {
   }
   const char* lo_path = std::getenv("GRLIBRE_LO_PATH");
   config.install_path = lo_path != nullptr ? lo_path : "/usr/lib/libreoffice/program";
+  const char* tmpfs_dir = std::getenv("GRLIBRE_TMPFS_DIR");
+  if (tmpfs_dir != nullptr && *tmpfs_dir != '\0') config.tmpfs_dir = tmpfs_dir;
+  struct statfs tmpfs_stat;
+  if (::statfs(config.tmpfs_dir.c_str(), &tmpfs_stat) != 0
+      || tmpfs_stat.f_type != TMPFS_MAGIC) {
+    std::cerr << "Startup failed: " << config.tmpfs_dir
+              << " is not a tmpfs. Uploaded documents must stay in RAM; "
+                 "mount a tmpfs there or point GRLIBRE_TMPFS_DIR at one.\n";
+    return 1;
+  }
   const char* worker = std::getenv("GRLIBRE_WORKER");
   config.worker_path = worker != nullptr ? worker : sibling_binary("grlibre-worker");
   config.libreoffice_version = detect_libreoffice_version();
@@ -115,6 +129,7 @@ int main() {
             << " workers=" << config.max_concurrent_documents
             << " dpi=" << config.render_dpi
             << " cap=" << config.max_document_bytes << "B"
+            << " tmpfs=" << config.tmpfs_dir
             << " core=\"" << config.libreoffice_version << "\"" << std::endl;
 
   ::signal(SIGINT, handle_shutdown);

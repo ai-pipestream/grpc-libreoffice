@@ -80,12 +80,14 @@ void capture_parts(const officev1::StreamPagesRequest& request,
 // PDF mode emits no typed content, so its request carries no selector.
 void capture_parts(const officev1::ConvertToPdfRequest&, std::string*) {}
 
-// A unique writable directory for one worker, removed on destruction.
+// A unique 0700 directory for one worker on the service's tmpfs, removed on
+// destruction. The removal is what reclaims the RAM even when the worker
+// was killed mid-render, so it must stay on the parent side of the process
+// boundary.
 class ScopedWorkDir {
  public:
-  ScopedWorkDir() {
-    const char* base = std::getenv("TMPDIR");
-    std::string pattern = std::string(base != nullptr ? base : "/tmp") + "/grlibre-XXXXXX";
+  explicit ScopedWorkDir(const std::string& base) {
+    std::string pattern = base + "/grlibre-XXXXXX";
     std::vector<char> buffer(pattern.begin(), pattern.end());
     buffer.push_back('\0');
     if (::mkdtemp(buffer.data()) != nullptr) path_ = buffer.data();
@@ -171,7 +173,7 @@ grpc::Status RenderServiceImpl::render(
   }
 
   SlotGuard slot(*this);
-  ScopedWorkDir work_dir;
+  ScopedWorkDir work_dir(config_.tmpfs_dir);
   if (work_dir.path().empty()) {
     failed++;
     return {grpc::StatusCode::INTERNAL, "cannot create worker directory"};

@@ -7,12 +7,15 @@
 #include <LibreOfficeKit/LibreOfficeKitEnums.h>
 
 #include <dlfcn.h>
+#include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <fstream>
 #include <mutex>
@@ -226,6 +229,17 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     std::free(office_error);
     return kExitLoadFailure;
   }
+  // The core opened its own descriptors on the document during the load and
+  // reads through them from here on, lazy pulls of embedded media included,
+  // so the directory entry is already dead weight. Removing it now bounds
+  // the upload's presence in the work dir to the load call alone; nothing
+  // may recreate it.
+  if (::unlink(options.doc_path.c_str()) != 0) {
+    *error = "cannot remove " + options.doc_path + " after load: "
+        + std::strerror(errno);
+    delete document;
+    return kExitRenderFailure;
+  }
   document->initializeForRendering(nullptr);
 
   int type = document->getDocumentType();
@@ -356,6 +370,14 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     std::ifstream pdf(pdf_path, std::ios::binary);
     std::string pdf_bytes((std::istreambuf_iterator<char>(pdf)),
                           std::istreambuf_iterator<char>());
+    // The PDF lives in memory now; drop the tmpfs file before any frame
+    // streams so no document-derived file outlives the export call.
+    if (::unlink(pdf_path.c_str()) != 0) {
+      *error = "cannot remove " + pdf_path + " after export: "
+          + std::strerror(errno);
+      delete document;
+      return kExitRenderFailure;
+    }
     if (pdf_bytes.empty()) {
       *error = "PDF export produced no bytes";
       delete document;

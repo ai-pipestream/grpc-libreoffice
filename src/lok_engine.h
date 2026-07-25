@@ -35,9 +35,12 @@ struct RenderOptions {
   std::string mode;
   // Canonical source extension; also the loaded file's extension.
   std::string extension;
-  // Absolute path of the document to load.
+  // Absolute path of the document to load, inside work_dir. The engine
+  // unlinks it as soon as the load completes.
   std::string doc_path;
-  // Writable per-worker directory (PDF output, office user profile).
+  // Writable per-worker directory on tmpfs (document staging, PDF staging,
+  // office user profile, the core's TMPDIR spills). Uploaded bytes never
+  // exist outside RAM.
   std::string work_dir;
   // LibreOffice installation program directory.
   std::string install_path;

@@ -13,9 +13,12 @@ The server exists for three reasons:
 2. Crash isolation. Every document is rendered by its own short-lived worker
    process that loads the core, renders, and exits. A crash or hang in the
    core kills one worker; the server maps it to a gRPC status and moves on.
-3. Document bytes should not touch persistent disk. All writable paths (the
-   uploaded document, the office user profile, PDF output) live under a
-   memory-backed tmpfs; the container runs with a read-only root filesystem.
+3. Document bytes never touch persistent disk. All per-document writable
+   paths (the uploaded document, the office user profile, PDF staging, the
+   office core's temp spills) live under a memory-backed tmpfs, verified at
+   startup and again by every worker, and the uploaded document is deleted
+   the moment the office core has loaded it. The container runs with a
+   read-only root filesystem.
 
 ## API
 
@@ -135,6 +138,21 @@ gRPC stream as they arrive. A concurrency gate bounds simultaneous workers;
 a deadline kills workers that hang. Worker exit codes distinguish "could not
 load the document" (client error) from crashes (server error).
 
+Uploaded document bytes never touch disk. Each worker gets a private 0700
+work dir on a RAM-backed tmpfs (`GRLIBRE_TMPFS_DIR`, default `/dev/shm`);
+the server refuses to start when that directory is not tmpfs, and the
+worker refuses a work dir that is not tmpfs, with no disk fallback either
+way. The document is staged there just long enough for the office core to
+open it and is unlinked the moment the load returns (the core keeps its own
+descriptors, so lazy reads of embedded media keep working). The core's own
+temp spills (`TMPDIR`) are pinned inside the same tmpfs: an ODF load keeps
+a full package copy there for the document's lifetime, and embedded media
+spill their raw bytes plus derived bitmaps, so size the tmpfs for the
+document plus those spills, times the number of concurrent workers. In pdf
+mode the exported file is staged on the same tmpfs and unlinked before its
+chunks stream. File locking is disabled through the worker profile, so no
+`.~lock` siblings are written anywhere.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -146,6 +164,7 @@ load the document" (client error) from crashes (server error).
 | `GRLIBRE_RENDER_DPI` | `144` | Requested page render DPI |
 | `GRLIBRE_MAX_PAGE_PIXELS` | `4096` | Per-side pixel bound; pages downscale to fit |
 | `GRLIBRE_LO_PATH` | `/usr/lib/libreoffice/program` | LibreOffice installation |
+| `GRLIBRE_TMPFS_DIR` | `/dev/shm` | tmpfs for per-worker work dirs; startup fails if it is not tmpfs |
 | `GRLIBRE_METRICS_INTERVAL_SECONDS` | `60` | Metrics line interval, `0` disables |
 
 ## Build and run

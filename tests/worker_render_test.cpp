@@ -1,6 +1,9 @@
 // Runs the real grlibre-worker binary against a headless LibreOffice.
 // Skips (exit 77) when soffice is not installed.
 
+#include <linux/magic.h>
+#include <sys/vfs.h>
+
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -36,9 +39,12 @@ std::string lo_install_path() {
   return configured != nullptr ? configured : "/usr/lib/libreoffice/program";
 }
 
+// Work dirs live on tmpfs, mirroring the service: the worker refuses a
+// disk-backed work dir outright.
 std::string make_work_dir() {
-  const char* base = std::getenv("TMPDIR");
-  std::string pattern = std::string(base != nullptr ? base : "/tmp") + "/grlibre-test-XXXXXX";
+  const char* base = std::getenv("GRLIBRE_TMPFS_DIR");
+  std::string pattern = std::string(base != nullptr && *base != '\0' ? base : "/dev/shm")
+      + "/grlibre-test-XXXXXX";
   std::vector<char> buffer(pattern.begin(), pattern.end());
   buffer.push_back('\0');
   require(::mkdtemp(buffer.data()) != nullptr, "mkdtemp");
@@ -106,6 +112,16 @@ void verify_csv_is_spreadsheet() {
   officev1::StreamPagesResponse first;
   require(first.ParseFromString(payloads.front()), "csv info parses");
   require(first.document_info().document_type() == "spreadsheet", "csv is spreadsheet");
+}
+
+void verify_tsv_is_spreadsheet() {
+  std::vector<std::string> payloads;
+  auto outcome = run("pages", "tsv", "a\tb\n1\t2\n", &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "tsv renders ok: " + outcome.detail);
+  officev1::StreamPagesResponse first;
+  require(first.ParseFromString(payloads.front()), "tsv info parses");
+  require(first.document_info().document_type() == "spreadsheet", "tsv is spreadsheet");
 }
 
 void verify_pdf_mode() {
@@ -1589,6 +1605,85 @@ void verify_marks_content() {
   require(warnings.empty(), "marked extraction produced no warnings");
 }
 
+// The edict behind the diskless path: no document-named file may exist in
+// the work dir while frames are flowing or after the run. The first frame
+// is emitted only after the load, by which point the upload must already be
+// unlinked; in pdf mode the staged out.pdf must be gone before its chunks
+// stream. The fixture carries an embedded image so the check also proves
+// the core's lazy storage reads survive the unlink.
+void verify_work_dir_stays_documentless() {
+  for (const std::string& mode : {std::string("pages"), std::string("pdf")}) {
+    std::string work_dir = make_work_dir();
+    std::vector<std::string> argv = {
+        worker_path(), mode, "fodt", "96", "2048",
+        work_dir, lo_install_path(), "all"};
+    auto document_files = [&] {
+      std::vector<std::string> found;
+      for (const auto& entry : std::filesystem::directory_iterator(work_dir)) {
+        std::string name = entry.path().filename().string();
+        if (name.rfind("doc.", 0) == 0 || name == "out.pdf") found.push_back(name);
+      }
+      return found;
+    };
+    int frames = 0;
+    bool clean_during = true;
+    auto outcome = grlibre::run_worker(
+        argv, kTypedFodt, std::chrono::milliseconds(120000),
+        256u * 1024 * 1024, [&](std::string&&) {
+          frames++;
+          clean_during = clean_during && document_files().empty();
+          return true;
+        });
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            mode + " documentless render ok: " + outcome.detail);
+    require(frames > 0, mode + " streamed frames");
+    require(clean_during, mode + " work dir holds no document file while streaming");
+    require(document_files().empty(), mode + " work dir holds no document file after");
+    std::error_code ignored;
+    std::filesystem::remove_all(work_dir, ignored);
+  }
+}
+
+// A work dir off tmpfs would put uploaded bytes on disk; the worker must
+// refuse outright instead of falling back.
+void verify_disk_work_dir_is_refused() {
+  std::string base;
+  for (const char* candidate : {"/var/tmp", "/tmp"}) {
+    struct statfs fs;
+    if (::statfs(candidate, &fs) == 0 && fs.f_type != TMPFS_MAGIC) {
+      base = candidate;
+      break;
+    }
+  }
+  if (base.empty()) {
+    std::cerr << "note: every temp candidate is tmpfs here; "
+                 "skipping the disk refusal check\n";
+    return;
+  }
+  std::string pattern = base + "/grlibre-disk-XXXXXX";
+  std::vector<char> buffer(pattern.begin(), pattern.end());
+  buffer.push_back('\0');
+  require(::mkdtemp(buffer.data()) != nullptr, "mkdtemp on disk");
+  std::string work_dir = buffer.data();
+  std::vector<std::string> payloads;
+  std::vector<std::string> argv = {
+      worker_path(), "pages", "txt", "96", "2048",
+      work_dir, lo_install_path(), "all"};
+  auto outcome = grlibre::run_worker(
+      argv, "must not land on disk\n", std::chrono::milliseconds(120000),
+      256u * 1024 * 1024, [&](std::string&& payload) {
+        payloads.push_back(std::move(payload));
+        return true;
+      });
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kCrash,
+          "disk work dir is refused, got detail: " + outcome.detail);
+  require(payloads.empty(), "refusal happens before any frame");
+  require(!std::filesystem::exists(work_dir + "/doc.txt"),
+          "no document bytes were written to the disk work dir");
+  std::error_code ignored;
+  std::filesystem::remove_all(work_dir, ignored);
+}
+
 void verify_corrupt_zip_is_load_failure() {
   // Plain ASCII garbage would not do here: the office core content-sniffs
   // it as text and loads it. A broken zip container is genuinely unloadable
@@ -1610,6 +1705,7 @@ int main() {
   }
   verify_text_pages();
   verify_csv_is_spreadsheet();
+  verify_tsv_is_spreadsheet();
   verify_pdf_mode();
   verify_typed_content();
   verify_typed_spreadsheet();
@@ -1620,6 +1716,8 @@ int main() {
   verify_line_rects();
   verify_docling_mapping();
   verify_marks_content();
+  verify_work_dir_stays_documentless();
+  verify_disk_work_dir_is_refused();
   verify_corrupt_zip_is_load_failure();
   std::cout << "worker-render-test passed\n";
   return 0;
