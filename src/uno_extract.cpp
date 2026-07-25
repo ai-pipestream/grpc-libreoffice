@@ -4071,8 +4071,15 @@ bool export_pdf_stream(const std::string& filter_name, size_t chunk_limit,
     // private:stream routes the store to the OutputStream instead of a URL;
     // the same idiom LOK uses for shape rendering.
     storable->storeToURL("private:stream", descriptor);
-    if (!sink->closed() || sink->total() == 0) {
+    if (sink->total() == 0) {
       *error = "PDF export produced no bytes";
+      return false;
+    }
+    if (!sink->closed()) {
+      // Without closeOutput the sink's buffered tail was never flushed, so
+      // whatever reached the wire is an incomplete PDF.
+      *error = "PDF filter delivered bytes but never closed the output "
+               "stream; the export is incomplete";
       return false;
     }
     *total_bytes = sink->total();

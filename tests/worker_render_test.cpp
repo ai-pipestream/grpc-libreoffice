@@ -1702,19 +1702,19 @@ void verify_work_dir_stays_documentless() {
 // A work dir off tmpfs would put uploaded bytes on disk; the worker must
 // refuse outright instead of falling back.
 void verify_disk_work_dir_is_refused() {
+  // The build tree's own directory is the most reliable disk-backed
+  // candidate: on hosts where every temp path is tmpfs, the sources still
+  // live on real storage.
   std::string base;
-  for (const char* candidate : {"/var/tmp", "/tmp"}) {
+  for (const char* candidate : {"/var/tmp", "/tmp", "."}) {
     struct statfs fs;
     if (::statfs(candidate, &fs) == 0 && fs.f_type != TMPFS_MAGIC) {
       base = candidate;
       break;
     }
   }
-  if (base.empty()) {
-    std::cerr << "note: every temp candidate is tmpfs here; "
-                 "skipping the disk refusal check\n";
-    return;
-  }
+  require(!base.empty(),
+          "no disk-backed directory found to exercise the refusal check");
   std::string pattern = base + "/grlibre-disk-XXXXXX";
   std::vector<char> buffer(pattern.begin(), pattern.end());
   buffer.push_back('\0');
@@ -1730,7 +1730,7 @@ void verify_disk_work_dir_is_refused() {
         payloads.push_back(std::move(payload));
         return true;
       });
-  require(outcome.kind == grlibre::WorkerOutcome::Kind::kCrash,
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kWorkDirNotTmpfs,
           "disk work dir is refused, got detail: " + outcome.detail);
   require(payloads.empty(), "refusal happens before any frame");
   require(!std::filesystem::exists(work_dir + "/doc.txt"),
@@ -1755,7 +1755,7 @@ void verify_corrupt_zip_is_load_failure() {
 
 // A stored-entry OOXML zip truncated right before its central directory:
 // the office core's own broken-ZIP probe classifies it as repairable, so
-// loading it must surface the allow_disk_repair opt-in instead of a
+// loading it must surface the allow_package_repair opt-in instead of a
 // generic load failure. Embedded as bytes because a broken zip cannot be a
 // readable fixture; two intact local file entries ([Content_Types].xml and
 // a minimal word/document.xml), no central directory.
@@ -1798,7 +1798,7 @@ void verify_broken_package_needs_repair_opt_in() {
         });
     require(outcome.kind == grlibre::WorkerOutcome::Kind::kRepairNeedsOptIn,
             "broken package needs the repair opt-in, got detail: " + outcome.detail);
-    require(outcome.detail.find("allow_disk_repair") != std::string::npos,
+    require(outcome.detail.find("allow_package_repair") != std::string::npos,
             "refusal names the opt-in field");
     require(payloads.empty(), "refusal happens before any frame");
     std::error_code ignored;

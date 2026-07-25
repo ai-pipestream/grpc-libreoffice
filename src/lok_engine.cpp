@@ -227,23 +227,35 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     std::string detail = office_error != nullptr ? office_error : "unknown";
     std::free(office_error);
     // A refused load may be a broken package the core would only open
-    // through its repair path, which stages a temp copy of the document
-    // (sfx2 forces one whenever RepairPackage is set). That path is opt-in,
-    // so classify the refusal with the core's own broken-ZIP probe and
-    // report the opt-in instead of a generic load failure. The staged
-    // upload still exists here; it is only unlinked after a successful
-    // load.
-    std::ifstream staged(options.doc_path, std::ios::binary);
-    std::string staged_bytes((std::istreambuf_iterator<char>(staged)),
-                             std::istreambuf_iterator<char>());
+    // through its repair path, which rebuilds a rewritten copy of the
+    // document (sfx2 stages one whenever RepairPackage is set). That path
+    // is opt-in, so classify the refusal with the core's own broken-ZIP
+    // probe and report the opt-in instead of a generic load failure. The
+    // staged upload still exists here; it is only unlinked after a
+    // successful load. Every package format is a ZIP, so four magic bytes
+    // decide whether the full re-read for the probe can pay off at all;
+    // anything else skips it, keeping garbage uploads at one RAM copy.
+    std::string staged_bytes;
+    {
+      std::ifstream staged(options.doc_path, std::ios::binary);
+      char magic[4] = {0, 0, 0, 0};
+      staged.read(magic, sizeof magic);
+      if (staged.gcount() == sizeof magic && magic[0] == 'P' &&
+          magic[1] == 'K') {
+        staged.seekg(0);
+        staged_bytes.assign(std::istreambuf_iterator<char>(staged),
+                            std::istreambuf_iterator<char>());
+      }
+    }
     if (!staged_bytes.empty() && is_repairable_broken_package(staged_bytes)) {
-      if (!options.allow_disk_repair) {
+      if (!options.allow_package_repair) {
         *error = "the document package is broken; the office core can only "
-                 "open it through its repair path, which stages a temp copy "
-                 "of the document and requires the allow_disk_repair opt-in";
+                 "open it through its repair path, which rebuilds a rewritten "
+                 "copy of the document and requires the allow_package_repair "
+                 "opt-in";
         return kExitRepairNeedsOptIn;
       }
-      *error = "allow_disk_repair is set, but this version does not "
+      *error = "allow_package_repair is set, but this version does not "
                "implement the repair path; the broken package cannot be "
                "loaded";
       return kExitRepairUnimplemented;

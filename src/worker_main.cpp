@@ -3,6 +3,7 @@
 // off stdout; isolation comes from this process boundary. A crash or hang
 // in the office core dies here, not in the server.
 
+#include <fcntl.h>
 #include <linux/magic.h>
 #include <sys/vfs.h>
 #include <unistd.h>
@@ -94,7 +95,7 @@ int main(int argc, char** argv) {
   if (argc == 9) {
     std::string repair = argv[8];
     if (repair == "repair") {
-      options.allow_disk_repair = true;
+      options.allow_package_repair = true;
     } else if (repair != "no-repair") {
       std::cerr << "grlibre-worker: unknown repair token \"" << repair
                 << "\" (expected repair or no-repair)\n";
@@ -112,7 +113,7 @@ int main(int argc, char** argv) {
     std::cerr << "grlibre-worker: work dir " << options.work_dir
               << " is not on tmpfs; refusing to write the uploaded document "
                  "to disk\n";
-    return grlibre::kExitRenderFailure;
+    return grlibre::kExitWorkDirNotTmpfs;
   }
   // The extension in the filename is load-bearing: delimiter formats (csv,
   // tsv, txt) fall back to a plain Writer text import without it, and the
@@ -121,14 +122,30 @@ int main(int argc, char** argv) {
   // opened its own descriptors on it.
   options.doc_path = options.work_dir + "/doc." + options.extension;
   {
-    std::ofstream out(options.doc_path, std::ios::binary);
-    out.write(document.data(), static_cast<std::streamsize>(document.size()));
-    // Closing before the check makes a failed final flush (a full tmpfs)
-    // loud instead of silently truncating the document.
-    out.close();
-    if (!out) {
+    // Raw POSIX writes so a failure reports the errno of the write that
+    // actually failed; iostreams do not guarantee errno survives close().
+    int fd = ::open(options.doc_path.c_str(),
+                    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    bool ok = fd >= 0;
+    for (size_t offset = 0; ok && offset < document.size();) {
+      ssize_t wrote = ::write(fd, document.data() + offset,
+                              document.size() - offset);
+      if (wrote < 0) {
+        if (errno == EINTR) continue;
+        ok = false;
+        break;
+      }
+      offset += static_cast<size_t>(wrote);
+    }
+    int saved_errno = errno;
+    if (fd >= 0 && ::close(fd) != 0 && ok) {
+      ok = false;
+      saved_errno = errno;
+    }
+    if (!ok) {
       std::cerr << "grlibre-worker: cannot write " << options.doc_path << ": "
-                << std::strerror(errno) << " (is the tmpfs sized for the document?)\n";
+                << std::strerror(saved_errno)
+                << " (is the tmpfs sized for the document?)\n";
       return grlibre::kExitRenderFailure;
     }
   }

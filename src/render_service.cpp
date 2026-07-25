@@ -83,11 +83,11 @@ void capture_parts(const officev1::ConvertToPdfRequest&, std::string*) {}
 // The repair opt-in may ride any request of the upload stream; true on any
 // request enables it, mirroring how the chunk identity fields resolve.
 void capture_repair(const officev1::StreamPagesRequest& request, bool* repair) {
-  *repair = *repair || request.allow_disk_repair();
+  *repair = *repair || request.allow_package_repair();
 }
 
 void capture_repair(const officev1::ConvertToPdfRequest& request, bool* repair) {
-  *repair = *repair || request.allow_disk_repair();
+  *repair = *repair || request.allow_package_repair();
 }
 
 // A unique 0700 directory for one worker on the service's tmpfs, removed on
@@ -148,7 +148,7 @@ grpc::Status RenderServiceImpl::render(
   std::string filename;
   std::string content_type;
   std::string parts_token;
-  bool allow_disk_repair = false;
+  bool allow_package_repair = false;
   bool saw_complete = false;
 
   Request request;
@@ -158,7 +158,7 @@ grpc::Status RenderServiceImpl::render(
     if (filename.empty()) filename = chunk.filename();
     if (content_type.empty()) content_type = chunk.content_type();
     capture_parts(request, &parts_token);
-    capture_repair(request, &allow_disk_repair);
+    capture_repair(request, &allow_package_repair);
     if (static_cast<long>(bytes.size() + chunk.data().size()) > config_.max_document_bytes) {
       rejected++;
       return {grpc::StatusCode::RESOURCE_EXHAUSTED,
@@ -196,7 +196,7 @@ grpc::Status RenderServiceImpl::render(
       std::to_string(config_.render_dpi), std::to_string(config_.max_side_px),
       work_dir.path(), config_.install_path,
       parts_token.empty() ? "all" : parts_token,
-      allow_disk_repair ? "repair" : "no-repair"};
+      allow_package_repair ? "repair" : "no-repair"};
   // Frames can carry a full page PNG; bound generously above the pixel cap.
   std::uint32_t max_frame = 256u * 1024 * 1024;
   WorkerOutcome outcome = run_worker(
@@ -222,6 +222,9 @@ grpc::Status RenderServiceImpl::render(
     case WorkerOutcome::Kind::kRepairUnimplemented:
       rejected++;
       return {grpc::StatusCode::UNIMPLEMENTED, outcome.detail};
+    case WorkerOutcome::Kind::kWorkDirNotTmpfs:
+      failed++;
+      return {grpc::StatusCode::FAILED_PRECONDITION, outcome.detail};
     case WorkerOutcome::Kind::kTimeout:
       failed++;
       return {grpc::StatusCode::DEADLINE_EXCEEDED,
@@ -263,13 +266,19 @@ grpc::Status RenderServiceImpl::GetServiceInfo(
   response->set_max_document_bytes(config_.max_document_bytes);
   response->set_max_concurrent_documents(config_.max_concurrent_documents);
   response->set_render_dpi(config_.render_dpi);
-  // The diskless posture: document bytes stay in RAM-backed tmpfs, and the
-  // two LibreOffice-internal temp artifacts are named so callers can
+  // The diskless posture: document bytes stay in RAM-backed tmpfs, and
+  // every LibreOffice-internal temp artifact class is named so callers can
   // reason about their own threat model.
   response->set_diskless_documents(true);
   response->add_internal_temp_artifacts(
       "odf-load: LibreOffice keeps one internal temp copy of an ODF package "
       "in the tmpfs work dir until the document closes");
+  response->add_internal_temp_artifacts(
+      "pdf-import: LibreOffice's PDF import stages one full copy of the "
+      "uploaded document in the tmpfs work dir for the document lifetime");
+  response->add_internal_temp_artifacts(
+      "embedded-media: raw bytes of embedded objects and derived bitmaps "
+      "may spill into the tmpfs work dir during a render");
   response->add_internal_temp_artifacts(
       "pdf-export: LibreOffice renders through one internal temp file in "
       "the tmpfs work dir, unlinked right after the store");

@@ -15,6 +15,7 @@ struct WorkerOutcome {
     kLoadFailure,           // office core could not load the document
     kRepairNeedsOptIn,      // broken package; repair not opted into
     kRepairUnimplemented,   // repair opted into but not implemented
+    kWorkDirNotTmpfs,       // deployment error: work dir is not tmpfs
     kTimeout,               // deadline elapsed; worker was killed
     kAborted,               // the frame consumer declined further frames
     kCrash,                 // any other exit, including signals

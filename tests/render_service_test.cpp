@@ -58,14 +58,14 @@ constexpr char kRepairableDocx[] =
 
 StreamResult stream_pages(const std::shared_ptr<grpc::Channel>& channel,
                           const std::string& bytes, const std::string& filename,
-                          bool mark_complete, bool allow_disk_repair = false) {
+                          bool mark_complete, bool allow_package_repair = false) {
   auto stub = officev1::OfficeRenderService::NewStub(channel);
   grpc::ClientContext context;
   auto stream = stub->StreamPages(&context);
   size_t chunk_size = 64 * 1024;
   for (size_t offset = 0; offset < bytes.size() || offset == 0; offset += chunk_size) {
     officev1::StreamPagesRequest request;
-    request.set_allow_disk_repair(allow_disk_repair);
+    request.set_allow_package_repair(allow_package_repair);
     officev1::DocumentChunk* chunk = request.mutable_chunk();
     chunk->set_document_id("test-doc");
     chunk->set_filename(filename);
@@ -125,11 +125,15 @@ int main() {
     require(info.render_dpi() == 96, "dpi reported");
     require(info.supported_formats_size() > 20, "formats reported");
     require(info.diskless_documents(), "diskless posture advertised");
-    require(info.internal_temp_artifacts_size() == 2,
-            "both LibreOffice-internal temp artifacts named");
+    require(info.internal_temp_artifacts_size() == 4,
+            "every LibreOffice-internal temp artifact class named");
     require(info.internal_temp_artifacts(0).find("odf-load") != std::string::npos,
             "ODF load residual named");
-    require(info.internal_temp_artifacts(1).find("pdf-export") != std::string::npos,
+    require(info.internal_temp_artifacts(1).find("pdf-import") != std::string::npos,
+            "PDF import residual named");
+    require(info.internal_temp_artifacts(2).find("embedded-media") != std::string::npos,
+            "embedded media residual named");
+    require(info.internal_temp_artifacts(3).find("pdf-export") != std::string::npos,
             "PDF export residual named");
   }
 
@@ -182,7 +186,7 @@ int main() {
     auto refused = stream_pages(channel, broken, "broken.docx", true);
     require(refused.status.error_code() == grpc::StatusCode::FAILED_PRECONDITION,
             "broken package without the opt-in is FAILED_PRECONDITION");
-    require(refused.status.error_message().find("allow_disk_repair") != std::string::npos,
+    require(refused.status.error_message().find("allow_package_repair") != std::string::npos,
             "refusal names the opt-in field");
     auto opted = stream_pages(channel, broken, "broken.docx", true, true);
     require(opted.status.error_code() == grpc::StatusCode::UNIMPLEMENTED,

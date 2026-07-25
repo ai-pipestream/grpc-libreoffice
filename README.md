@@ -19,9 +19,12 @@ The server exists for three reasons:
    again by every worker; the uploaded document is deleted the moment the
    office core has loaded it, and a produced PDF streams from the export
    filter without ever being staged as a file. The container runs with a
-   read-only root filesystem. The one disk-shaped feature, LibreOffice's
-   broken-package repair, is an explicit per-request opt-in
-   (`allow_disk_repair`) and off by default.
+   read-only root filesystem. One honest limit: tmpfs pages are swappable,
+   so on a host with swap enabled the kernel may page document bytes to the
+   swap device; run swapless or with encrypted swap where that matters.
+   LibreOffice's broken-package repair, which rewrites the upload through
+   the core's own staging, is an explicit per-request opt-in
+   (`allow_package_repair`) and off by default.
 
 ## API
 
@@ -119,15 +122,16 @@ legacy), the OpenDocument families, RTF, CSV, HTML, and plain text.
 Errors are gRPC status codes: `INVALID_ARGUMENT` (no bytes, missing complete
 flag, unresolvable format, or the core cannot load the document),
 `RESOURCE_EXHAUSTED` (over the byte cap), `FAILED_PRECONDITION` (broken
-package needing repair without the `allow_disk_repair` opt-in),
-`UNIMPLEMENTED` (`allow_disk_repair` set, repair path not implemented in
+package needing repair without the `allow_package_repair` opt-in),
+`UNIMPLEMENTED` (`allow_package_repair` set, repair path not implemented in
 this version), `DEADLINE_EXCEEDED` (per-document timeout, worker killed),
 `INTERNAL` (worker crash). Health checking and reflection are registered.
 
 A document whose zip package is broken but repairable is a special case:
-LibreOffice can only open it through its repair path, which stages a temp
-copy of the document. That disk-shaped behaviour is gated behind the
-explicit `allow_disk_repair` request field (default false). By default such
+LibreOffice can only open it through its repair path, which rebuilds the
+package from what it can salvage and stages that copy through the core's
+own temp machinery. Accepting a rewritten document is gated behind the
+explicit `allow_package_repair` request field (default false). By default such
 a document fails with `FAILED_PRECONDITION` naming the field; the current
 version does not implement the repair interaction itself, so opting in
 turns the failure into `UNIMPLEMENTED` rather than repairing. A broken
@@ -165,7 +169,8 @@ way. The document is staged there just long enough for the office core to
 open it and is unlinked the moment the load returns (the core keeps its own
 descriptors, so lazy reads of embedded media keep working). The core's own
 temp spills (`TMPDIR`) are pinned inside the same tmpfs: an ODF load keeps
-a full package copy there for the document's lifetime, and embedded media
+a full package copy there for the document's lifetime, a PDF upload is
+staged in full by the office core's PDF import, and embedded media
 spill their raw bytes plus derived bitmaps, so size the tmpfs for the
 document plus those spills, times the number of concurrent workers. In pdf
 mode the PDF streams straight from the export filter's output stream into
