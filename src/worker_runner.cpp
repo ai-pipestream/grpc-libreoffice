@@ -30,13 +30,43 @@ void write_input(int fd, const std::string& bytes) {
   }
 }
 
+// How long finish() waits for a worker whose stdout has closed to actually
+// exit before killing it. Normally exit follows the last write within
+// milliseconds (_exit right after run_render); a wedged process that closed
+// its stream but lives on would otherwise hold the caller's concurrency
+// slot forever.
+constexpr std::chrono::milliseconds kReapGrace{2000};
+
 WorkerOutcome finish(pid_t pid, bool kill_first, WorkerOutcome::Kind kind_on_exit_ok,
                      const std::string& detail) {
   if (kill_first) ::kill(pid, SIGKILL);
   int status = 0;
-  while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+  bool reaped = false;
+  const auto reap_deadline = std::chrono::steady_clock::now() + kReapGrace;
+  for (;;) {
+    pid_t got = ::waitpid(pid, &status, WNOHANG);
+    if (got == pid) {
+      reaped = true;
+      break;
+    }
+    if (got < 0 && errno != EINTR) break;
+    if (std::chrono::steady_clock::now() >= reap_deadline) break;
+    ::poll(nullptr, 0, 10);
+  }
+  bool forced = false;
+  if (!reaped) {
+    forced = true;
+    ::kill(pid, SIGKILL);
+    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+  }
   WorkerOutcome outcome;
   outcome.detail = detail;
+  if (forced && kind_on_exit_ok == WorkerOutcome::Kind::kOk) {
+    outcome.kind = WorkerOutcome::Kind::kCrash;
+    outcome.detail = "worker closed its stream but did not exit; killed "
+                     "after the reap grace";
+    return outcome;
+  }
   if (kind_on_exit_ok != WorkerOutcome::Kind::kOk) {
     outcome.kind = kind_on_exit_ok;
     return outcome;
