@@ -8,6 +8,7 @@
 #include <grpcpp/health_check_service_interface.h>
 #include <linux/magic.h>
 #include <signal.h>
+#include <sys/eventfd.h>
 #include <sys/vfs.h>
 #include <unistd.h>
 
@@ -68,8 +69,14 @@ std::string detect_libreoffice_version() {
 
 std::unique_ptr<grpc::Server> g_server;
 
+// The handler only pokes an eventfd: grpc::Server::Shutdown allocates and
+// takes locks, none of which is async-signal-safe, so the actual shutdown
+// runs on a dedicated thread woken by this write.
+int g_shutdown_fd = -1;
+
 void handle_shutdown(int) {
-  if (g_server != nullptr) g_server->Shutdown();
+  uint64_t one = 1;
+  [[maybe_unused]] ssize_t wrote = ::write(g_shutdown_fd, &one, sizeof one);
 }
 
 }  // namespace
@@ -132,6 +139,16 @@ int main() {
             << " tmpfs=" << config.tmpfs_dir
             << " core=\"" << config.libreoffice_version << "\"" << std::endl;
 
+  g_shutdown_fd = ::eventfd(0, EFD_CLOEXEC);
+  if (g_shutdown_fd < 0) {
+    std::cerr << "Startup failed: cannot create the shutdown eventfd\n";
+    return 1;
+  }
+  std::thread shutdown_thread([] {
+    uint64_t value = 0;
+    while (::read(g_shutdown_fd, &value, sizeof value) < 0 && errno == EINTR) {}
+    g_server->Shutdown();
+  });
   ::signal(SIGINT, handle_shutdown);
   ::signal(SIGTERM, handle_shutdown);
 
@@ -149,5 +166,8 @@ int main() {
   }
 
   g_server->Wait();
+  // Wait() only returns after Shutdown(), so the thread has finished its
+  // one read-then-shutdown pass by now.
+  shutdown_thread.join();
   return 0;
 }

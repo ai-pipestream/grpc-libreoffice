@@ -2,11 +2,17 @@
 // everywhere; the happy path needs LibreOffice and is skipped without it.
 
 #include <grpcpp/grpcpp.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <thread>
 
 #include "ai/pipestream/office/v1/office_service.grpc.pb.h"
 #include "render_service.h"
@@ -208,6 +214,62 @@ int main() {
   }
 
   server->Shutdown();
+
+  // SIGTERM must shut the real binary down cleanly: the handler only pokes
+  // an eventfd and the actual grpc Shutdown runs on a plain thread, so the
+  // exit is orderly (code 0) instead of a signal-context deadlock gamble.
+  // Runs against the built server because main() owns the signal wiring.
+  {
+    const char* server_bin = std::getenv("GRLIBRE_SERVER");
+    require(server_bin != nullptr, "GRLIBRE_SERVER must point at the server binary");
+    // Grab an ephemeral port and hand it to the child; the close-to-exec
+    // reuse window is a benign test-only race.
+    int probe = ::socket(AF_INET, SOCK_STREAM, 0);
+    require(probe >= 0, "probe socket");
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    require(::bind(probe, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == 0,
+            "probe bind");
+    socklen_t addr_len = sizeof addr;
+    require(::getsockname(probe, reinterpret_cast<sockaddr*>(&addr), &addr_len) == 0,
+            "probe getsockname");
+    int free_port = ntohs(addr.sin_port);
+    ::close(probe);
+
+    pid_t pid = ::fork();
+    require(pid >= 0, "fork server");
+    if (pid == 0) {
+      ::setenv("GRLIBRE_PORT", std::to_string(free_port).c_str(), 1);
+      ::setenv("GRLIBRE_METRICS_INTERVAL_SECONDS", "0", 1);
+      ::execl(server_bin, server_bin, nullptr);
+      ::_exit(127);
+    }
+    bool up = false;
+    for (int attempt = 0; attempt < 300 && !up; attempt++) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      int s = ::socket(AF_INET, SOCK_STREAM, 0);
+      addr.sin_port = htons(free_port);
+      up = ::connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == 0;
+      ::close(s);
+      int status = 0;
+      require(::waitpid(pid, &status, WNOHANG) == 0,
+              "server stays up while the test waits for its port");
+    }
+    require(up, "server came up on its port");
+    require(::kill(pid, SIGTERM) == 0, "SIGTERM sent");
+    int status = 0;
+    bool exited = false;
+    for (int attempt = 0; attempt < 100 && !exited; attempt++) {
+      exited = ::waitpid(pid, &status, WNOHANG) == pid;
+      if (!exited) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!exited) ::kill(pid, SIGKILL);
+    require(exited, "server exited within the bound after SIGTERM");
+    require(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+            "SIGTERM exit is an orderly code 0");
+  }
+
   std::cout << "render-service-test passed\n";
   return 0;
 }

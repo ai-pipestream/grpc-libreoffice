@@ -1916,6 +1916,27 @@ void verify_hung_worker_is_killed_at_deadline() {
               + std::to_string(elapsed.count()) + " ms");
 }
 
+// A worker that closes its stream but never exits must not hold the caller
+// (and its concurrency slot) forever: finish() reaps it after a bounded
+// grace and reports the abnormal exit. A stub that closes stdout then
+// sleeps stands in for a wedged process.
+void verify_eof_without_exit_is_reaped() {
+  auto begin = std::chrono::steady_clock::now();
+  auto outcome = grlibre::run_worker(
+      {"/bin/sh", "-c", "exec 1>&-; exec sleep 600"}, "",
+      std::chrono::milliseconds(120000), 256u * 1024 * 1024,
+      [&](std::string&&) { return true; });
+  auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - begin);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kCrash,
+          "eof-without-exit surfaces as a crash, got: " + outcome.detail);
+  require(outcome.detail.find("did not exit") != std::string::npos,
+          "the reap detail names the condition, got: " + outcome.detail);
+  require(elapsed.count() >= 1900 && elapsed.count() < 8000,
+          "reap happens at the grace bound, took "
+              + std::to_string(elapsed.count()) + " ms");
+}
+
 }  // namespace
 
 int main() {
@@ -1944,6 +1965,7 @@ int main() {
   verify_html_renders_and_exits_promptly();
   verify_death_before_status_is_crash();
   verify_hung_worker_is_killed_at_deadline();
+  verify_eof_without_exit_is_reaped();
   std::cout << "worker-render-test passed\n";
   return 0;
 }

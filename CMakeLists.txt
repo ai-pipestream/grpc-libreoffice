@@ -197,6 +197,6 @@ if(BUILD_TESTING)
     add_test(NAME ${test_name} COMMAND ${test_name})
   endforeach()
   set_tests_properties(worker-render-test render-service-test PROPERTIES
-    ENVIRONMENT "GRLIBRE_WORKER=$<TARGET_FILE:grlibre-worker>"
+    ENVIRONMENT "GRLIBRE_WORKER=$<TARGET_FILE:grlibre-worker>;GRLIBRE_SERVER=$<TARGET_FILE:grlibre-server>"
     SKIP_RETURN_CODE 77)
 endif()
