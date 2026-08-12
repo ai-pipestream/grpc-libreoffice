@@ -6,6 +6,7 @@ compile_commands.json
 # demo/bench artifacts
 bench/.venv/
 bench/gen/
+bench/__pycache__/
 bench/last-run.json
 fixtures/*
 !fixtures/fetch.sh

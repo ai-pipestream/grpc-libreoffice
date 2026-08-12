@@ -49,6 +49,11 @@ struct RenderOptions {
   int dpi = 144;
   // Per-side pixel bound; a page is downscaled to fit.
   int max_side_px = 4096;
+  // 1-based inclusive page range for pages mode; 0 means unbounded on that
+  // side. Pages outside the range are never painted. Emitted PageImage
+  // indexes stay document-absolute.
+  int first_page = 0;
+  int last_page = 0;
   // Uploaded byte count, echoed into RenderStatus.
   long input_bytes = 0;
   // Which parts to emit; defaults to every part.

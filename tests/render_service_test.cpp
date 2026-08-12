@@ -13,6 +13,7 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "ai/pipestream/office/v1/office_service.grpc.pb.h"
 #include "render_service.h"
@@ -37,6 +38,7 @@ struct StreamResult {
   bool got_status = false;
   int first_page_dpi = 0;
   int first_page_width_px = 0;
+  std::vector<int> page_indexes;
 };
 
 // A stored-entry OOXML zip truncated right before its central directory:
@@ -67,7 +69,8 @@ constexpr char kRepairableDocx[] =
 StreamResult stream_pages(const std::shared_ptr<grpc::Channel>& channel,
                           const std::string& bytes, const std::string& filename,
                           bool mark_complete, bool allow_package_repair = false,
-                          int render_dpi = 0) {
+                          int render_dpi = 0, int first_page = 0,
+                          int last_page = 0) {
   auto stub = officev1::OfficeRenderService::NewStub(channel);
   grpc::ClientContext context;
   auto stream = stub->StreamPages(&context);
@@ -77,6 +80,10 @@ StreamResult stream_pages(const std::shared_ptr<grpc::Channel>& channel,
     request.set_allow_package_repair(allow_package_repair);
     if (offset == 0 && render_dpi != 0) {
       request.mutable_options()->set_render_dpi(render_dpi);
+    }
+    if (offset == 0 && (first_page != 0 || last_page != 0)) {
+      request.mutable_options()->set_first_page(first_page);
+      request.mutable_options()->set_last_page(last_page);
     }
     officev1::DocumentChunk* chunk = request.mutable_chunk();
     chunk->set_document_id("test-doc");
@@ -98,6 +105,7 @@ StreamResult stream_pages(const std::shared_ptr<grpc::Channel>& channel,
         result.first_page_dpi = response.page_image().dpi();
         result.first_page_width_px = response.page_image().width_px();
       }
+      result.page_indexes.push_back(response.page_image().index());
       result.pages++;
     }
     if (response.has_paragraph()) result.paragraphs++;
@@ -224,6 +232,48 @@ int main() {
             "over-range dpi clamps to the ceiling (pixel bound may lower it)");
     require(high.first_page_width_px > base.first_page_width_px,
             "clamped high dpi still paints more pixels than the default");
+  }
+
+  // The page range: a three-page text document (form feeds break pages in
+  // the Writer text import) painted with first_page/last_page restrictions.
+  // The range trims only PageImage events; DocumentInfo keeps the full
+  // count, emitted indexes stay document-absolute, a range past the end is
+  // an empty but successful render, and a backwards range is rejected
+  // before any worker spawns.
+  {
+    const std::string three_pages = "Page one.\fPage two.\fPage three.\n";
+    auto all = stream_pages(channel, three_pages, "multi.txt", true);
+    require(all.status.ok(), "three-page baseline renders");
+    require(all.pages == 3, "baseline paints every page");
+    require(all.info.page_count() == 3, "baseline page count");
+
+    auto middle = stream_pages(channel, three_pages, "multi.txt", true, false,
+                               0, 2, 2);
+    require(middle.status.ok(), "ranged render ok");
+    require(middle.pages == 1, "range 2:2 paints exactly one page");
+    require(middle.page_indexes == std::vector<int>{1},
+            "ranged page keeps its document-absolute index");
+    require(middle.info.page_count() == 3,
+            "ranged DocumentInfo keeps the full page count");
+    require(middle.paragraphs == all.paragraphs,
+            "typed content is unaffected by the page range");
+
+    auto tail = stream_pages(channel, three_pages, "multi.txt", true, false,
+                             0, 2, 0);
+    require(tail.status.ok(), "open-ended range ok");
+    require(tail.page_indexes == (std::vector<int>{1, 2}),
+            "open-ended range paints from first_page to the end");
+
+    auto beyond = stream_pages(channel, three_pages, "multi.txt", true, false,
+                               0, 7, 9);
+    require(beyond.status.ok(), "past-the-end range is not an error");
+    require(beyond.pages == 0, "past-the-end range paints nothing");
+    require(beyond.got_status, "past-the-end range still ends with status");
+
+    auto backwards = stream_pages(channel, three_pages, "multi.txt", true,
+                                  false, 0, 3, 2);
+    require(backwards.status.error_code() == grpc::StatusCode::INVALID_ARGUMENT,
+            "backwards range is INVALID_ARGUMENT");
   }
 
   // An HTML upload once failed at the finish line: LibreOffice's exit-time

@@ -155,6 +155,9 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
   });
 
   for (size_t index = 0; encoder_ok && index < pages.size(); index++) {
+    int page_number = static_cast<int>(index) + 1;
+    if (options.first_page > 0 && page_number < options.first_page) continue;
+    if (options.last_page > 0 && page_number > options.last_page) continue;
     const PageRect& page = pages[index];
     document->setPart(page.part);
     double scale = options.dpi / kTwipsPerInch;

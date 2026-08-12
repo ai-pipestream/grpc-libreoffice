@@ -75,10 +75,10 @@ constexpr char kProfileSeed[] =
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 7 || argc > 9) {
+  if (argc < 7 || argc > 10) {
     std::cerr << "usage: grlibre-worker <pages|pdf> <extension> <dpi> "
                  "<max_side_px> <work_dir> <install_path> "
-                 "[parts [repair|no-repair]]\n";
+                 "[parts [repair|no-repair [first:last]]]\n";
     return grlibre::kExitRenderFailure;
   }
   grlibre::RenderOptions options;
@@ -92,13 +92,35 @@ int main(int argc, char** argv) {
   if (argc >= 8) options.parts = parse_parts(argv[7]);
   // The broken-package repair opt-in. Absent means refuse, matching the
   // wire default; an unknown token is a caller bug and fails loudly.
-  if (argc == 9) {
+  if (argc >= 9) {
     std::string repair = argv[8];
     if (repair == "repair") {
       options.allow_package_repair = true;
     } else if (repair != "no-repair") {
       std::cerr << "grlibre-worker: unknown repair token \"" << repair
                 << "\" (expected repair or no-repair)\n";
+      return grlibre::kExitRenderFailure;
+    }
+  }
+  // The 1-based inclusive page range as "first:last"; 0 means unbounded on
+  // that side. Absent means every page. The server validated ordering; a
+  // malformed token here is a caller bug and fails loudly.
+  if (argc == 10) {
+    std::string range = argv[9];
+    size_t colon = range.find(':');
+    char* first_end = nullptr;
+    char* last_end = nullptr;
+    if (colon != std::string::npos) {
+      options.first_page =
+          static_cast<int>(std::strtol(range.c_str(), &first_end, 10));
+      options.last_page = static_cast<int>(
+          std::strtol(range.c_str() + colon + 1, &last_end, 10));
+    }
+    if (colon == std::string::npos || first_end != range.c_str() + colon
+        || *last_end != '\0' || options.first_page < 0
+        || options.last_page < 0) {
+      std::cerr << "grlibre-worker: malformed page range token \"" << range
+                << "\" (expected first:last)\n";
       return grlibre::kExitRenderFailure;
     }
   }

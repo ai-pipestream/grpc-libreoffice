@@ -90,6 +90,25 @@ void capture_dpi(const officev1::StreamPagesRequest& request, int* dpi) {
 
 void capture_dpi(const officev1::ConvertToPdfRequest&, int*) {}
 
+// The page range rides StreamOptions and resolves as one pair: the first
+// request with either bound nonzero wins. Validated after upload; the
+// worker receives it as one "first:last" argv token. PDF mode always
+// renders the whole document.
+struct PageRange {
+  int first = 0;
+  int last = 0;
+};
+
+void capture_range(const officev1::StreamPagesRequest& request,
+                   PageRange* range) {
+  if (range->first == 0 && range->last == 0) {
+    range->first = request.options().first_page();
+    range->last = request.options().last_page();
+  }
+}
+
+void capture_range(const officev1::ConvertToPdfRequest&, PageRange*) {}
+
 // The repair opt-in may ride any request of the upload stream; true on any
 // request enables it, mirroring how the chunk identity fields resolve.
 void capture_repair(const officev1::StreamPagesRequest& request, bool* repair) {
@@ -159,6 +178,7 @@ grpc::Status RenderServiceImpl::render(
   std::string content_type;
   std::string parts_token;
   int requested_dpi = 0;
+  PageRange page_range;
   bool allow_package_repair = false;
   bool saw_complete = false;
 
@@ -170,6 +190,7 @@ grpc::Status RenderServiceImpl::render(
     if (content_type.empty()) content_type = chunk.content_type();
     capture_parts(request, &parts_token);
     capture_dpi(request, &requested_dpi);
+    capture_range(request, &page_range);
     capture_repair(request, &allow_package_repair);
     if (static_cast<long>(bytes.size() + chunk.data().size()) > config_.max_document_bytes) {
       rejected++;
@@ -195,6 +216,14 @@ grpc::Status RenderServiceImpl::render(
             "cannot determine source format from filename \"" + filename
                 + "\" or content type \"" + content_type + "\""};
   }
+  if (page_range.first < 0 || page_range.last < 0
+      || (page_range.first > 0 && page_range.last > 0
+          && page_range.first > page_range.last)) {
+    rejected++;
+    return {grpc::StatusCode::INVALID_ARGUMENT,
+            "invalid page range: first_page " + std::to_string(page_range.first)
+                + ", last_page " + std::to_string(page_range.last)};
+  }
 
   SlotGuard slot(*this);
   ScopedWorkDir work_dir(config_.tmpfs_dir);
@@ -211,7 +240,8 @@ grpc::Status RenderServiceImpl::render(
       std::to_string(render_dpi), std::to_string(config_.max_side_px),
       work_dir.path(), config_.install_path,
       parts_token.empty() ? "all" : parts_token,
-      allow_package_repair ? "repair" : "no-repair"};
+      allow_package_repair ? "repair" : "no-repair",
+      std::to_string(page_range.first) + ":" + std::to_string(page_range.last)};
   // Frames can carry a full page PNG; bound generously above the pixel cap.
   std::uint32_t max_frame = 256u * 1024 * 1024;
   WorkerOutcome outcome = run_worker(

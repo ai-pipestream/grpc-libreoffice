@@ -102,8 +102,12 @@ at STANDARD plus COMMENTS):
   The work behind an unselected part is skipped, not just its emission.
   `StreamOptions` also carries an optional per-request `render_dpi`
   (clamped to 24–600, zero means the server default); every page reports
-  the DPI it actually rendered at in `PageImage.dpi`.
-  `DocumentInfo` and `RenderStatus` are always sent.
+  the DPI it actually rendered at in `PageImage.dpi`. A 1-based inclusive
+  `first_page`/`last_page` range restricts which pages are painted at all
+  (zero means unbounded on that side): pages outside it are never rendered,
+  while `DocumentInfo` keeps the full page count and typed content is
+  unaffected — page 50 of a 224-page document costs one page's paint, not
+  224. `DocumentInfo` and `RenderStatus` are always sent.
   `DocumentInfo` also carries the layout rectangle of every page in the
   same twips space the typed positions use, so a consumer can map any
   document-absolute position to page-local coordinates.
