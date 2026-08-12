@@ -13,6 +13,11 @@
 
 namespace grlibre {
 
+// Bounds for the render DPI, shared by the GRLIBRE_RENDER_DPI environment
+// default and the per-request StreamOptions.render_dpi override.
+inline constexpr int kMinRenderDpi = 24;
+inline constexpr int kMaxRenderDpi = 600;
+
 // Server-side configuration shared by every request.
 struct ServiceConfig {
   std::string worker_path;

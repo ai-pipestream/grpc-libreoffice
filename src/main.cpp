@@ -94,7 +94,9 @@ int main() {
     config.max_concurrent_documents = int_from_env("GRLIBRE_MAX_CONCURRENT_DOCUMENTS", 2, 1, 64);
     config.task_deadline = std::chrono::milliseconds(
         1000L * int_from_env("GRLIBRE_TASK_TIMEOUT_SECONDS", 120, 5, 3600));
-    config.render_dpi = int_from_env("GRLIBRE_RENDER_DPI", 144, 24, 600);
+    config.render_dpi = int_from_env("GRLIBRE_RENDER_DPI", 144,
+                                     grlibre::kMinRenderDpi,
+                                     grlibre::kMaxRenderDpi);
     config.max_side_px = int_from_env("GRLIBRE_MAX_PAGE_PIXELS", 4096, 256, 16384);
     metrics_interval = int_from_env("GRLIBRE_METRICS_INTERVAL_SECONDS", 60, 0, 86400);
   } catch (const std::exception& bad_config) {

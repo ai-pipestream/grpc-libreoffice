@@ -55,10 +55,11 @@ def upload_requests(path, request_cls, options=None):
         offset = end
 
 
-def run_pages(stub, path, pages_only):
+def run_pages(stub, path, pages_only, dpi=0):
     options = None
-    if pages_only:
-        options = pb.StreamOptions(parts=[pb.DOCUMENT_PART_PAGES])
+    if pages_only or dpi:
+        parts = [pb.DOCUMENT_PART_PAGES] if pages_only else []
+        options = pb.StreamOptions(parts=parts, render_dpi=dpi)
     start = time.perf_counter()
     m = {"ttfb": None, "ttfp": None, "pages": 0, "out_bytes": 0,
          "events": 0, "render_millis": None}
@@ -102,10 +103,10 @@ def run_pdf(stub, path):
     return m
 
 
-def run_one(stub, path, mode):
+def run_one(stub, path, mode, dpi=0):
     if mode == "pdf":
         return run_pdf(stub, path)
-    return run_pages(stub, path, pages_only=(mode == "pages-only"))
+    return run_pages(stub, path, pages_only=(mode == "pages-only"), dpi=dpi)
 
 
 def fmt_ms(seconds):
@@ -139,6 +140,10 @@ def main():
     ap.add_argument("--modes", default="pages-only,pages-full,pdf")
     ap.add_argument("--concurrency", default="1,2,4",
                     help="comma list for the throughput sweep; empty to skip")
+    ap.add_argument("--dpi", type=int, default=0,
+                    help="per-request render DPI override for the pages "
+                         "modes (StreamOptions.render_dpi); 0 = server "
+                         "default")
     ap.add_argument("--json", dest="json_out", default=None)
     args = ap.parse_args()
 
@@ -176,8 +181,8 @@ def main():
         for mode in modes:
             try:
                 for _ in range(args.warmup):
-                    run_one(stub, path, mode)
-                runs = [run_one(stub, path, mode)
+                    run_one(stub, path, mode, args.dpi)
+                runs = [run_one(stub, path, mode, args.dpi)
                         for _ in range(args.iterations)]
             except grpc.RpcError as e:
                 rows.append([name, mode, f"{size_kib:.0f}", "ERR",
@@ -210,7 +215,7 @@ def main():
             pages = 0
             failed = 0
             with concurrent.futures.ThreadPoolExecutor(level) as pool:
-                futs = [pool.submit(run_one, stub, f, "pages-only")
+                futs = [pool.submit(run_one, stub, f, "pages-only", args.dpi)
                         for f in jobs]
                 for fut in concurrent.futures.as_completed(futs):
                     try:

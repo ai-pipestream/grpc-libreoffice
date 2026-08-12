@@ -100,6 +100,9 @@ at STANDARD plus COMMENTS):
   rectangles to individual table cells (`TableCellData.line_rects`) at one
   selection round-trip per cell and therefore must be listed explicitly.
   The work behind an unselected part is skipped, not just its emission.
+  `StreamOptions` also carries an optional per-request `render_dpi`
+  (clamped to 24–600, zero means the server default); every page reports
+  the DPI it actually rendered at in `PageImage.dpi`.
   `DocumentInfo` and `RenderStatus` are always sent.
   `DocumentInfo` also carries the layout rectangle of every page in the
   same twips space the typed positions use, so a consumer can map any
@@ -188,7 +191,7 @@ anywhere.
 | `GRLIBRE_MAX_DOCUMENT_MIB` | `100` | Per-document byte cap |
 | `GRLIBRE_MAX_CONCURRENT_DOCUMENTS` | `2` | Worker processes in flight |
 | `GRLIBRE_TASK_TIMEOUT_SECONDS` | `120` | Per-document deadline |
-| `GRLIBRE_RENDER_DPI` | `144` | Requested page render DPI |
+| `GRLIBRE_RENDER_DPI` | `144` | Default page render DPI; a request may override it via `StreamOptions.render_dpi` |
 | `GRLIBRE_MAX_PAGE_PIXELS` | `4096` | Per-side pixel bound; pages downscale to fit |
 | `GRLIBRE_LO_PATH` | `/usr/lib/libreoffice/program` | LibreOffice installation |
 | `GRLIBRE_TMPFS_DIR` | `/dev/shm` | tmpfs for per-worker work dirs; startup fails if it is not tmpfs |
@@ -242,3 +245,6 @@ counts.](docs/frontend.png)
 - `scripts/e2e-smoke.sh` boots a private server on a free port, streams a
   fixture through both RPCs, and fails loudly on any regression — the
   quickest "is the tree healthy" check after a build.
+- `scripts/demo.sh` is the one-command demo: builds the server if needed,
+  boots it and the frontend (idempotently), verifies the wiring, and prints
+  the URL. `scripts/demo.sh --stop` tears both down.

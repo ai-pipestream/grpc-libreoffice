@@ -8,6 +8,8 @@ Measures per-document latency and whole-service throughput against a running
 ./run.sh                      # venv + stub generation + full run
 ./run.sh --iterations 5 --concurrency 1,2,4,8 --json results.json
 ./run.sh --files ../fixtures/sample4.docx --modes pdf
+./run.sh --modes pages-only --dpi 72   # per-request DPI override
+./test.sh                     # unit tests (no server needed)
 ```
 
 Three modes per file:

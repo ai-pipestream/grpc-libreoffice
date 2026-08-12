@@ -35,6 +35,8 @@ struct StreamResult {
   int paragraphs = 0;
   bool got_metadata = false;
   bool got_status = false;
+  int first_page_dpi = 0;
+  int first_page_width_px = 0;
 };
 
 // A stored-entry OOXML zip truncated right before its central directory:
@@ -64,7 +66,8 @@ constexpr char kRepairableDocx[] =
 
 StreamResult stream_pages(const std::shared_ptr<grpc::Channel>& channel,
                           const std::string& bytes, const std::string& filename,
-                          bool mark_complete, bool allow_package_repair = false) {
+                          bool mark_complete, bool allow_package_repair = false,
+                          int render_dpi = 0) {
   auto stub = officev1::OfficeRenderService::NewStub(channel);
   grpc::ClientContext context;
   auto stream = stub->StreamPages(&context);
@@ -72,6 +75,9 @@ StreamResult stream_pages(const std::shared_ptr<grpc::Channel>& channel,
   for (size_t offset = 0; offset < bytes.size() || offset == 0; offset += chunk_size) {
     officev1::StreamPagesRequest request;
     request.set_allow_package_repair(allow_package_repair);
+    if (offset == 0 && render_dpi != 0) {
+      request.mutable_options()->set_render_dpi(render_dpi);
+    }
     officev1::DocumentChunk* chunk = request.mutable_chunk();
     chunk->set_document_id("test-doc");
     chunk->set_filename(filename);
@@ -87,7 +93,13 @@ StreamResult stream_pages(const std::shared_ptr<grpc::Channel>& channel,
   officev1::StreamPagesResponse response;
   while (stream->Read(&response)) {
     if (response.has_document_info()) result.info = response.document_info();
-    if (response.has_page_image()) result.pages++;
+    if (response.has_page_image()) {
+      if (result.pages == 0) {
+        result.first_page_dpi = response.page_image().dpi();
+        result.first_page_width_px = response.page_image().width_px();
+      }
+      result.pages++;
+    }
     if (response.has_paragraph()) result.paragraphs++;
     if (response.has_metadata()) result.got_metadata = true;
     if (response.has_status()) result.got_status = true;
@@ -182,6 +194,36 @@ int main() {
     require(result.got_metadata, "metadata event relayed through the service");
     require(result.paragraphs >= 1, "paragraph events relayed through the service");
     require(result.got_status, "final status emitted");
+  }
+
+  // The per-request DPI override: a 48-dpi render of the same document must
+  // report 48 in PageImage.dpi and paint half the pixels per side of the
+  // server's 96-dpi default. Out-of-range values clamp to [24, 600] instead
+  // of failing or being forwarded raw.
+  {
+    auto base = stream_pages(channel, "Hello over gRPC.\n", "hello.txt", true);
+    require(base.status.ok(), "dpi baseline renders");
+    require(base.first_page_dpi == 96, "baseline uses the configured dpi");
+
+    auto half = stream_pages(channel, "Hello over gRPC.\n", "hello.txt", true,
+                             false, 48);
+    require(half.status.ok(), "dpi override renders");
+    require(half.first_page_dpi == 48, "override dpi reported per page");
+    require(half.first_page_width_px * 2 == base.first_page_width_px,
+            "48-dpi page paints half the pixels per side of the 96-dpi page");
+
+    auto low = stream_pages(channel, "Hello over gRPC.\n", "hello.txt", true,
+                            false, 1);
+    require(low.status.ok(), "under-range dpi renders");
+    require(low.first_page_dpi == 24, "under-range dpi clamps to the floor");
+
+    auto high = stream_pages(channel, "Hello over gRPC.\n", "hello.txt", true,
+                             false, 100000);
+    require(high.status.ok(), "over-range dpi renders");
+    require(high.first_page_dpi <= 600,
+            "over-range dpi clamps to the ceiling (pixel bound may lower it)");
+    require(high.first_page_width_px > base.first_page_width_px,
+            "clamped high dpi still paints more pixels than the default");
   }
 
   // An HTML upload once failed at the finish line: LibreOffice's exit-time

@@ -1,5 +1,6 @@
 #include "render_service.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <unordered_map>
@@ -80,6 +81,15 @@ void capture_parts(const officev1::StreamPagesRequest& request,
 // PDF mode emits no typed content, so its request carries no selector.
 void capture_parts(const officev1::ConvertToPdfRequest&, std::string*) {}
 
+// The per-request DPI override rides StreamOptions; the first nonzero value
+// wins, matching how the parts list resolves. PDF mode does not rasterize
+// pages, so its request carries no override.
+void capture_dpi(const officev1::StreamPagesRequest& request, int* dpi) {
+  if (*dpi == 0) *dpi = request.options().render_dpi();
+}
+
+void capture_dpi(const officev1::ConvertToPdfRequest&, int*) {}
+
 // The repair opt-in may ride any request of the upload stream; true on any
 // request enables it, mirroring how the chunk identity fields resolve.
 void capture_repair(const officev1::StreamPagesRequest& request, bool* repair) {
@@ -148,6 +158,7 @@ grpc::Status RenderServiceImpl::render(
   std::string filename;
   std::string content_type;
   std::string parts_token;
+  int requested_dpi = 0;
   bool allow_package_repair = false;
   bool saw_complete = false;
 
@@ -158,6 +169,7 @@ grpc::Status RenderServiceImpl::render(
     if (filename.empty()) filename = chunk.filename();
     if (content_type.empty()) content_type = chunk.content_type();
     capture_parts(request, &parts_token);
+    capture_dpi(request, &requested_dpi);
     capture_repair(request, &allow_package_repair);
     if (static_cast<long>(bytes.size() + chunk.data().size()) > config_.max_document_bytes) {
       rejected++;
@@ -191,9 +203,12 @@ grpc::Status RenderServiceImpl::render(
     return {grpc::StatusCode::INTERNAL, "cannot create worker directory"};
   }
 
+  int render_dpi = requested_dpi != 0
+                       ? std::clamp(requested_dpi, kMinRenderDpi, kMaxRenderDpi)
+                       : config_.render_dpi;
   std::vector<std::string> argv = {
       config_.worker_path, mode, extension,
-      std::to_string(config_.render_dpi), std::to_string(config_.max_side_px),
+      std::to_string(render_dpi), std::to_string(config_.max_side_px),
       work_dir.path(), config_.install_path,
       parts_token.empty() ? "all" : parts_token,
       allow_package_repair ? "repair" : "no-repair"};

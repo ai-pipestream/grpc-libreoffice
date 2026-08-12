@@ -138,6 +138,14 @@ message StreamOptions {
   // DOCUMENT_PART_UNSPECIFIED entries are ignored; order and duplicates do
   // not matter.
   repeated DocumentPart parts = 1;
+  // Requested render DPI for this document's page images, overriding the
+  // server's configured default for this request only. Zero or absent means
+  // the server default. Nonzero values are clamped to [24, 600]; a page may
+  // still render below the resolved DPI when it would otherwise exceed the
+  // server's per-side pixel bound. The DPI each page actually rendered at is
+  // reported in PageImage.dpi. Resolved across the upload stream like parts:
+  // the first nonzero value wins.
+  int32 render_dpi = 2;
 }
 
 // StreamPagesRequest carries one upload chunk of a StreamPages call.
