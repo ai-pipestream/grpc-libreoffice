@@ -258,6 +258,48 @@ int main() {
     }
   }
 
+  // The format dispatch: JPEG and WebP outputs carry their magic bytes,
+  // decode-compatible geometry is the encoder's own concern, and PNG through
+  // encode_image is byte-identical to encode_png. Lossy quality must move
+  // the size on a continuous-tone fixture.
+  {
+    const Fixture photo = make_fixtures()[2];
+    std::string via_dispatch = grlibre::encode_image(
+        photo.rgba.data(), photo.width, photo.height, /*bgra=*/false,
+        grlibre::ImageFormat::kPng, 85);
+    std::string direct = grlibre::encode_png(photo.rgba.data(), photo.width,
+                                             photo.height, /*bgra=*/false);
+    require(via_dispatch == direct, "PNG dispatch matches encode_png");
+
+    std::string jpeg = grlibre::encode_image(
+        photo.rgba.data(), photo.width, photo.height, /*bgra=*/false,
+        grlibre::ImageFormat::kJpeg, 85);
+    require(jpeg.size() > 3, "JPEG produced");
+    require(static_cast<unsigned char>(jpeg[0]) == 0xff
+                && static_cast<unsigned char>(jpeg[1]) == 0xd8,
+            "JPEG SOI magic");
+    std::string jpeg_low = grlibre::encode_image(
+        photo.rgba.data(), photo.width, photo.height, /*bgra=*/false,
+        grlibre::ImageFormat::kJpeg, 20);
+    require(jpeg_low.size() < jpeg.size(), "lower JPEG quality shrinks output");
+
+    std::string webp = grlibre::encode_image(
+        photo.rgba.data(), photo.width, photo.height, /*bgra=*/false,
+        grlibre::ImageFormat::kWebp, 85);
+    require(webp.size() > 12, "WebP produced");
+    require(std::memcmp(webp.data(), "RIFF", 4) == 0
+                && std::memcmp(webp.data() + 8, "WEBP", 4) == 0,
+            "WebP RIFF magic");
+    std::string webp_low = grlibre::encode_image(
+        photo.rgba.data(), photo.width, photo.height, /*bgra=*/false,
+        grlibre::ImageFormat::kWebp, 20);
+    require(webp_low.size() < webp.size(), "lower WebP quality shrinks output");
+
+    require(grlibre::encode_image(photo.rgba.data(), 0, photo.height, false,
+                                  grlibre::ImageFormat::kJpeg, 85).empty(),
+            "zero width rejected for JPEG");
+  }
+
   std::cout << "png-encode-test passed\n";
   return 0;
 }

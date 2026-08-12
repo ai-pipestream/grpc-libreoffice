@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <string>
 
+#include "png_encode.h"
+
 namespace grlibre {
 
 // Which document parts the caller selected, decoded from the worker's argv
@@ -54,6 +56,10 @@ struct RenderOptions {
   // indexes stay document-absolute.
   int first_page = 0;
   int last_page = 0;
+  // Page image encoding and lossy quality for pages mode. Quality is
+  // 1..100 and ignored for PNG.
+  ImageFormat image_format = ImageFormat::kPng;
+  int image_quality = 85;
   // Uploaded byte count, echoed into RenderStatus.
   long input_bytes = 0;
   // Which parts to emit; defaults to every part.

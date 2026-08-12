@@ -55,13 +55,24 @@ def upload_requests(path, request_cls, options=None):
         offset = end
 
 
-def run_pages(stub, path, pages_only, dpi=0, page_range=(0, 0)):
+FORMATS = {
+    "": 0,
+    "png": pb.PAGE_IMAGE_FORMAT_PNG,
+    "jpeg": pb.PAGE_IMAGE_FORMAT_JPEG,
+    "webp": pb.PAGE_IMAGE_FORMAT_WEBP,
+}
+
+
+def run_pages(stub, path, pages_only, dpi=0, page_range=(0, 0), fmt="",
+              quality=0):
     options = None
-    if pages_only or dpi or page_range != (0, 0):
+    if pages_only or dpi or page_range != (0, 0) or fmt or quality:
         parts = [pb.DOCUMENT_PART_PAGES] if pages_only else []
         options = pb.StreamOptions(parts=parts, render_dpi=dpi,
                                    first_page=page_range[0],
-                                   last_page=page_range[1])
+                                   last_page=page_range[1],
+                                   page_format=FORMATS[fmt],
+                                   page_quality=quality)
     start = time.perf_counter()
     m = {"ttfb": None, "ttfp": None, "pages": 0, "out_bytes": 0,
          "events": 0, "render_millis": None}
@@ -105,11 +116,11 @@ def run_pdf(stub, path):
     return m
 
 
-def run_one(stub, path, mode, dpi=0, page_range=(0, 0)):
+def run_one(stub, path, mode, dpi=0, page_range=(0, 0), fmt="", quality=0):
     if mode == "pdf":
         return run_pdf(stub, path)
     return run_pages(stub, path, pages_only=(mode == "pages-only"), dpi=dpi,
-                     page_range=page_range)
+                     page_range=page_range, fmt=fmt, quality=quality)
 
 
 def fmt_ms(seconds):
@@ -151,6 +162,12 @@ def main():
                     help="1-based inclusive page range for the pages modes "
                          "(StreamOptions first_page/last_page), e.g. 2:5, "
                          "7 (just page 7), or 100: (open end)")
+    ap.add_argument("--format", default="", choices=["", "png", "jpeg", "webp"],
+                    help="page image encoding for the pages modes "
+                         "(StreamOptions page_format); empty = PNG")
+    ap.add_argument("--quality", type=int, default=0,
+                    help="lossy quality 1-100 (StreamOptions page_quality); "
+                         "0 = server default 85")
     ap.add_argument("--json", dest="json_out", default=None)
     args = ap.parse_args()
 
@@ -193,8 +210,10 @@ def main():
         for mode in modes:
             try:
                 for _ in range(args.warmup):
-                    run_one(stub, path, mode, args.dpi, page_range)
-                runs = [run_one(stub, path, mode, args.dpi, page_range)
+                    run_one(stub, path, mode, args.dpi, page_range,
+                            args.format, args.quality)
+                runs = [run_one(stub, path, mode, args.dpi, page_range,
+                                args.format, args.quality)
                         for _ in range(args.iterations)]
             except grpc.RpcError as e:
                 rows.append([name, mode, f"{size_kib:.0f}", "ERR",

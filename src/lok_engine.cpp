@@ -134,19 +134,33 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
         queue.pop_front();
       }
       queue_changed.notify_one();
-      std::string png = encode_png(raw.pixels.data(), raw.width_px, raw.height_px, bgra);
-      if (png.empty()) {
+      std::string encoded = encode_image(raw.pixels.data(), raw.width_px,
+                                         raw.height_px, bgra,
+                                         options.image_format,
+                                         options.image_quality);
+      if (encoded.empty()) {
         encoder_ok = false;
         return;
       }
-      encoded_bytes += static_cast<long>(png.size());
+      encoded_bytes += static_cast<long>(encoded.size());
       officev1::StreamPagesResponse page_event;
       officev1::PageImage* image = page_event.mutable_page_image();
       image->set_index(raw.index);
       image->set_width_px(raw.width_px);
       image->set_height_px(raw.height_px);
       image->set_dpi(raw.dpi);
-      image->set_png(std::move(png));
+      image->set_png(std::move(encoded));
+      switch (options.image_format) {
+        case ImageFormat::kPng:
+          image->set_format(officev1::PAGE_IMAGE_FORMAT_PNG);
+          break;
+        case ImageFormat::kJpeg:
+          image->set_format(officev1::PAGE_IMAGE_FORMAT_JPEG);
+          break;
+        case ImageFormat::kWebp:
+          image->set_format(officev1::PAGE_IMAGE_FORMAT_WEBP);
+          break;
+      }
       if (!emit(out_fd, page_event)) {
         encoder_ok = false;
         return;

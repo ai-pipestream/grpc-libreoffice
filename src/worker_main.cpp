@@ -75,10 +75,10 @@ constexpr char kProfileSeed[] =
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 7 || argc > 10) {
+  if (argc < 7 || argc > 11) {
     std::cerr << "usage: grlibre-worker <pages|pdf> <extension> <dpi> "
                  "<max_side_px> <work_dir> <install_path> "
-                 "[parts [repair|no-repair [first:last]]]\n";
+                 "[parts [repair|no-repair [first:last [format[:quality]]]]]\n";
     return grlibre::kExitRenderFailure;
   }
   grlibre::RenderOptions options;
@@ -105,7 +105,7 @@ int main(int argc, char** argv) {
   // The 1-based inclusive page range as "first:last"; 0 means unbounded on
   // that side. Absent means every page. The server validated ordering; a
   // malformed token here is a caller bug and fails loudly.
-  if (argc == 10) {
+  if (argc >= 10) {
     std::string range = argv[9];
     size_t colon = range.find(':');
     char* first_end = nullptr;
@@ -121,6 +121,37 @@ int main(int argc, char** argv) {
         || options.last_page < 0) {
       std::cerr << "grlibre-worker: malformed page range token \"" << range
                 << "\" (expected first:last)\n";
+      return grlibre::kExitRenderFailure;
+    }
+  }
+  // The page image encoding as "format" or "format:quality" (png, jpeg,
+  // webp). Absent means PNG. The server validated the quality bounds; a
+  // malformed token here is a caller bug and fails loudly.
+  if (argc == 11) {
+    std::string token = argv[10];
+    std::string format = token;
+    size_t colon = token.find(':');
+    if (colon != std::string::npos) {
+      format = token.substr(0, colon);
+      char* end = nullptr;
+      options.image_quality = static_cast<int>(
+          std::strtol(token.c_str() + colon + 1, &end, 10));
+      if (*end != '\0' || options.image_quality < 1
+          || options.image_quality > 100) {
+        std::cerr << "grlibre-worker: malformed image quality in \"" << token
+                  << "\"\n";
+        return grlibre::kExitRenderFailure;
+      }
+    }
+    if (format == "png") {
+      options.image_format = grlibre::ImageFormat::kPng;
+    } else if (format == "jpeg") {
+      options.image_format = grlibre::ImageFormat::kJpeg;
+    } else if (format == "webp") {
+      options.image_format = grlibre::ImageFormat::kWebp;
+    } else {
+      std::cerr << "grlibre-worker: unknown image format token \"" << token
+                << "\"\n";
       return grlibre::kExitRenderFailure;
     }
   }

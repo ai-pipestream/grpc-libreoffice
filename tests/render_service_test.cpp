@@ -39,6 +39,9 @@ struct StreamResult {
   int first_page_dpi = 0;
   int first_page_width_px = 0;
   std::vector<int> page_indexes;
+  std::string first_page_bytes;
+  officev1::PageImageFormat first_page_format =
+      officev1::PAGE_IMAGE_FORMAT_UNSPECIFIED;
 };
 
 // A stored-entry OOXML zip truncated right before its central directory:
@@ -70,7 +73,8 @@ StreamResult stream_pages(const std::shared_ptr<grpc::Channel>& channel,
                           const std::string& bytes, const std::string& filename,
                           bool mark_complete, bool allow_package_repair = false,
                           int render_dpi = 0, int first_page = 0,
-                          int last_page = 0) {
+                          int last_page = 0, int page_format = 0,
+                          int page_quality = 0) {
   auto stub = officev1::OfficeRenderService::NewStub(channel);
   grpc::ClientContext context;
   auto stream = stub->StreamPages(&context);
@@ -84,6 +88,11 @@ StreamResult stream_pages(const std::shared_ptr<grpc::Channel>& channel,
     if (offset == 0 && (first_page != 0 || last_page != 0)) {
       request.mutable_options()->set_first_page(first_page);
       request.mutable_options()->set_last_page(last_page);
+    }
+    if (offset == 0 && (page_format != 0 || page_quality != 0)) {
+      request.mutable_options()->set_page_format(
+          static_cast<officev1::PageImageFormat>(page_format));
+      request.mutable_options()->set_page_quality(page_quality);
     }
     officev1::DocumentChunk* chunk = request.mutable_chunk();
     chunk->set_document_id("test-doc");
@@ -104,6 +113,8 @@ StreamResult stream_pages(const std::shared_ptr<grpc::Channel>& channel,
       if (result.pages == 0) {
         result.first_page_dpi = response.page_image().dpi();
         result.first_page_width_px = response.page_image().width_px();
+        result.first_page_bytes = response.page_image().png();
+        result.first_page_format = response.page_image().format();
       }
       result.page_indexes.push_back(response.page_image().index());
       result.pages++;
@@ -274,6 +285,53 @@ int main() {
                                   false, 0, 3, 2);
     require(backwards.status.error_code() == grpc::StatusCode::INVALID_ARGUMENT,
             "backwards range is INVALID_ARGUMENT");
+  }
+
+  // Page image format selection: the default is PNG and says so, JPEG and
+  // WebP carry their magic bytes and name themselves, and the bad-input
+  // doors (out-of-range quality, unknown format value) reject before any
+  // worker spawns.
+  {
+    auto png = stream_pages(channel, "Hello over gRPC.\n", "hello.txt", true);
+    require(png.first_page_format == officev1::PAGE_IMAGE_FORMAT_PNG,
+            "default format names itself PNG");
+    require(png.first_page_bytes.rfind("\x89PNG", 0) == 0, "PNG magic");
+
+    auto jpeg = stream_pages(channel, "Hello over gRPC.\n", "hello.txt", true,
+                             false, 0, 0, 0, officev1::PAGE_IMAGE_FORMAT_JPEG);
+    require(jpeg.status.ok(), "jpeg renders: " + jpeg.status.error_message());
+    require(jpeg.first_page_format == officev1::PAGE_IMAGE_FORMAT_JPEG,
+            "jpeg format named");
+    require(jpeg.first_page_bytes.size() > 2
+                && static_cast<unsigned char>(jpeg.first_page_bytes[0]) == 0xff
+                && static_cast<unsigned char>(jpeg.first_page_bytes[1]) == 0xd8,
+            "JPEG magic");
+
+    auto webp = stream_pages(channel, "Hello over gRPC.\n", "hello.txt", true,
+                             false, 0, 0, 0, officev1::PAGE_IMAGE_FORMAT_WEBP,
+                             60);
+    require(webp.status.ok(), "webp renders: " + webp.status.error_message());
+    require(webp.first_page_format == officev1::PAGE_IMAGE_FORMAT_WEBP,
+            "webp format named");
+    require(webp.first_page_bytes.size() > 12
+                && webp.first_page_bytes.compare(0, 4, "RIFF") == 0
+                && webp.first_page_bytes.compare(8, 4, "WEBP") == 0,
+            "WebP magic");
+    require(webp.first_page_bytes.size() < png.first_page_bytes.size(),
+            "lossy page is smaller than the PNG page");
+
+    auto bad_quality = stream_pages(channel, "Hello over gRPC.\n", "hello.txt",
+                                    true, false, 0, 0, 0,
+                                    officev1::PAGE_IMAGE_FORMAT_JPEG, 101);
+    require(bad_quality.status.error_code()
+                == grpc::StatusCode::INVALID_ARGUMENT,
+            "quality over 100 is INVALID_ARGUMENT");
+
+    auto bad_format = stream_pages(channel, "Hello over gRPC.\n", "hello.txt",
+                                   true, false, 0, 0, 0, 99);
+    require(bad_format.status.error_code()
+                == grpc::StatusCode::INVALID_ARGUMENT,
+            "unknown format value is INVALID_ARGUMENT");
   }
 
   // An HTML upload once failed at the finish line: LibreOffice's exit-time

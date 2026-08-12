@@ -109,6 +109,41 @@ void capture_range(const officev1::StreamPagesRequest& request,
 
 void capture_range(const officev1::ConvertToPdfRequest&, PageRange*) {}
 
+// The page image encoding rides StreamOptions and resolves as one pair with
+// its quality: the first request with either field nonzero wins. PDF mode
+// emits no page images.
+struct ImageEncoding {
+  int format = 0;   // officev1::PageImageFormat wire value.
+  int quality = 0;  // 0 means the server default.
+};
+
+void capture_encoding(const officev1::StreamPagesRequest& request,
+                      ImageEncoding* encoding) {
+  if (encoding->format == 0 && encoding->quality == 0) {
+    encoding->format = request.options().page_format();
+    encoding->quality = request.options().page_quality();
+  }
+}
+
+void capture_encoding(const officev1::ConvertToPdfRequest&, ImageEncoding*) {}
+
+// The encoding's worker argv token: the format name, with the lossy quality
+// appended as ":Q". Returns an empty string for an unknown format value.
+std::string encoding_token(const ImageEncoding& encoding) {
+  int quality = encoding.quality == 0 ? 85 : encoding.quality;
+  switch (encoding.format) {
+    case officev1::PAGE_IMAGE_FORMAT_UNSPECIFIED:
+    case officev1::PAGE_IMAGE_FORMAT_PNG:
+      return "png";
+    case officev1::PAGE_IMAGE_FORMAT_JPEG:
+      return "jpeg:" + std::to_string(quality);
+    case officev1::PAGE_IMAGE_FORMAT_WEBP:
+      return "webp:" + std::to_string(quality);
+    default:
+      return "";
+  }
+}
+
 // The repair opt-in may ride any request of the upload stream; true on any
 // request enables it, mirroring how the chunk identity fields resolve.
 void capture_repair(const officev1::StreamPagesRequest& request, bool* repair) {
@@ -179,6 +214,7 @@ grpc::Status RenderServiceImpl::render(
   std::string parts_token;
   int requested_dpi = 0;
   PageRange page_range;
+  ImageEncoding encoding;
   bool allow_package_repair = false;
   bool saw_complete = false;
 
@@ -191,6 +227,7 @@ grpc::Status RenderServiceImpl::render(
     capture_parts(request, &parts_token);
     capture_dpi(request, &requested_dpi);
     capture_range(request, &page_range);
+    capture_encoding(request, &encoding);
     capture_repair(request, &allow_package_repair);
     if (static_cast<long>(bytes.size() + chunk.data().size()) > config_.max_document_bytes) {
       rejected++;
@@ -224,6 +261,19 @@ grpc::Status RenderServiceImpl::render(
             "invalid page range: first_page " + std::to_string(page_range.first)
                 + ", last_page " + std::to_string(page_range.last)};
   }
+  std::string format_token = encoding_token(encoding);
+  if (format_token.empty()) {
+    rejected++;
+    return {grpc::StatusCode::INVALID_ARGUMENT,
+            "unsupported page_format value "
+                + std::to_string(encoding.format)};
+  }
+  if (encoding.quality < 0 || encoding.quality > 100) {
+    rejected++;
+    return {grpc::StatusCode::INVALID_ARGUMENT,
+            "page_quality must be within [0, 100], got "
+                + std::to_string(encoding.quality)};
+  }
 
   SlotGuard slot(*this);
   ScopedWorkDir work_dir(config_.tmpfs_dir);
@@ -241,7 +291,8 @@ grpc::Status RenderServiceImpl::render(
       work_dir.path(), config_.install_path,
       parts_token.empty() ? "all" : parts_token,
       allow_package_repair ? "repair" : "no-repair",
-      std::to_string(page_range.first) + ":" + std::to_string(page_range.last)};
+      std::to_string(page_range.first) + ":" + std::to_string(page_range.last),
+      format_token};
   // Frames can carry a full page PNG; bound generously above the pixel cap.
   std::uint32_t max_frame = 256u * 1024 * 1024;
   WorkerOutcome outcome = run_worker(

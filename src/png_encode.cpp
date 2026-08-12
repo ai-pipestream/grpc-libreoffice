@@ -2,6 +2,7 @@
 
 #include <vector>
 
+#include <webp/encode.h>
 #include <zlib.h>
 
 // stb's built-in deflate is routed through real zlib below: measured on
@@ -56,24 +57,65 @@ void append_bytes(void* context, void* data, int size) {
   out->append(static_cast<const char*>(data), static_cast<size_t>(size));
 }
 
+// Returns pixels as RGBA, swapping a BGRA buffer through *storage. stb's
+// writers only take RGBA; libwebp has a native BGRA entry point and skips
+// this.
+const std::uint8_t* as_rgba(const std::uint8_t* pixels, int width, int height,
+                            bool bgra, std::vector<std::uint8_t>* storage) {
+  if (!bgra) return pixels;
+  storage->assign(pixels, pixels + static_cast<size_t>(width) * height * 4);
+  for (size_t i = 0; i < storage->size(); i += 4) {
+    std::swap((*storage)[i], (*storage)[i + 2]);
+  }
+  return storage->data();
+}
+
 }  // namespace
 
 std::string encode_png(const std::uint8_t* pixels, int width, int height, bool bgra) {
   if (width <= 0 || height <= 0) return {};
   std::string png;
-  const std::uint8_t* source = pixels;
   std::vector<std::uint8_t> swapped;
-  if (bgra) {
-    swapped.assign(pixels, pixels + static_cast<size_t>(width) * height * 4);
-    for (size_t i = 0; i < swapped.size(); i += 4) {
-      std::swap(swapped[i], swapped[i + 2]);
-    }
-    source = swapped.data();
-  }
+  const std::uint8_t* source = as_rgba(pixels, width, height, bgra, &swapped);
   if (!stbi_write_png_to_func(append_bytes, &png, width, height, 4, source, width * 4)) {
     return {};
   }
   return png;
+}
+
+std::string encode_image(const std::uint8_t* pixels, int width, int height,
+                         bool bgra, ImageFormat format, int quality) {
+  if (width <= 0 || height <= 0) return {};
+  switch (format) {
+    case ImageFormat::kPng:
+      return encode_png(pixels, width, height, bgra);
+    case ImageFormat::kJpeg: {
+      std::string jpeg;
+      std::vector<std::uint8_t> swapped;
+      const std::uint8_t* source = as_rgba(pixels, width, height, bgra, &swapped);
+      if (!stbi_write_jpg_to_func(append_bytes, &jpeg, width, height, 4,
+                                  source, quality)) {
+        return {};
+      }
+      return jpeg;
+    }
+    case ImageFormat::kWebp: {
+      std::uint8_t* output = nullptr;
+      size_t size = bgra
+          ? WebPEncodeBGRA(pixels, width, height, width * 4,
+                           static_cast<float>(quality), &output)
+          : WebPEncodeRGBA(pixels, width, height, width * 4,
+                           static_cast<float>(quality), &output);
+      if (size == 0 || output == nullptr) {
+        WebPFree(output);
+        return {};
+      }
+      std::string webp(reinterpret_cast<const char*>(output), size);
+      WebPFree(output);
+      return webp;
+    }
+  }
+  return {};
 }
 
 }  // namespace grlibre

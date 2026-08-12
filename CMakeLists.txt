@@ -67,6 +67,24 @@ FetchContent_Declare(grpc
   GIT_SUBMODULES_RECURSE TRUE)
 FetchContent_MakeAvailable(grpc)
 
+# libwebp provides the WebP page-image encoding; PNG and JPEG come from the
+# vendored stb writer. Built static, tools and extras off.
+set(WEBP_BUILD_ANIM_UTILS OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_CWEBP OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_DWEBP OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_GIF2WEBP OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_IMG2WEBP OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_VWEBP OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_WEBPINFO OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_LIBWEBPMUX OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_WEBPMUX OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_EXTRAS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(libwebp
+  GIT_REPOSITORY https://chromium.googlesource.com/webm/libwebp
+  GIT_TAG v1.5.0
+  GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(libwebp)
+
 find_package(Threads REQUIRED)
 
 # The PNG encoder deflates through the zlib gRPC already builds in module
@@ -156,7 +174,7 @@ target_include_directories(grlibre-worker PRIVATE
 set_source_files_properties(src/uno_extract.cpp PROPERTIES
   COMPILE_DEFINITIONS "LINUX;UNX;CPPU_ENV=gcc3")
 target_link_directories(grlibre-worker PRIVATE "${GRLIBRE_LO_SDK_DIR}/lib")
-target_link_libraries(grlibre-worker PRIVATE office_proto zlibstatic
+target_link_libraries(grlibre-worker PRIVATE office_proto zlibstatic webp
   uno_sal uno_cppu uno_cppuhelpergcc3
   ${CMAKE_DL_LIBS} Threads::Threads grlibre_flags)
 # CMake links executables with -rdynamic, which would export the bundled
@@ -182,7 +200,7 @@ if(BUILD_TESTING)
   add_executable(png-encode-test tests/png_encode_test.cpp src/png_encode.cpp)
   target_include_directories(png-encode-test PRIVATE src third_party/stb
     ${GRLIBRE_ZLIB_INCLUDE_DIRS})
-  target_link_libraries(png-encode-test PRIVATE zlibstatic grlibre_flags)
+  target_link_libraries(png-encode-test PRIVATE zlibstatic webp grlibre_flags)
 
   add_executable(worker-render-test tests/worker_render_test.cpp)
   target_link_libraries(worker-render-test PRIVATE grlibre_core grlibre_flags)

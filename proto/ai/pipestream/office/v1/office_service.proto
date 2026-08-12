@@ -160,6 +160,28 @@ message StreamOptions {
   // Last page to paint as a PageImage, 1-based inclusive. Zero means
   // through the last page. See first_page for the shared range contract.
   int32 last_page = 4;
+  // Encoding for this document's page images. Unspecified means PNG, the
+  // lossless default. JPEG and WebP are lossy and typically several times
+  // smaller; each emitted PageImage names the encoding it actually carries
+  // in its format field. Resolved across the upload stream as one pair with
+  // page_quality: the first request with either field nonzero wins.
+  PageImageFormat page_format = 5;
+  // Quality for lossy page encodings, 1 to 100; higher is better and
+  // larger. Zero means the server default (85). Ignored for PNG. Values
+  // outside [0, 100] are rejected with INVALID_ARGUMENT.
+  int32 page_quality = 6;
+}
+
+// PageImageFormat names the encodings a page image can be produced in.
+enum PageImageFormat {
+  // Unset; requests render PNG, and responses never carry it.
+  PAGE_IMAGE_FORMAT_UNSPECIFIED = 0;
+  // Lossless PNG, the default.
+  PAGE_IMAGE_FORMAT_PNG = 1;
+  // Lossy baseline JPEG.
+  PAGE_IMAGE_FORMAT_JPEG = 2;
+  // Lossy WebP.
+  PAGE_IMAGE_FORMAT_WEBP = 3;
 }
 
 // StreamPagesRequest carries one upload chunk of a StreamPages call.
@@ -360,8 +382,14 @@ message PageImage {
   // The DPI the page was rendered at. May be lower than the requested DPI
   // when a page would otherwise exceed the configured pixel bound.
   int32 dpi = 4;
-  // The page encoded as a PNG.
+  // The encoded page image. PNG unless the request selected another
+  // encoding through StreamOptions.page_format; the field name predates
+  // format selection. The format field names what these bytes are.
   bytes png = 5;
+  // The encoding the png field actually carries. Always set by servers
+  // that support format selection; absent (unspecified) from older servers,
+  // whose bytes are always PNG.
+  PageImageFormat format = 6;
 }
 
 // TwipsPoint is a point in twips (1/1440 inch), document-absolute: the

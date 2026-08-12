@@ -17,6 +17,11 @@ Measures per-document latency and whole-service throughput against a running
 `--pages 100` returns that single page in ~650 ms where the full paint takes
 ~14 s — the load and layout are paid once, the other 223 paints never happen.
 
+`--format webp` (with optional `--quality`) selects the lossy page
+encodings: on this corpus WebP cuts page payloads 2-4x against PNG at a
+small encode-time cost, while JPEG usually loses to PNG on text pages —
+document pages are not photographs.
+
 Three modes per file:
 
 - `pages-only` — `StreamPages` with `parts=[DOCUMENT_PART_PAGES]`: pure
