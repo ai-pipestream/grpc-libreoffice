@@ -16,8 +16,14 @@ Gradle 9.x works identically (`gradle run ...`).
 ```bash
 ./gradlew run --args="info"
 ./gradlew run --args="pages ../../fixtures/sample3.docx out"
+./gradlew run --args="pages ../../fixtures/sample3.docx out --dpi 72"
 ./gradlew run --args="pdf ../../fixtures/sample3.docx out.pdf"
 ```
+
+`pages --dpi <n>` requests a render DPI (`StreamOptions.render_dpi`, sent on
+the first upload chunk; the server clamps it to [24,600], 0 or omitted means
+the server default). Each page line prints the DPI the page actually
+rendered at.
 
 Server address: `GRLIBRE_ADDR` environment variable
 (default `localhost:50053`).

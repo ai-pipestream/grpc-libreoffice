@@ -9,6 +9,8 @@
 #   pdf     converts the same fixture; output starts with %PDF and the byte
 #           sizes across languages agree within 1%
 #   error   a file with an unresolvable extension must fail (nonzero exit)
+#   dpi     pages --dpi 72 against the server's 144-dpi default: the first
+#           PNG's pixel width must be exactly half the default run's width
 #
 # Prints a per-language PASS/FAIL table and exits nonzero on any failure.
 # Client setup (venv, stubs, node_modules, gradle installDist) happens lazily.
@@ -93,9 +95,9 @@ export GRLIBRE_ADDR="localhost:$PORT"
 # ---- checks -------------------------------------------------------------------
 
 LANGS=(python node java)
-TESTS=(info pages pdf error)
+TESTS=(info pages pdf error dpi)
 declare -A RESULT   # RESULT[lang/test] = PASS | FAIL(reason)
-declare -A PAGE_COUNT PDF_SIZE
+declare -A PAGE_COUNT PDF_SIZE PAGE_WIDTH
 FAILED=0
 
 fail() { # fail <lang> <test> <reason>
@@ -107,6 +109,14 @@ fail() { # fail <lang> <test> <reason>
 pass() { RESULT["$1/$2"]="PASS"; }
 
 is_png() { [ -s "$1" ] && [ "$(head -c 8 "$1" | od -An -tx1 | tr -d ' \n')" = "89504e470d0a1a0a" ]; }
+
+# IHDR pixel width: bytes 16..19 of the file, big-endian.
+png_width() {
+  python3 -c 'import struct, sys
+with open(sys.argv[1], "rb") as f:
+    f.seek(16)
+    print(struct.unpack(">I", f.read(4))[0])' "$1"
+}
 
 BAD_FILE="$WORK/x.unknownext"
 cp "$FIXTURE" "$BAD_FILE"
@@ -138,9 +148,32 @@ for lang in "${LANGS[@]}"; do
       fail "$lang" pages "bad PNG:$bad"
     else
       pass "$lang" pages
+      PAGE_WIDTH[$lang]=$(png_width "$outdir/page-0001.png")
     fi
   else
     fail "$lang" pages "exit $?"
+  fi
+
+  # dpi: --dpi 72 against the 144-dpi server default must exactly halve the
+  # first page's pixel width relative to the default pages run above
+  dpidir="$WORK/pages-$lang-dpi72"
+  mkdir -p "$dpidir"
+  if run_client "$lang" pages "$FIXTURE" "$dpidir" --dpi 72 >"$WORK/logs/$lang-dpi.log" 2>&1; then
+    base="${PAGE_WIDTH[$lang]:-}"
+    if [ -z "$base" ]; then
+      fail "$lang" dpi "no baseline width (default pages run failed)"
+    elif ! is_png "$dpidir/page-0001.png"; then
+      fail "$lang" dpi "no valid page-0001.png produced"
+    else
+      w=$(png_width "$dpidir/page-0001.png")
+      if [ $((w * 2)) -eq "$base" ]; then
+        pass "$lang" dpi
+      else
+        fail "$lang" dpi "width $w at 72 dpi, expected half of $base"
+      fi
+    fi
+  else
+    fail "$lang" dpi "exit $?"
   fi
 
   # pdf

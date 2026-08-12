@@ -9,6 +9,7 @@ import ai.pipestream.office.v1.GetServiceInfoResponse;
 import ai.pipestream.office.v1.OfficeRenderServiceGrpc;
 import ai.pipestream.office.v1.PageImage;
 import ai.pipestream.office.v1.RenderStatus;
+import ai.pipestream.office.v1.StreamOptions;
 import ai.pipestream.office.v1.StreamPagesRequest;
 import ai.pipestream.office.v1.StreamPagesResponse;
 import com.google.protobuf.ByteString;
@@ -29,8 +30,10 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.BiFunction;
 import java.util.function.Consumer;
-import java.util.function.Function;
 
 /**
  * Example CLI client for the grpc-libreoffice OfficeRenderService.
@@ -38,6 +41,7 @@ import java.util.function.Function;
  * <pre>
  *   gradle run --args="info"
  *   gradle run --args="pages ../../fixtures/sample3.docx out"
+ *   gradle run --args="pages ../../fixtures/sample3.docx out --dpi 72"
  *   gradle run --args="pdf ../../fixtures/sample3.docx out.pdf"
  * </pre>
  *
@@ -67,11 +71,27 @@ public final class OfficeClient {
             switch (args[0]) {
                 case "info" -> info(channel);
                 case "pages" -> {
-                    if (args.length < 2) {
+                    int dpi = 0;
+                    List<String> positional = new ArrayList<>();
+                    for (int i = 1; i < args.length; i++) {
+                        if ("--dpi".equals(args[i])) {
+                            if (i + 1 >= args.length) {
+                                usage();
+                            }
+                            dpi = Integer.parseInt(args[++i]);
+                            if (dpi <= 0) {
+                                usage();
+                            }
+                        } else {
+                            positional.add(args[i]);
+                        }
+                    }
+                    if (positional.isEmpty()) {
                         usage();
                     }
-                    pages(channel, Path.of(args[1]),
-                            Path.of(args.length > 2 ? args[2] : "pages-out"));
+                    pages(channel, Path.of(positional.get(0)),
+                            Path.of(positional.size() > 1 ? positional.get(1) : "pages-out"),
+                            dpi);
                 }
                 case "pdf" -> {
                     if (args.length < 2) {
@@ -94,7 +114,8 @@ public final class OfficeClient {
     }
 
     private static void usage() {
-        System.err.println("usage: OfficeClient <info | pages <file> [outdir] | pdf <file> [out.pdf]>");
+        System.err.println(
+                "usage: OfficeClient <info | pages <file> [outdir] [--dpi <n>] | pdf <file> [out.pdf]>");
         System.exit(2);
     }
 
@@ -113,7 +134,7 @@ public final class OfficeClient {
                 String.join(", ", resp.getSupportedFormatsList()));
     }
 
-    private static void pages(ManagedChannel channel, Path file, Path outdir)
+    private static void pages(ManagedChannel channel, Path file, Path outdir, int dpi)
             throws IOException, InterruptedException {
         Files.createDirectories(outdir);
         long t0 = System.nanoTime();
@@ -167,8 +188,15 @@ public final class OfficeClient {
                             }
                         }));
 
-        streamDocument(file, upload,
-                chunk -> StreamPagesRequest.newBuilder().setChunk(chunk).build());
+        streamDocument(file, upload, (chunk, first) -> {
+            StreamPagesRequest.Builder req = StreamPagesRequest.newBuilder().setChunk(chunk);
+            // render_dpi resolves to the first nonzero value in the upload
+            // stream, so it must ride the first chunk.
+            if (first && dpi > 0) {
+                req.setOptions(StreamOptions.newBuilder().setRenderDpi(dpi));
+            }
+            return req.build();
+        });
         state.awaitDone();
     }
 
@@ -200,7 +228,7 @@ public final class OfficeClient {
                             }));
 
             streamDocument(file, upload,
-                    chunk -> ConvertToPdfRequest.newBuilder().setChunk(chunk).build());
+                    (chunk, first) -> ConvertToPdfRequest.newBuilder().setChunk(chunk).build());
             state.awaitDone();
         }
         System.out.printf("wrote       : %,d bytes -> %s%n", total[0], out);
@@ -243,9 +271,13 @@ public final class OfficeClient {
         }
     }
 
-    /** Uploads {@code file} as 256 KiB DocumentChunks; the last chunk sets complete. */
+    /**
+     * Uploads {@code file} as 256 KiB DocumentChunks; the last chunk sets complete.
+     * {@code wrap} receives each chunk plus whether it is the first of the stream,
+     * so per-request options can ride the front of the upload.
+     */
     private static <ReqT> void streamDocument(Path file, StreamObserver<ReqT> upload,
-            Function<DocumentChunk, ReqT> wrap) throws IOException {
+            BiFunction<DocumentChunk, Boolean, ReqT> wrap) throws IOException {
         byte[] data = Files.readAllBytes(file);
         int offset = 0;
         boolean first = true;
@@ -257,9 +289,9 @@ public final class OfficeClient {
             if (first) {
                 chunk.setDocumentId(UUID.randomUUID().toString())
                         .setFilename(file.getFileName().toString());
-                first = false;
             }
-            upload.onNext(wrap.apply(chunk.build()));
+            upload.onNext(wrap.apply(chunk.build(), first));
+            first = false;
             offset = end;
         } while (offset < data.length);
         upload.onCompleted();

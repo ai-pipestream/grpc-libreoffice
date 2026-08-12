@@ -2,7 +2,7 @@
 // Example CLI client for the grpc-libreoffice OfficeRenderService.
 //
 //   node client.js info
-//   node client.js pages <file> [outdir]
+//   node client.js pages <file> [outdir] [--dpi <n>]
 //   node client.js pdf <file> [out.pdf]
 //
 // Server address defaults to localhost:50053; override with GRLIBRE_ADDR.
@@ -50,7 +50,9 @@ function fail(err) {
 }
 
 // Writes `file` into the call as 256 KiB DocumentChunks, last one complete.
-function uploadFile(call, file) {
+// `firstExtra` fields ride the first request only (per-request options
+// resolve to the first value seen in the upload stream).
+function uploadFile(call, file, firstExtra = {}) {
   const data = fs.readFileSync(file);
   const total = data.length;
   let offset = 0;
@@ -61,12 +63,14 @@ function uploadFile(call, file) {
       data: data.subarray(offset, end),
       complete: end === total,
     };
+    const req = { chunk };
     if (first) {
       chunk.document_id = randomUUID();
       chunk.filename = path.basename(file);
+      Object.assign(req, firstExtra);
       first = false;
     }
-    call.write({ chunk });
+    call.write(req);
     offset = end;
   } while (offset < total);
   call.end();
@@ -107,7 +111,7 @@ function cmdInfo() {
   });
 }
 
-function cmdPages(file, outdir = "pages-out") {
+function cmdPages(file, outdir = "pages-out", dpi = 0) {
   fs.mkdirSync(outdir, { recursive: true });
   const client = makeClient();
   const t0 = performance.now();
@@ -155,7 +159,7 @@ function cmdPages(file, outdir = "pages-out") {
     }
   });
   call.on("error", fail);
-  uploadFile(call, file);
+  uploadFile(call, file, dpi > 0 ? { options: { render_dpi: dpi } } : {});
 }
 
 function cmdPdf(file, out = "out.pdf") {
@@ -195,13 +199,27 @@ switch (cmd) {
   case "info":
     cmdInfo();
     break;
-  case "pages":
-    if (!rest[0]) {
-      console.error("usage: node client.js pages <file> [outdir]");
+  case "pages": {
+    let dpi = 0;
+    const positional = [];
+    for (let i = 0; i < rest.length; i++) {
+      if (rest[i] === "--dpi") {
+        dpi = Number.parseInt(rest[++i], 10);
+        if (!Number.isInteger(dpi) || dpi <= 0) {
+          console.error("--dpi needs a positive integer");
+          process.exit(2);
+        }
+      } else {
+        positional.push(rest[i]);
+      }
+    }
+    if (!positional[0]) {
+      console.error("usage: node client.js pages <file> [outdir] [--dpi <n>]");
       process.exit(2);
     }
-    cmdPages(rest[0], rest[1]);
+    cmdPages(positional[0], positional[1], dpi);
     break;
+  }
   case "pdf":
     if (!rest[0]) {
       console.error("usage: node client.js pdf <file> [out.pdf]");
@@ -211,7 +229,7 @@ switch (cmd) {
     break;
   default:
     console.error(
-      "usage: node client.js <info | pages <file> [outdir] | pdf <file> [out.pdf]>",
+      "usage: node client.js <info | pages <file> [outdir] [--dpi <n>] | pdf <file> [out.pdf]>",
     );
     process.exit(2);
 }

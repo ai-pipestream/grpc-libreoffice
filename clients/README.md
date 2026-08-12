@@ -7,7 +7,7 @@ and Java. Each client exposes the same three subcommands:
 | Subcommand | What it does |
 |---|---|
 | `info` | Print server/LibreOffice versions, limits, and accepted formats. |
-| `pages <file> [outdir]` | Upload the file, save every rendered page as `page-NNNN.png`, summarize typed content events, print RenderStatus and timing. |
+| `pages <file> [outdir] [--dpi <n>]` | Upload the file, save every rendered page as `page-NNNN.png`, summarize typed content events, print RenderStatus and timing. `--dpi` sets `StreamOptions.render_dpi` on the first upload chunk (server clamps to [24,600]; omitted or 0 = server default); each page line shows the DPI it actually rendered at (`PageImage.dpi`). |
 | `pdf <file> [out.pdf]` | Upload the file, write the streamed PDF, print byte count and timing. |
 
 All clients upload the document as ~256 KiB `DocumentChunk`s with
@@ -33,6 +33,7 @@ python3 -m venv .venv
 ./generate.sh                                # generates stubs into gen/
 .venv/bin/python client.py info
 .venv/bin/python client.py pages ../../fixtures/sample3.docx out
+.venv/bin/python client.py pages ../../fixtures/sample3.docx out --dpi 72
 .venv/bin/python client.py pdf ../../fixtures/sample3.docx out.pdf
 ```
 
@@ -45,6 +46,7 @@ cd clients/node
 npm install
 node client.js info
 node client.js pages ../../fixtures/sample3.docx out
+node client.js pages ../../fixtures/sample3.docx out --dpi 72
 node client.js pdf ../../fixtures/sample3.docx out.pdf
 ```
 
@@ -58,6 +60,7 @@ tree. A wrapper pinned at Gradle 9.6.1 is included; a system `gradle`
 cd clients/java
 ./gradlew run --args="info"
 ./gradlew run --args="pages ../../fixtures/sample3.docx out"
+./gradlew run --args="pages ../../fixtures/sample3.docx out --dpi 72"
 ./gradlew run --args="pdf ../../fixtures/sample3.docx out.pdf"
 ```
 
@@ -69,7 +72,9 @@ conformance test. It boots a private server on port 50253 (override with
 missing client prerequisites (Python venv + stubs, `npm ci`, Gradle
 `installDist`), and runs all three clients against it: `info` must succeed,
 `pages` must produce the same number of valid PNGs in every language, `pdf`
-outputs must carry the `%PDF` magic with byte sizes agreeing within 1%, and a
-file with an unresolvable extension must fail with a nonzero exit. It prints
+outputs must carry the `%PDF` magic with byte sizes agreeing within 1%, a
+file with an unresolvable extension must fail with a nonzero exit, and
+`pages --dpi 72` against the private server's 144-dpi default must produce a
+first PNG exactly half the default run's pixel width. It prints
 a per-language PASS/FAIL table and exits nonzero on any failure. It also runs
 as an optional leg of the smoke test: `scripts/e2e-smoke.sh --clients`.

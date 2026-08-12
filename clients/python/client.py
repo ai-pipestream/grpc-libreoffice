@@ -3,7 +3,8 @@
 
 Subcommands:
   info                     print server versions, limits, accepted formats
-  pages <file> [outdir]    render every page to PNG, dump typed-content stats
+  pages <file> [outdir] [--dpi N]
+                           render every page to PNG, dump typed-content stats
   pdf <file> [out.pdf]     convert the document to a PDF
 
 The server address defaults to localhost:50053; override with --addr or the
@@ -37,7 +38,11 @@ def make_stub(addr):
 
 
 def chunk_requests(path, wrap):
-    """Yield upload requests for `path`, 256 KiB per chunk, last one complete."""
+    """Yield upload requests for `path`, 256 KiB per chunk, last one complete.
+
+    `wrap(chunk, first)` builds the request; `first` is True for the first
+    chunk only, so per-request options can ride the front of the stream.
+    """
     filename = os.path.basename(path)
     content_type = mimetypes.guess_type(filename)[0] or ""
     doc_id = str(uuid.uuid4())
@@ -51,8 +56,8 @@ def chunk_requests(path, wrap):
             chunk.document_id = doc_id
             chunk.filename = filename
             chunk.content_type = content_type
-            first = False
-        yield wrap(chunk)
+        yield wrap(chunk, first)
+        first = False
         offset = end
         if offset >= len(data):
             return
@@ -96,9 +101,15 @@ def cmd_pages(stub, args):
     first_page_s = None
     pages = 0
     counts = {}
-    responses = stub.StreamPages(
-        chunk_requests(args.file, lambda c: pb.StreamPagesRequest(chunk=c))
-    )
+    def wrap(chunk, first):
+        req = pb.StreamPagesRequest(chunk=chunk)
+        # render_dpi resolves to the first nonzero value in the upload
+        # stream, so it must ride the first chunk.
+        if first and args.dpi:
+            req.options.render_dpi = args.dpi
+        return req
+
+    responses = stub.StreamPages(chunk_requests(args.file, wrap))
     for resp in responses:
         event = resp.WhichOneof("event")
         if event == "document_info":
@@ -134,7 +145,7 @@ def cmd_pdf(stub, args):
     t0 = time.monotonic()
     total = 0
     responses = stub.ConvertToPdf(
-        chunk_requests(args.file, lambda c: pb.ConvertToPdfRequest(chunk=c))
+        chunk_requests(args.file, lambda c, _first: pb.ConvertToPdfRequest(chunk=c))
     )
     with open(args.out, "wb") as f:
         for resp in responses:
@@ -161,6 +172,8 @@ def main():
     p = sub.add_parser("pages", help="render every page as PNG")
     p.add_argument("file")
     p.add_argument("outdir", nargs="?", default="pages-out")
+    p.add_argument("--dpi", type=int, default=0,
+                   help="render DPI (server clamps to [24,600]; 0 = server default)")
 
     p = sub.add_parser("pdf", help="convert to PDF")
     p.add_argument("file")
