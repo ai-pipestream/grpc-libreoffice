@@ -13,6 +13,7 @@ const PROTO_ROOT = path.join(__dirname, "..", "proto");
 const PROTO_FILE = path.join(
   PROTO_ROOT, "ai", "pipestream", "office", "v1", "office_service.proto");
 const PUBLIC_DIR = path.join(__dirname, "public");
+const FIXTURES_DIR = path.join(__dirname, "..", "fixtures");
 
 const PORT = Number(process.env.PORT || 8080);
 const GRLIBRE_ADDR = process.env.GRLIBRE_ADDR || "localhost:50053";
@@ -40,6 +41,30 @@ const client = new officePkg.OfficeRenderService(
 
 const STATUS_NAMES = Object.fromEntries(
   Object.entries(grpc.status).map(([name, code]) => [code, name]));
+
+// Valid DocumentPart enum names, read from the loaded proto so the list
+// never drifts from the contract. Accepts short forms too: "PAGES" maps to
+// "DOCUMENT_PART_PAGES".
+const DOCUMENT_PART_NAMES = new Set(
+  officePkg.DocumentPart.type.value.map((v) => v.name));
+
+// Parses ?parts=PAGES,METADATA into full enum names, or null when absent.
+// Throws on unknown names.
+function parsePartsParam(url) {
+  const raw = url.searchParams.get("parts");
+  if (raw == null || raw.trim() === "") return null;
+  const parts = [];
+  for (const token of raw.split(",")) {
+    const t = token.trim().toUpperCase();
+    if (!t) continue;
+    const full = t.startsWith("DOCUMENT_PART_") ? t : "DOCUMENT_PART_" + t;
+    if (!DOCUMENT_PART_NAMES.has(full)) {
+      throw new Error(`unknown document part "${token.trim()}"`);
+    }
+    parts.push(full);
+  }
+  return parts.length ? parts : null;
+}
 
 function grpcErrorPayload(err) {
   return {
@@ -70,14 +95,17 @@ function resolveFilename(req, url) {
 }
 
 // Streams the uploaded buffer into a gRPC client-streaming call as
-// DocumentChunk messages, the last one marked complete.
-function sendUpload(call, buffer, filename, contentType) {
+// DocumentChunk messages, the last one marked complete. firstExtra is
+// merged into the first request message (StreamOptions ride there: the
+// server resolves the first non-empty parts list).
+function sendUpload(call, buffer, filename, contentType, firstExtra) {
   let offset = 0;
   let first = true;
   while (offset < buffer.length) {
     const end = Math.min(offset + UPLOAD_CHUNK, buffer.length);
     const complete = end >= buffer.length;
     call.write({
+      ...(first ? firstExtra : null),
       chunk: {
         documentId: "",
         filename: first ? filename : "",
@@ -91,6 +119,7 @@ function sendUpload(call, buffer, filename, contentType) {
   }
   if (buffer.length === 0) {
     call.write({
+      ...firstExtra,
       chunk: { filename, contentType: contentType || "", data: Buffer.alloc(0), complete: true },
     });
   }
@@ -140,6 +169,14 @@ async function handleInfo(res) {
 async function handleRender(req, res, url) {
   const filename = resolveFilename(req, url);
   const contentType = req.headers["content-type"] || "";
+  let parts;
+  try {
+    parts = parsePartsParam(url);
+  } catch (err) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: { message: String(err.message) } }));
+    return;
+  }
   const body = await readBody(req);
 
   res.writeHead(200, {
@@ -150,7 +187,11 @@ async function handleRender(req, res, url) {
 
   const t0 = Date.now();
   const emit = (obj) => res.write(JSON.stringify(obj) + "\n");
-  emit({ event: "start", tMs: 0, data: { filename, bytes: body.length } });
+  emit({
+    event: "start",
+    tMs: 0,
+    data: { filename, bytes: body.length, parts: parts || [] },
+  });
 
   const call = client.StreamPages();
   let ended = false;
@@ -178,7 +219,52 @@ async function handleRender(req, res, url) {
     if (!ended) call.cancel();
   });
 
-  sendUpload(call, body, filename, contentType);
+  sendUpload(call, body, filename, contentType,
+    parts ? { options: { parts } } : null);
+}
+
+// Lists the demo fixture files (regular files only) with their sizes.
+function handleFixtures(res) {
+  fs.readdir(FIXTURES_DIR, { withFileTypes: true }, (err, entries) => {
+    if (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { message: String(err.message) } }));
+      return;
+    }
+    const files = entries
+      .filter((e) => e.isFile() && !e.name.startsWith(".") && !e.name.endsWith(".sh"))
+      .map((e) => {
+        const st = fs.statSync(path.join(FIXTURES_DIR, e.name));
+        return { name: e.name, bytes: st.size };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ files }));
+  });
+}
+
+// Serves one fixture file's bytes so the browser speed test can upload it
+// back through /api/render and /api/pdf.
+function handleFixtureFile(res, name) {
+  const decoded = decodeURIComponent(name);
+  if (decoded.includes("/") || decoded.includes("\\") || decoded.includes("..")) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "bad fixture name" } }));
+    return;
+  }
+  const filePath = path.join(FIXTURES_DIR, decoded);
+  fs.readFile(filePath, (err, contents) => {
+    if (err) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "fixture not found" } }));
+      return;
+    }
+    res.writeHead(200, {
+      "Content-Type": "application/octet-stream",
+      "Content-Length": contents.length,
+    });
+    res.end(contents);
+  });
 }
 
 async function handlePdf(req, res, url) {
@@ -273,6 +359,10 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "GET" && url.pathname === "/api/info") {
       await handleInfo(res);
+    } else if (req.method === "GET" && url.pathname === "/api/fixtures") {
+      handleFixtures(res);
+    } else if (req.method === "GET" && url.pathname.startsWith("/api/fixtures/")) {
+      handleFixtureFile(res, url.pathname.slice("/api/fixtures/".length));
     } else if (req.method === "POST" && url.pathname === "/api/render") {
       await handleRender(req, res, url);
     } else if (req.method === "POST" && url.pathname === "/api/pdf") {
@@ -292,6 +382,9 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`grlibre BFF listening on http://localhost:${PORT}`);
+  // The actual bound port matters when PORT=0 asks for an ephemeral one
+  // (the test suite does); the log line is the contract the tests parse.
+  console.log(
+    `grlibre BFF listening on http://localhost:${server.address().port}`);
   console.log(`gRPC target: ${GRLIBRE_ADDR}`);
 });

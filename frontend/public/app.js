@@ -6,9 +6,19 @@ const $ = (id) => document.getElementById(id);
 
 const els = {
   chips: $("info-chips"),
+  navRender: $("nav-render"),
+  navSpeed: $("nav-speed"),
+  viewRender: $("view-render"),
+  viewSpeed: $("view-speed"),
   dropZone: $("drop-zone"),
   dropFormats: $("drop-formats"),
   fileInput: $("file-input"),
+  partsPanel: $("parts-panel"),
+  partsChips: $("parts-chips"),
+  partsSummary: $("parts-summary"),
+  partsAll: $("parts-all"),
+  partsNone: $("parts-none"),
+  partsDefault: $("parts-default"),
   errorBanner: $("error-banner"),
   errorTitle: $("error-title"),
   errorDetail: $("error-detail"),
@@ -27,16 +37,34 @@ const els = {
   statPages: $("stat-pages"),
   contentCounts: $("content-counts"),
   pageGrid: $("page-grid"),
+  contentPanel: $("content-panel"),
+  tabBar: $("tab-bar"),
+  tabBodies: $("tab-bodies"),
   statusPanel: $("status-panel"),
   statusBody: $("status-body"),
   warnCount: $("warn-count"),
   lightbox: $("lightbox"),
+  lbStage: $("lb-stage"),
   lbImage: $("lb-image"),
+  lbOverlaySvg: $("lb-overlay-svg"),
+  lbOverlayToggle: $("lb-overlay-toggle"),
   lbCaption: $("lb-caption"),
   lbPrev: $("lb-prev"),
   lbNext: $("lb-next"),
   lbClose: $("lb-close"),
+  fixtureList: $("fixture-list"),
+  modePages: $("mode-pages"),
+  modeFull: $("mode-full"),
+  modePdf: $("mode-pdf"),
+  speedIterations: $("speed-iterations"),
+  speedRun: $("speed-run"),
+  speedStatus: $("speed-status"),
+  speedResults: $("speed-results"),
+  resultsTbody: $("results-tbody"),
+  barChart: $("bar-chart"),
 };
+
+const SVG_NS = "http://www.w3.org/2000/svg";
 
 /* ---------- formatting helpers ---------- */
 
@@ -55,6 +83,122 @@ function formatMs(ms) {
   if (ms < 1000) return `${Math.round(ms)} ms`;
   return `${(ms / 1000).toFixed(2)} s`;
 }
+
+function formatDate(epochMs) {
+  if (!epochMs) return "";
+  return new Date(Number(epochMs)).toLocaleString();
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+/* ---------- view switching ---------- */
+
+function switchView(view) {
+  const speed = view === "speed";
+  els.viewRender.classList.toggle("hidden", speed);
+  els.viewSpeed.classList.toggle("hidden", !speed);
+  els.navRender.classList.toggle("active", !speed);
+  els.navSpeed.classList.toggle("active", speed);
+  if (speed) loadFixtures();
+}
+
+els.navRender.addEventListener("click", () => switchView("render"));
+els.navSpeed.addEventListener("click", () => switchView("speed"));
+
+/* ---------- document part selection (Feature 1) ---------- */
+
+// Order and labels of the DocumentPart enum (short names; the BFF prefixes
+// DOCUMENT_PART_). defaultOn mirrors the proto's empty-list semantics:
+// everything except CELL_LINE_RECTS.
+const PART_DEFS = [
+  { key: "PAGES", label: "Pages" },
+  { key: "METADATA", label: "Metadata" },
+  { key: "PARAGRAPHS", label: "Paragraphs" },
+  { key: "TABLES", label: "Tables" },
+  { key: "IMAGES", label: "Images" },
+  { key: "FOOTNOTES", label: "Footnotes" },
+  { key: "HEADERS_FOOTERS", label: "Headers/footers" },
+  { key: "PAGE_STYLES", label: "Page styles" },
+  { key: "INDEXES", label: "Indexes" },
+  { key: "SHEETS", label: "Sheets" },
+  { key: "SLIDES", label: "Slides" },
+  { key: "SHAPES", label: "Shapes" },
+  { key: "TEXT_FRAMES", label: "Text frames" },
+  { key: "EMBEDDED_OBJECTS", label: "Embedded objects" },
+  { key: "LINE_RECTS", label: "Line rects" },
+  { key: "CELL_LINE_RECTS", label: "Cell line rects", defaultOn: false },
+  { key: "COMMENTS", label: "Comments" },
+  { key: "TRACKED_CHANGES", label: "Tracked changes" },
+  { key: "BOOKMARKS", label: "Bookmarks" },
+  { key: "FORM_FIELDS", label: "Form fields" },
+];
+
+const partsSelected = new Set(
+  PART_DEFS.filter((p) => p.defaultOn !== false).map((p) => p.key));
+
+function isDefaultPartsSelection() {
+  const def = PART_DEFS.filter((p) => p.defaultOn !== false);
+  return partsSelected.size === def.length &&
+    def.every((p) => partsSelected.has(p.key));
+}
+
+// Query-string fragment for the current selection. The default selection
+// sends nothing: the server's empty-list behavior is exactly that default.
+function partsQuery() {
+  if (isDefaultPartsSelection() || partsSelected.size === 0) return "";
+  return "&parts=" + [...partsSelected].join(",");
+}
+
+function updatePartsSummary() {
+  if (isDefaultPartsSelection()) {
+    els.partsSummary.textContent = "everything (default)";
+  } else if (partsSelected.size === 0) {
+    els.partsSummary.textContent = "none selected: server default applies";
+  } else {
+    els.partsSummary.textContent =
+      `${partsSelected.size} of ${PART_DEFS.length} selected`;
+  }
+}
+
+function buildPartsChips() {
+  for (const def of PART_DEFS) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "part-chip" + (partsSelected.has(def.key) ? " on" : "");
+    chip.textContent = def.label;
+    chip.dataset.key = def.key;
+    chip.addEventListener("click", () => {
+      if (partsSelected.has(def.key)) partsSelected.delete(def.key);
+      else partsSelected.add(def.key);
+      chip.classList.toggle("on", partsSelected.has(def.key));
+      updatePartsSummary();
+    });
+    els.partsChips.appendChild(chip);
+  }
+  updatePartsSummary();
+}
+
+function setAllParts(pred) {
+  partsSelected.clear();
+  for (const def of PART_DEFS) {
+    if (pred(def)) partsSelected.add(def.key);
+  }
+  for (const chip of els.partsChips.children) {
+    chip.classList.toggle("on", partsSelected.has(chip.dataset.key));
+  }
+  updatePartsSummary();
+}
+
+els.partsAll.addEventListener("click", () => setAllParts(() => true));
+els.partsNone.addEventListener("click", () => setAllParts(() => false));
+els.partsDefault.addEventListener("click",
+  () => setAllParts((def) => def.defaultOn !== false));
+
+buildPartsChips();
 
 /* ---------- content-count labels ---------- */
 
@@ -100,6 +244,9 @@ const state = {
   liveTimer: null,
   startedAt: 0,
   lightboxIndex: -1,
+  pageRects: [], // DocumentInfo.pageRects, twips, document-absolute
+  lineBoxes: new Map(), // pageIndex -> [{x, y, w, h}] twips, doc-absolute
+  overlayOn: false,
 };
 
 /* ---------- service info ---------- */
@@ -135,12 +282,6 @@ function addChip(html) {
   chip.className = "chip";
   chip.innerHTML = html;
   els.chips.appendChild(chip);
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  }[c]));
 }
 
 /* ---------- error banner ---------- */
@@ -200,9 +341,12 @@ function resetSession(file) {
   state.expectedPages = null;
   state.startedAt = performance.now();
   state.lightboxIndex = -1;
+  state.pageRects = [];
+  state.lineBoxes = new Map();
 
   hideError();
   closeLightbox();
+  resetContentPanel();
   els.pageGrid.innerHTML = "";
   els.contentCounts.innerHTML = "";
   els.statusBody.innerHTML = "";
@@ -241,7 +385,7 @@ async function startRender(file) {
 
   try {
     const resp = await fetch(
-      "/api/render?filename=" + encodeURIComponent(file.name),
+      "/api/render?filename=" + encodeURIComponent(file.name) + partsQuery(),
       {
         method: "POST",
         headers: {
@@ -322,6 +466,8 @@ function handleEvent(evt) {
       break;
     default:
       bumpCount(evt.event);
+      collectLineBoxes(evt.event, evt.data);
+      contentEvent(evt.event, evt.data);
       break;
   }
 }
@@ -331,6 +477,7 @@ function onDocumentInfo(info) {
   els.docFormat.textContent = info.sourceFormat || "?";
   els.docClass.textContent = info.documentType || "?";
   state.expectedPages = info.pageCount;
+  state.pageRects = info.pageRects || [];
   els.docPages.textContent =
     `${info.pageCount} page${info.pageCount === 1 ? "" : "s"}`;
   els.statPages.textContent = `0 / ${info.pageCount}`;
@@ -417,6 +564,484 @@ function onGrpcError(err) {
     `${escapeHtml(err.message || "")}</div>`;
 }
 
+/* ---------- layout overlay collection (Feature 3) ---------- */
+
+function addLineBoxes(rects) {
+  for (const b of rects || []) {
+    if (b.pageIndex == null || b.pageIndex < 0) continue;
+    let list = state.lineBoxes.get(b.pageIndex);
+    if (!list) {
+      list = [];
+      state.lineBoxes.set(b.pageIndex, list);
+    }
+    list.push({
+      x: Number(b.xTwips), y: Number(b.yTwips),
+      w: Number(b.widthTwips), h: Number(b.heightTwips),
+    });
+  }
+}
+
+// Events that carry LineBox rects: Paragraph, TableData (and its cells when
+// CELL_LINE_RECTS is selected), EmbeddedImage.
+function collectLineBoxes(kind, data) {
+  if (data.lineRects) addLineBoxes(data.lineRects);
+  if (kind === "table") {
+    for (const cell of data.cells || []) {
+      if (cell.lineRects) addLineBoxes(cell.lineRects);
+    }
+  }
+}
+
+/* ---------- typed-content viewer (Feature 2) ---------- */
+
+const TAB_DEFS = [
+  { key: "text", label: "Text" },
+  { key: "tables", label: "Tables" },
+  { key: "sheets", label: "Sheets" },
+  { key: "slides", label: "Slides" },
+  { key: "metadata", label: "Metadata" },
+];
+
+const MAX_SHEET_ROWS = 200;
+const MAX_SHEET_COLS = 40;
+
+// Per-session viewer state; rebuilt by resetContentPanel().
+let content = null;
+
+function resetContentPanel() {
+  els.tabBar.innerHTML = "";
+  els.tabBodies.innerHTML = "";
+  els.contentPanel.classList.add("hidden");
+  content = {
+    tabs: new Map(), // key -> { btn, body, count }
+    activeTab: null,
+    textFlow: null, // container for paragraphs
+    footnotesSection: null,
+    commentsSection: null,
+    sheets: new Map(), // sheetIndex -> { tbody, rows, cols, startCol, truncNote }
+    slides: new Map(), // slideIndex -> { shapesDiv, notesDiv }
+  };
+  for (const def of TAB_DEFS) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "tab-btn hidden";
+    btn.setAttribute("role", "tab");
+    btn.innerHTML =
+      `${escapeHtml(def.label)}<span class="tab-count"></span>`;
+    const body = document.createElement("div");
+    body.className = "tab-body";
+    btn.addEventListener("click", () => activateTab(def.key));
+    els.tabBar.appendChild(btn);
+    els.tabBodies.appendChild(body);
+    content.tabs.set(def.key, { btn, body, count: 0 });
+  }
+}
+
+function activateTab(key) {
+  for (const [k, tab] of content.tabs) {
+    const active = k === key;
+    tab.btn.classList.toggle("active", active);
+    tab.body.classList.toggle("active", active);
+  }
+  content.activeTab = key;
+}
+
+// Returns the tab body, unhiding the tab (and the panel) on first content.
+function tab(key, delta = 1) {
+  const t = content.tabs.get(key);
+  t.count += delta;
+  if (t.btn.classList.contains("hidden")) {
+    t.btn.classList.remove("hidden");
+    els.contentPanel.classList.remove("hidden");
+    if (!content.activeTab) activateTab(key);
+  }
+  t.btn.querySelector(".tab-count").textContent =
+    t.count > 0 ? String(t.count) : "";
+  return t.body;
+}
+
+// One styled run -> inline DOM. Hyperlinks become real links.
+function renderRun(run) {
+  let node;
+  if (run.hyperlinkUrl) {
+    node = document.createElement("a");
+    node.href = run.hyperlinkUrl;
+    node.target = "_blank";
+    node.rel = "noopener noreferrer";
+    if (run.hyperlinkName) node.title = run.hyperlinkName;
+  } else {
+    node = document.createElement("span");
+  }
+  node.textContent = run.text || "";
+  if (run.weight >= 150) node.style.fontWeight = "700";
+  if (run.italic) node.style.fontStyle = "italic";
+  const deco = [];
+  if (run.underline) deco.push("underline");
+  if (run.strikethrough) deco.push("line-through");
+  if (deco.length) node.style.textDecoration = deco.join(" ");
+  return node;
+}
+
+function paragraphText(runs) {
+  return (runs || []).map((r) => r.text || "").join("");
+}
+
+function runsInto(el, runs) {
+  for (const run of runs || []) {
+    if (run.text) el.appendChild(renderRun(run));
+  }
+  return el;
+}
+
+/* text tab */
+
+function textFlow() {
+  const body = tab("text", 0);
+  if (!content.textFlow) {
+    content.textFlow = document.createElement("div");
+    body.insertBefore(content.textFlow, body.firstChild);
+  }
+  return content.textFlow;
+}
+
+function onParagraphEvent(p) {
+  if (!paragraphText(p.runs).trim()) return; // skip empty spacer paragraphs
+  tab("text");
+  const el = document.createElement("p");
+  const level = p.outlineLevel || 0;
+  if (level >= 1) {
+    el.className = "ct-h " +
+      (level === 1 ? "ct-h1" : level === 2 ? "ct-h2" : "ct-h3");
+  } else {
+    el.className = "ct-para" + (p.listLevel >= 0 ? " ct-list" : "");
+    if (p.listLevel > 0) el.style.marginLeft = `${p.listLevel * 22}px`;
+  }
+  runsInto(el, p.runs);
+  textFlow().appendChild(el);
+}
+
+function textSection(prop, title) {
+  if (!content[prop]) {
+    const body = tab("text", 0);
+    const head = document.createElement("div");
+    head.className = "ct-section-head";
+    head.textContent = title;
+    const sec = document.createElement("div");
+    body.appendChild(head);
+    body.appendChild(sec);
+    content[prop] = sec;
+  }
+  return content[prop];
+}
+
+function onFootnoteEvent(f) {
+  tab("text");
+  const el = document.createElement("p");
+  el.className = "ct-note";
+  const label = document.createElement("b");
+  label.textContent = (f.endnote ? "endnote " : "footnote ") + (f.label || "");
+  el.appendChild(label);
+  el.appendChild(document.createTextNode("  "));
+  runsInto(el, f.runs);
+  textSection("footnotesSection", "Footnotes & endnotes").appendChild(el);
+}
+
+function onCommentEvent(c) {
+  tab("text");
+  const el = document.createElement("div");
+  el.className = "ct-comment";
+  const meta = document.createElement("div");
+  meta.className = "ct-comment-meta";
+  const when = formatDate(c.epochMs);
+  meta.textContent = [c.author || "unknown author", when]
+    .filter(Boolean).join(" \u00b7 ") +
+    (c.resolved ? " \u00b7 resolved" : "");
+  el.appendChild(meta);
+  const text = document.createElement("div");
+  text.textContent = c.text || paragraphText(c.runs);
+  el.appendChild(text);
+  if (c.anchoredText) {
+    const anchor = document.createElement("div");
+    anchor.className = "ct-comment-meta";
+    anchor.textContent = `on: "${c.anchoredText}"`;
+    el.appendChild(anchor);
+  }
+  textSection("commentsSection", "Comments").appendChild(el);
+}
+
+/* tables tab */
+
+function onTableEvent(t) {
+  const body = tab("tables");
+  const caption = document.createElement("div");
+  caption.className = "ct-table-caption";
+  caption.textContent =
+    `table ${t.index + 1} \u00b7 page ${t.pageIndex + 1} \u00b7 ` +
+    `${t.rows}\u00d7${t.columns}`;
+  body.appendChild(caption);
+
+  const table = document.createElement("table");
+  table.className = "ct-table";
+  // Base grid, addressed by row/column; cells outside the base grid (split
+  // or merged, row -1) are appended below by their office cell name.
+  const grid = [];
+  for (let r = 0; r < t.rows; r++) grid.push(new Array(t.columns).fill(null));
+  const extras = [];
+  for (const cell of t.cells || []) {
+    if (cell.row >= 0 && cell.row < t.rows &&
+        cell.column >= 0 && cell.column < t.columns) {
+      grid[cell.row][cell.column] = cell;
+    } else {
+      extras.push(cell);
+    }
+  }
+  for (let r = 0; r < t.rows; r++) {
+    const tr = document.createElement("tr");
+    for (let c = 0; c < t.columns; c++) {
+      const td = document.createElement("td");
+      const cell = grid[r][c];
+      if (cell) {
+        td.textContent = cell.text || "";
+        td.title = cell.name || "";
+      }
+      tr.appendChild(td);
+    }
+    table.appendChild(tr);
+  }
+  body.appendChild(table);
+  if (extras.length) {
+    const note = document.createElement("div");
+    note.className = "ct-table-caption";
+    note.textContent = "off-grid cells: " + extras
+      .map((c) => `${c.name}="${c.text || ""}"`).join("  ");
+    body.appendChild(note);
+  }
+}
+
+/* sheets tab */
+
+function sheetEntry(sheetIndex, header) {
+  let entry = content.sheets.get(sheetIndex);
+  if (entry) return entry;
+  const body = tab("sheets", 0);
+
+  const caption = document.createElement("div");
+  caption.className = "ct-table-caption";
+  caption.textContent = header
+    ? `sheet ${sheetIndex + 1}: ${header.name}` +
+      (header.visible === false ? " (hidden)" : "")
+    : `sheet ${sheetIndex + 1}`;
+  body.appendChild(caption);
+
+  const startCol = header ? header.usedStartColumn : 0;
+  const endCol = header
+    ? Math.min(header.usedEndColumn, startCol + MAX_SHEET_COLS - 1)
+    : startCol + MAX_SHEET_COLS - 1;
+
+  const table = document.createElement("table");
+  table.className = "ct-table";
+  const thead = document.createElement("tr");
+  thead.appendChild(document.createElement("th")); // row-number corner
+  for (let c = startCol; c <= endCol; c++) {
+    const th = document.createElement("th");
+    th.textContent = columnName(c);
+    thead.appendChild(th);
+  }
+  table.appendChild(thead);
+  body.appendChild(table);
+
+  const truncNote = document.createElement("div");
+  truncNote.className = "ct-sheet-truncated hidden";
+  body.appendChild(truncNote);
+
+  entry = { table, rows: 0, startCol, endCol, truncNote };
+  content.sheets.set(sheetIndex, entry);
+  return entry;
+}
+
+function columnName(c) {
+  let name = "";
+  let n = c;
+  do {
+    name = String.fromCharCode(65 + (n % 26)) + name;
+    n = Math.floor(n / 26) - 1;
+  } while (n >= 0);
+  return name;
+}
+
+function onSheetEvent(s) {
+  tab("sheets");
+  sheetEntry(s.index, s);
+}
+
+function onSheetRowEvent(r) {
+  tab("sheets");
+  const entry = sheetEntry(r.sheetIndex, null);
+  if (entry.rows >= MAX_SHEET_ROWS) {
+    entry.truncNote.classList.remove("hidden");
+    entry.truncNote.textContent =
+      `showing first ${MAX_SHEET_ROWS} used rows; more rows streamed`;
+    return;
+  }
+  entry.rows++;
+  const tr = document.createElement("tr");
+  const th = document.createElement("th");
+  th.textContent = String(r.row + 1);
+  tr.appendChild(th);
+  const byCol = new Map((r.cells || []).map((c) => [c.column, c]));
+  for (let c = entry.startCol; c <= entry.endCol; c++) {
+    const td = document.createElement("td");
+    const cell = byCol.get(c);
+    if (cell) {
+      td.textContent = cell.display || "";
+      if (cell.formula) td.title = cell.formula;
+    }
+    tr.appendChild(td);
+  }
+  entry.table.appendChild(tr);
+}
+
+/* slides tab */
+
+function slideEntry(slideIndex, header) {
+  let entry = content.slides.get(slideIndex);
+  if (entry) return entry;
+  const body = tab("slides", 0);
+
+  const box = document.createElement("div");
+  box.className = "ct-slide";
+  const head = document.createElement("div");
+  head.className = "ct-slide-head";
+  const title = document.createElement("b");
+  title.textContent = header?.name || `Slide ${slideIndex + 1}`;
+  head.appendChild(title);
+  if (header?.masterPageName) {
+    const master = document.createElement("span");
+    master.className = "ct-slide-master";
+    master.textContent = `master: ${header.masterPageName}`;
+    head.appendChild(master);
+  }
+  box.appendChild(head);
+  const shapesDiv = document.createElement("div");
+  box.appendChild(shapesDiv);
+  body.appendChild(box);
+
+  entry = { shapesDiv };
+  content.slides.set(slideIndex, entry);
+  return entry;
+}
+
+function onSlideEvent(s) {
+  tab("slides");
+  slideEntry(s.index, s);
+}
+
+function onSlideShapeEvent(s) {
+  tab("slides");
+  const entry = slideEntry(s.slideIndex, null);
+  const div = document.createElement("div");
+  div.className = "ct-shape";
+
+  const meta = document.createElement("div");
+  meta.className = "ct-shape-meta";
+  const role = document.createElement("span");
+  if (s.notes) {
+    role.className = "ct-role ct-role-notes";
+    role.textContent = "speaker notes";
+  } else {
+    role.className = "ct-role";
+    const r = (s.placeholderRole || "").replace(/^PLACEHOLDER_ROLE_/, "");
+    role.textContent = r && r !== "NONE" ? r.toLowerCase() : "shape";
+  }
+  meta.appendChild(role);
+  const type = document.createElement("span");
+  type.className = "ct-shape-type";
+  type.textContent = (s.shapeType || "").replace(/^com\.sun\.star\./, "");
+  meta.appendChild(type);
+  div.appendChild(meta);
+
+  let hasText = false;
+  for (const para of s.paragraphs || []) {
+    const text = paragraphText(para.runs);
+    if (!text.trim()) continue;
+    hasText = true;
+    const p = document.createElement("p");
+    p.className = "ct-slide-para";
+    p.style.marginLeft = `${(para.outlineDepth || 0) * 18}px`;
+    runsInto(p, para.runs);
+    div.appendChild(p);
+  }
+  if (!hasText && s.isEmptyPlaceholder) {
+    const p = document.createElement("p");
+    p.className = "ct-slide-para";
+    p.style.color = "var(--text-dim)";
+    p.textContent = "(empty placeholder)";
+    div.appendChild(p);
+  }
+  entry.shapesDiv.appendChild(div);
+}
+
+/* metadata tab */
+
+function onMetadataEvent(m) {
+  const body = tab("metadata");
+  const dl = document.createElement("dl");
+  dl.className = "ct-meta-grid";
+  const add = (label, value) => {
+    if (value == null || value === "" ||
+        (Array.isArray(value) && !value.length)) return;
+    const dt = document.createElement("dt");
+    dt.textContent = label;
+    const dd = document.createElement("dd");
+    dd.textContent = Array.isArray(value) ? value.join(", ") : String(value);
+    dl.appendChild(dt);
+    dl.appendChild(dd);
+  };
+  add("title", m.title);
+  add("author", m.author);
+  add("subject", m.subject);
+  add("keywords", m.keywords);
+  add("created", formatDate(m.createdEpochMs));
+  add("modified", formatDate(m.modifiedEpochMs));
+  add("modified by", m.modifiedBy);
+  add("generator", m.generator);
+  add("language", m.language);
+  add("template", m.templateName);
+  if (m.editingCycles) add("editing cycles", m.editingCycles);
+  if (m.editingDurationSeconds) {
+    add("editing time", formatMs(Number(m.editingDurationSeconds) * 1000));
+  }
+  add("printed", formatDate(m.printedEpochMs));
+  add("printed by", m.printedBy);
+  for (const [k, v] of Object.entries(m.statistics || {})) {
+    add(k, Number(v));
+  }
+  for (const up of m.userProperties || []) {
+    const v = up.value === "epochMs" ? formatDate(up.epochMs) : up[up.value];
+    add(up.name, v);
+  }
+  body.appendChild(dl);
+}
+
+/* dispatcher for typed content */
+
+function contentEvent(kind, data) {
+  switch (kind) {
+    case "paragraph": onParagraphEvent(data); break;
+    case "footnote": onFootnoteEvent(data); break;
+    case "comment": onCommentEvent(data); break;
+    case "table": onTableEvent(data); break;
+    case "sheet": onSheetEvent(data); break;
+    case "sheetRow": onSheetRowEvent(data); break;
+    case "slide": onSlideEvent(data); break;
+    case "slideShape": onSlideShapeEvent(data); break;
+    case "metadata": onMetadataEvent(data); break;
+    default: break;
+  }
+}
+
+resetContentPanel();
+
 /* ---------- PDF download ---------- */
 
 els.pdfButton.addEventListener("click", async () => {
@@ -467,20 +1092,63 @@ els.pdfButton.addEventListener("click", async () => {
   }
 });
 
-/* ---------- lightbox ---------- */
+/* ---------- lightbox + overlay (Feature 3) ---------- */
 
 function openLightbox(pos) {
   if (pos < 0 || pos >= state.pages.length) return;
   state.lightboxIndex = pos;
   const page = state.pages[pos];
   els.lbImage.src = page.dataUrl;
+  const boxes = state.lineBoxes.get(page.index) || [];
   els.lbCaption.textContent =
     `Page ${page.index + 1} of ${state.expectedPages ?? state.pages.length}` +
-    ` \u00b7 ${page.widthPx}\u00d7${page.heightPx} @ ${page.dpi} dpi`;
+    ` \u00b7 ${page.widthPx}\u00d7${page.heightPx} @ ${page.dpi} dpi` +
+    (boxes.length ? ` \u00b7 ${boxes.length} line boxes` : "");
   els.lbPrev.disabled = pos === 0;
   els.lbNext.disabled = pos === state.pages.length - 1;
+  els.lbOverlayToggle.disabled = state.lineBoxes.size === 0;
   els.lightbox.classList.remove("hidden");
+  drawOverlay();
 }
+
+// Draws the current page's line boxes over the image. LineBox coordinates
+// are document-absolute twips; the page's PageRect origin maps them to
+// page-local twips, and dpi/1440 maps those to the PNG's pixel space. The
+// SVG viewBox is that pixel space, so CSS scaling of the displayed image
+// applies to the boxes for free.
+function drawOverlay() {
+  const svg = els.lbOverlaySvg;
+  svg.innerHTML = "";
+  const pos = state.lightboxIndex;
+  if (!state.overlayOn || pos < 0) {
+    svg.classList.add("hidden");
+    return;
+  }
+  const page = state.pages[pos];
+  const pageRect = state.pageRects[page.index];
+  const boxes = state.lineBoxes.get(page.index) || [];
+  if (!pageRect || !boxes.length) {
+    svg.classList.add("hidden");
+    return;
+  }
+  svg.setAttribute("viewBox", `0 0 ${page.widthPx} ${page.heightPx}`);
+  const scale = page.dpi / 1440; // twips -> px at the rendered dpi
+  for (const b of boxes) {
+    const rect = document.createElementNS(SVG_NS, "rect");
+    rect.setAttribute("x", ((b.x - Number(pageRect.xTwips)) * scale).toFixed(1));
+    rect.setAttribute("y", ((b.y - Number(pageRect.yTwips)) * scale).toFixed(1));
+    rect.setAttribute("width", (b.w * scale).toFixed(1));
+    rect.setAttribute("height", (b.h * scale).toFixed(1));
+    svg.appendChild(rect);
+  }
+  svg.classList.remove("hidden");
+}
+
+els.lbOverlayToggle.addEventListener("click", () => {
+  state.overlayOn = !state.overlayOn;
+  els.lbOverlayToggle.setAttribute("aria-pressed", String(state.overlayOn));
+  drawOverlay();
+});
 
 function closeLightbox() {
   els.lightbox.classList.add("hidden");
@@ -498,7 +1166,251 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") closeLightbox();
   else if (e.key === "ArrowLeft") openLightbox(state.lightboxIndex - 1);
   else if (e.key === "ArrowRight") openLightbox(state.lightboxIndex + 1);
+  else if (e.key === "o" || e.key === "O") els.lbOverlayToggle.click();
 });
+
+/* ---------- speed test (Feature 4) ---------- */
+
+const speed = {
+  fixtures: null, // [{name, bytes}] once loaded
+  bytesCache: new Map(), // name -> ArrayBuffer
+  running: false,
+};
+
+async function loadFixtures() {
+  if (speed.fixtures) return;
+  try {
+    const resp = await fetch("/api/fixtures");
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const { files } = await resp.json();
+    speed.fixtures = files;
+    els.fixtureList.innerHTML = "";
+    for (const f of files) {
+      const label = document.createElement("label");
+      label.className = "check-row";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = true;
+      cb.dataset.name = f.name;
+      const name = document.createElement("span");
+      name.textContent = f.name;
+      const size = document.createElement("span");
+      size.className = "fx-size";
+      size.textContent = formatBytes(f.bytes);
+      label.appendChild(cb);
+      label.appendChild(name);
+      label.appendChild(size);
+      els.fixtureList.appendChild(label);
+    }
+  } catch (err) {
+    els.fixtureList.innerHTML = "";
+    const chip = document.createElement("span");
+    chip.className = "chip chip-bad";
+    chip.textContent = "could not list fixtures: " + String(err.message || err);
+    els.fixtureList.appendChild(chip);
+  }
+}
+
+async function fixtureBytes(name) {
+  let bytes = speed.bytesCache.get(name);
+  if (!bytes) {
+    const resp = await fetch("/api/fixtures/" + encodeURIComponent(name));
+    if (!resp.ok) throw new Error(`fixture fetch HTTP ${resp.status}`);
+    bytes = await resp.arrayBuffer();
+    speed.bytesCache.set(name, bytes);
+  }
+  return bytes;
+}
+
+const SPEED_MODES = [
+  { key: "pages", label: "pages-only", el: () => els.modePages,
+    endpoint: "render", query: "&parts=PAGES" },
+  { key: "full", label: "full", el: () => els.modeFull,
+    endpoint: "render", query: "" },
+  { key: "pdf", label: "pdf", el: () => els.modePdf,
+    endpoint: "pdf", query: "" },
+];
+
+// One measured request. Returns {ttfpMs, totalMs, pages, bytes}; for pdf
+// mode ttfpMs/pages stay null.
+async function speedRun(name, body, mode) {
+  const t0 = performance.now();
+  const resp = await fetch(
+    `/api/${mode.endpoint}?filename=${encodeURIComponent(name)}${mode.query}`,
+    { method: "POST", body });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+  const reader = resp.body.getReader();
+  const result = { ttfpMs: null, totalMs: 0, pages: null, bytes: 0 };
+
+  if (mode.endpoint === "pdf") {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      result.bytes += value.byteLength;
+    }
+    result.totalMs = performance.now() - t0;
+    return result;
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  result.pages = 0;
+  let sawError = null;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    result.bytes += value.byteLength;
+    buffer += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (!line) continue;
+      const evt = JSON.parse(line);
+      if (evt.event === "pageImage") {
+        result.pages++;
+        if (result.ttfpMs == null) result.ttfpMs = performance.now() - t0;
+      } else if (evt.event === "error") {
+        sawError = evt.data;
+      }
+    }
+  }
+  result.totalMs = performance.now() - t0;
+  if (sawError) {
+    throw new Error(`${sawError.codeName}: ${sawError.message}`);
+  }
+  return result;
+}
+
+function avg(list) {
+  return list.length
+    ? list.reduce((a, b) => a + b, 0) / list.length
+    : null;
+}
+
+els.speedRun.addEventListener("click", async () => {
+  if (speed.running) return;
+  const picked = [...els.fixtureList.querySelectorAll("input:checked")]
+    .map((cb) => cb.dataset.name);
+  const modes = SPEED_MODES.filter((m) => m.el().checked);
+  const iterations = Math.max(1,
+    Math.min(20, Number(els.speedIterations.value) || 2));
+  if (!picked.length || !modes.length) {
+    els.speedStatus.textContent = "pick at least one fixture and one mode";
+    return;
+  }
+
+  speed.running = true;
+  els.speedRun.disabled = true;
+  els.speedResults.classList.add("hidden");
+  els.resultsTbody.innerHTML = "";
+  els.barChart.innerHTML = "";
+
+  // rows: one per fixture x mode, aggregated over iterations
+  const rows = [];
+  const totalRuns = picked.length * modes.length * iterations;
+  let doneRuns = 0;
+  try {
+    for (const name of picked) {
+      const body = await fixtureBytes(name);
+      for (const mode of modes) {
+        const runs = [];
+        let error = null;
+        for (let i = 0; i < iterations; i++) {
+          doneRuns++;
+          els.speedStatus.textContent =
+            `${name} \u00b7 ${mode.label} \u00b7 run ${i + 1}/${iterations}` +
+            ` (${doneRuns}/${totalRuns})`;
+          try {
+            runs.push(await speedRun(name, body, mode));
+          } catch (err) {
+            error = String(err.message || err);
+            break;
+          }
+        }
+        rows.push({ name, mode, runs, error });
+      }
+    }
+  } finally {
+    speed.running = false;
+    els.speedRun.disabled = false;
+    els.speedStatus.textContent = "done";
+  }
+  renderSpeedResults(rows);
+});
+
+function renderSpeedResults(rows) {
+  els.resultsTbody.innerHTML = "";
+  for (const row of rows) {
+    const tr = document.createElement("tr");
+    const cells = [];
+    cells.push(row.name, row.mode.label);
+    if (row.error) {
+      cells.push(String(row.runs.length), "-", "-", "-", "-");
+    } else {
+      const totalMs = avg(row.runs.map((r) => r.totalMs));
+      const ttfp = avg(row.runs.map((r) => r.ttfpMs).filter((v) => v != null));
+      const pps = avg(row.runs
+        .filter((r) => r.pages != null && r.totalMs > 0)
+        .map((r) => r.pages / (r.totalMs / 1000)));
+      const bytes = avg(row.runs.map((r) => r.bytes));
+      cells.push(
+        String(row.runs.length),
+        ttfp != null ? formatMs(ttfp) : "-",
+        formatMs(totalMs),
+        pps != null ? pps.toFixed(2) : "-",
+        formatBytes(bytes));
+    }
+    cells.forEach((text, i) => {
+      const td = document.createElement("td");
+      td.textContent = text;
+      tr.appendChild(td);
+    });
+    if (row.error) {
+      const td = tr.lastChild;
+      td.textContent = row.error;
+      td.className = "err";
+      td.style.textAlign = "left";
+    }
+    els.resultsTbody.appendChild(tr);
+  }
+
+  // horizontal CSS bar chart of avg total ms per fixture/mode
+  els.barChart.innerHTML = "";
+  const bars = rows
+    .filter((r) => !r.error && r.runs.length)
+    .map((r) => ({
+      label: r.name,
+      mode: r.mode,
+      ms: avg(r.runs.map((x) => x.totalMs)),
+    }));
+  const maxMs = Math.max(1, ...bars.map((b) => b.ms));
+  for (const b of bars) {
+    const row = document.createElement("div");
+    row.className = "bar-row";
+    const label = document.createElement("div");
+    label.className = "bar-label";
+    label.innerHTML = `<b>${escapeHtml(b.label)}</b> \u00b7 ${escapeHtml(b.mode.label)}`;
+    const track = document.createElement("div");
+    track.className = "bar-track";
+    const fill = document.createElement("div");
+    fill.className = "bar-fill" +
+      (b.mode.key === "pdf" ? " bar-pdf" : b.mode.key === "pages" ? " bar-pages" : "");
+    track.appendChild(fill);
+    const value = document.createElement("div");
+    value.className = "bar-value";
+    value.textContent = formatMs(b.ms);
+    row.appendChild(label);
+    row.appendChild(track);
+    row.appendChild(value);
+    els.barChart.appendChild(row);
+    requestAnimationFrame(() => {
+      fill.style.width = `${(b.ms / maxMs) * 100}%`;
+    });
+  }
+  els.speedResults.classList.remove("hidden");
+}
 
 /* ---------- boot ---------- */
 

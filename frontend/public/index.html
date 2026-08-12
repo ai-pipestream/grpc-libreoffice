@@ -15,6 +15,10 @@
       <h1>grlibre</h1>
       <p>LibreOffice render service</p>
     </div>
+    <nav class="view-nav" aria-label="View">
+      <button class="view-tab active" id="nav-render" data-view="render">Render</button>
+      <button class="view-tab" id="nav-speed" data-view="speed">Speed test</button>
+    </nav>
   </div>
   <div class="chips" id="info-chips">
     <span class="chip chip-muted" id="chip-loading">connecting to service&hellip;</span>
@@ -22,6 +26,10 @@
 </header>
 
 <main>
+
+<!-- ==================== render view ==================== -->
+<div id="view-render">
+
   <section class="drop-zone" id="drop-zone" tabindex="0" role="button"
            aria-label="Upload a document">
     <div class="drop-inner">
@@ -40,6 +48,21 @@
     </div>
     <input type="file" id="file-input" hidden>
   </section>
+
+  <details class="parts-panel" id="parts-panel">
+    <summary>Parts <span class="parts-summary" id="parts-summary">everything (default)</span></summary>
+    <div class="parts-body">
+      <p class="parts-hint">Select which document parts the server extracts and
+        streams. Everything selected sends the server default; cell line rects
+        must be requested explicitly.</p>
+      <div class="parts-chips" id="parts-chips"></div>
+      <div class="parts-actions">
+        <button class="btn btn-small" id="parts-all">Select all</button>
+        <button class="btn btn-small" id="parts-none">Select none</button>
+        <button class="btn btn-small" id="parts-default">Default</button>
+      </div>
+    </div>
+  </details>
 
   <section class="banner banner-error hidden" id="error-banner" role="alert">
     <div>
@@ -83,17 +106,82 @@
 
   <section class="page-grid" id="page-grid"></section>
 
+  <section class="content-panel hidden" id="content-panel">
+    <div class="tab-bar" id="tab-bar" role="tablist"></div>
+    <div class="tab-bodies" id="tab-bodies"></div>
+  </section>
+
   <details class="status-panel hidden" id="status-panel">
     <summary>Render status &amp; warnings <span class="warn-count" id="warn-count"></span></summary>
     <div class="status-body" id="status-body"></div>
   </details>
+
+</div>
+
+<!-- ==================== speed test view ==================== -->
+<div id="view-speed" class="hidden">
+
+  <section class="speed-config">
+    <h2 class="speed-title">In-browser speed test</h2>
+    <p class="speed-sub">Runs the selected fixtures sequentially through the
+      live endpoints and measures in the browser: time to first page event,
+      total stream time, pages per second.</p>
+
+    <div class="speed-columns">
+      <div class="speed-col">
+        <h3>Fixtures</h3>
+        <div class="fixture-list" id="fixture-list">
+          <span class="chip chip-muted">loading fixtures&hellip;</span>
+        </div>
+      </div>
+      <div class="speed-col">
+        <h3>Modes</h3>
+        <label class="check-row"><input type="checkbox" id="mode-pages" checked>
+          <span>pages-only <code>parts=PAGES</code></span></label>
+        <label class="check-row"><input type="checkbox" id="mode-full" checked>
+          <span>full <code>StreamPages, every part</code></span></label>
+        <label class="check-row"><input type="checkbox" id="mode-pdf" checked>
+          <span>pdf <code>ConvertToPdf</code></span></label>
+        <h3>Iterations</h3>
+        <input type="number" id="speed-iterations" class="num-input"
+               min="1" max="20" value="2">
+        <div class="speed-run-row">
+          <button class="btn btn-primary" id="speed-run">Run speed test</button>
+          <span class="speed-status" id="speed-status"></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="speed-results hidden" id="speed-results">
+    <h3>Results <span class="speed-note">(averages over iterations)</span></h3>
+    <div class="table-scroll">
+      <table class="results-table" id="results-table">
+        <thead>
+          <tr><th>fixture</th><th>mode</th><th>runs</th>
+              <th>first page</th><th>total</th><th>pages/sec</th><th>received</th></tr>
+        </thead>
+        <tbody id="results-tbody"></tbody>
+      </table>
+    </div>
+    <h3>Total time per file / mode</h3>
+    <div class="bar-chart" id="bar-chart"></div>
+  </section>
+
+</div>
+
 </main>
 
 <div class="lightbox hidden" id="lightbox" role="dialog" aria-modal="true">
   <button class="lb-close" id="lb-close" aria-label="Close">&times;</button>
+  <button class="lb-overlay-toggle" id="lb-overlay-toggle"
+          aria-pressed="false">Overlay</button>
   <button class="lb-nav lb-prev" id="lb-prev" aria-label="Previous page">&#8249;</button>
   <figure>
-    <img id="lb-image" alt="Full-size page">
+    <div class="lb-stage" id="lb-stage">
+      <img id="lb-image" alt="Full-size page">
+      <svg id="lb-overlay-svg" class="hidden" preserveAspectRatio="none"></svg>
+    </div>
     <figcaption id="lb-caption"></figcaption>
   </figure>
   <button class="lb-nav lb-next" id="lb-next" aria-label="Next page">&#8250;</button>
