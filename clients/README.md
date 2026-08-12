@@ -60,3 +60,16 @@ cd clients/java
 ./gradlew run --args="pages ../../fixtures/sample3.docx out"
 ./gradlew run --args="pdf ../../fixtures/sample3.docx out.pdf"
 ```
+
+## Testing
+
+`scripts/test-clients.sh` (run from the repo root) is the cross-language
+conformance test. It boots a private server on port 50253 (override with
+`CLIENTS_TEST_PORT`; the shared 50053 instance is never touched), sets up any
+missing client prerequisites (Python venv + stubs, `npm ci`, Gradle
+`installDist`), and runs all three clients against it: `info` must succeed,
+`pages` must produce the same number of valid PNGs in every language, `pdf`
+outputs must carry the `%PDF` magic with byte sizes agreeing within 1%, and a
+file with an unresolvable extension must fail with a nonzero exit. It prints
+a per-language PASS/FAIL table and exits nonzero on any failure. It also runs
+as an optional leg of the smoke test: `scripts/e2e-smoke.sh --clients`.
