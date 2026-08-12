@@ -2,3 +2,17 @@ build/
 .idea/
 .cache/
 compile_commands.json
+
+# demo/bench artifacts
+bench/.venv/
+bench/gen/
+bench/last-run.json
+fixtures/*
+!fixtures/fetch.sh
+clients/python/.venv/
+clients/python/gen/
+clients/**/node_modules/
+clients/java/.gradle/
+clients/java/build/
+frontend/node_modules/
+frontend/out/

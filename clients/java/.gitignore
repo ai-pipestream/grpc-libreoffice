@@ -1,0 +1,4 @@
+build/
+.gradle/
+pages-out/
+out.pdf

@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>grlibre — LibreOffice render service</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <div class="brand-text">
+      <h1>grlibre</h1>
+      <p>LibreOffice render service</p>
+    </div>
+  </div>
+  <div class="chips" id="info-chips">
+    <span class="chip chip-muted" id="chip-loading">connecting to service&hellip;</span>
+  </div>
+</header>
+
+<main>
+  <section class="drop-zone" id="drop-zone" tabindex="0" role="button"
+           aria-label="Upload a document">
+    <div class="drop-inner">
+      <div class="drop-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="44" height="44" fill="none"
+             stroke="currentColor" stroke-width="1.5" stroke-linecap="round"
+             stroke-linejoin="round">
+          <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/>
+          <path d="M14 3v5h5"/>
+          <path d="M12 18v-6"/>
+          <path d="M9.5 14.5 12 12l2.5 2.5"/>
+        </svg>
+      </div>
+      <p class="drop-title">Drop a document here, or click to browse</p>
+      <p class="drop-sub" id="drop-formats">Accepted formats load from the service&hellip;</p>
+    </div>
+    <input type="file" id="file-input" hidden>
+  </section>
+
+  <section class="banner banner-error hidden" id="error-banner" role="alert">
+    <div>
+      <strong id="error-title">Error</strong>
+      <span id="error-detail"></span>
+    </div>
+    <button class="banner-dismiss" id="error-dismiss" aria-label="Dismiss">&times;</button>
+  </section>
+
+  <section class="doc-card hidden" id="doc-card">
+    <div class="doc-card-main">
+      <div class="doc-identity">
+        <h2 id="doc-filename">document</h2>
+        <div class="doc-tags">
+          <span class="tag" id="doc-format"></span>
+          <span class="tag" id="doc-class"></span>
+          <span class="tag" id="doc-pages"></span>
+        </div>
+      </div>
+      <div class="doc-actions">
+        <button class="btn btn-primary" id="pdf-button" disabled>Download as PDF</button>
+        <span class="pdf-time" id="pdf-time"></span>
+      </div>
+    </div>
+
+    <div class="stats-strip" id="stats-strip">
+      <div class="stat"><span class="stat-label">First page</span>
+        <span class="stat-value" id="stat-first-page">&ndash;</span></div>
+      <div class="stat"><span class="stat-label">Total time</span>
+        <span class="stat-value" id="stat-total">&ndash;</span></div>
+      <div class="stat"><span class="stat-label">Pages / sec</span>
+        <span class="stat-value" id="stat-pps">&ndash;</span></div>
+      <div class="stat"><span class="stat-label">Bytes received</span>
+        <span class="stat-value" id="stat-bytes">&ndash;</span></div>
+      <div class="stat"><span class="stat-label">Pages</span>
+        <span class="stat-value" id="stat-pages">&ndash;</span></div>
+    </div>
+
+    <div class="content-counts" id="content-counts"></div>
+  </section>
+
+  <section class="page-grid" id="page-grid"></section>
+
+  <details class="status-panel hidden" id="status-panel">
+    <summary>Render status &amp; warnings <span class="warn-count" id="warn-count"></span></summary>
+    <div class="status-body" id="status-body"></div>
+  </details>
+</main>
+
+<div class="lightbox hidden" id="lightbox" role="dialog" aria-modal="true">
+  <button class="lb-close" id="lb-close" aria-label="Close">&times;</button>
+  <button class="lb-nav lb-prev" id="lb-prev" aria-label="Previous page">&#8249;</button>
+  <figure>
+    <img id="lb-image" alt="Full-size page">
+    <figcaption id="lb-caption"></figcaption>
+  </figure>
+  <button class="lb-nav lb-next" id="lb-next" aria-label="Next page">&#8250;</button>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

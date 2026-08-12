@@ -214,3 +214,31 @@ docker run --rm --read-only --tmpfs /tmp:rw,size=1g -p 50053:50053 grlibre
 The image build runs the full test suite, including real renders through a
 headless LibreOffice, before an image can exist. Tests author their fixtures
 in memory; the render tests skip cleanly on machines without LibreOffice.
+
+## Demo kit
+
+The repo carries a self-contained demo and evaluation kit around the server;
+none of it is needed to build or run the service itself.
+
+![The demo frontend rendering a docx: pages stream in as thumbnails while
+live stats show time to first page, pages per second, and typed-content
+counts.](docs/frontend.png)
+
+- `fixtures/fetch.sh` downloads (or locally converts) a sample document set:
+  docx, doc, xlsx, xls, pptx, odt, rtf, pdf, including a 224-page docx for
+  stress runs.
+- `frontend/` is a demo web UI: a small Node BFF speaks gRPC to the server
+  and streams events to the browser, which shows page images popping in as
+  they arrive, live timing stats, typed-content counts, and one-click PDF
+  download. `npm install && npm start` in `frontend/`, then open
+  `http://localhost:8080`.
+- `clients/` holds example clients in Python, Node.js, and Java. Each is a
+  small CLI with the same three subcommands: `info`, `pages <file> [outdir]`,
+  `pdf <file> [out.pdf]`. See `clients/README.md`.
+- `bench/run.sh` is the speed test: per-document latency (time to first
+  page, total, pages/sec) in pages-only, full-extraction, and PDF modes,
+  plus a concurrency sweep for throughput. See `bench/README.md` for sample
+  numbers.
+- `scripts/e2e-smoke.sh` boots a private server on a free port, streams a
+  fixture through both RPCs, and fails loudly on any regression — the
+  quickest "is the tree healthy" check after a build.

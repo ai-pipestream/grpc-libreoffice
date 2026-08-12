@@ -1,0 +1,5 @@
+.venv/
+gen/
+__pycache__/
+pages-out/
+out.pdf
