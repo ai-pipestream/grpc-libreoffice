@@ -9,8 +9,13 @@ Measures per-document latency and whole-service throughput against a running
 ./run.sh --iterations 5 --concurrency 1,2,4,8 --json results.json
 ./run.sh --files ../fixtures/sample4.docx --modes pdf
 ./run.sh --modes pages-only --dpi 72   # per-request DPI override
+./run.sh --modes pages-only --pages 100 --files ../fixtures/sample4.docx
 ./test.sh                     # unit tests (no server needed)
 ```
+
+`--pages` exercises the page-range feature: on the 224-page sample4.docx,
+`--pages 100` returns that single page in ~650 ms where the full paint takes
+~14 s — the load and layout are paid once, the other 223 paints never happen.
 
 Three modes per file:
 

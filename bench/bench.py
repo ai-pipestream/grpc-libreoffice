@@ -55,11 +55,13 @@ def upload_requests(path, request_cls, options=None):
         offset = end
 
 
-def run_pages(stub, path, pages_only, dpi=0):
+def run_pages(stub, path, pages_only, dpi=0, page_range=(0, 0)):
     options = None
-    if pages_only or dpi:
+    if pages_only or dpi or page_range != (0, 0):
         parts = [pb.DOCUMENT_PART_PAGES] if pages_only else []
-        options = pb.StreamOptions(parts=parts, render_dpi=dpi)
+        options = pb.StreamOptions(parts=parts, render_dpi=dpi,
+                                   first_page=page_range[0],
+                                   last_page=page_range[1])
     start = time.perf_counter()
     m = {"ttfb": None, "ttfp": None, "pages": 0, "out_bytes": 0,
          "events": 0, "render_millis": None}
@@ -103,10 +105,11 @@ def run_pdf(stub, path):
     return m
 
 
-def run_one(stub, path, mode, dpi=0):
+def run_one(stub, path, mode, dpi=0, page_range=(0, 0)):
     if mode == "pdf":
         return run_pdf(stub, path)
-    return run_pages(stub, path, pages_only=(mode == "pages-only"), dpi=dpi)
+    return run_pages(stub, path, pages_only=(mode == "pages-only"), dpi=dpi,
+                     page_range=page_range)
 
 
 def fmt_ms(seconds):
@@ -144,8 +147,17 @@ def main():
                     help="per-request render DPI override for the pages "
                          "modes (StreamOptions.render_dpi); 0 = server "
                          "default")
+    ap.add_argument("--pages", default="",
+                    help="1-based inclusive page range for the pages modes "
+                         "(StreamOptions first_page/last_page), e.g. 2:5, "
+                         "7 (just page 7), or 100: (open end)")
     ap.add_argument("--json", dest="json_out", default=None)
     args = ap.parse_args()
+
+    page_range = (0, 0)
+    if args.pages:
+        first, sep, last = args.pages.partition(":")
+        page_range = (int(first or 0), int(last or 0) if sep else int(first))
 
     # run.sh cds into bench/; resolve caller-relative paths against the
     # invoking directory.
@@ -181,8 +193,8 @@ def main():
         for mode in modes:
             try:
                 for _ in range(args.warmup):
-                    run_one(stub, path, mode, args.dpi)
-                runs = [run_one(stub, path, mode, args.dpi)
+                    run_one(stub, path, mode, args.dpi, page_range)
+                runs = [run_one(stub, path, mode, args.dpi, page_range)
                         for _ in range(args.iterations)]
             except grpc.RpcError as e:
                 rows.append([name, mode, f"{size_kib:.0f}", "ERR",
