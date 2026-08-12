@@ -150,6 +150,120 @@ test("unknown part name is rejected with HTTP 400", async () => {
   assert.match(payload.error.message, /unknown document part/);
 });
 
+test("dpi=72 reports dpi 72 and halves the default pixel width", async () => {
+  const defEvents = await renderEvents(DOCX, "sample3.docx", "&parts=PAGES");
+  const lowEvents = await renderEvents(
+    DOCX, "sample3.docx", "&parts=PAGES&dpi=72");
+
+  const start = lowEvents[0];
+  assert.strictEqual(start.event, "start");
+  assert.strictEqual(start.data.dpi, 72, "start event echoes dpi");
+
+  const defPages = defEvents.filter((e) => e.event === "pageImage");
+  const lowPages = lowEvents.filter((e) => e.event === "pageImage");
+  assert.ok(defPages.length > 0);
+  assert.strictEqual(lowPages.length, defPages.length);
+  lowPages.forEach((p, i) => {
+    assert.strictEqual(p.data.dpi, 72, `page ${i} rendered at 72 dpi`);
+    assert.strictEqual(
+      p.data.widthPx * 2, defPages[i].data.widthPx,
+      `page ${i} width must be exactly half the default-dpi width`);
+  });
+});
+
+test("firstPage=2&lastPage=2 emits only page index 1, full pageCount", async () => {
+  const events = await renderEvents(
+    DOCX, "sample3.docx", "&parts=PAGES&firstPage=2&lastPage=2");
+
+  const start = events[0];
+  assert.strictEqual(start.data.firstPage, 2, "start event echoes firstPage");
+  assert.strictEqual(start.data.lastPage, 2, "start event echoes lastPage");
+
+  const info = events.find((e) => e.event === "documentInfo").data;
+  assert.strictEqual(info.pageCount, 4,
+    "DocumentInfo keeps the FULL page count despite the range");
+  assert.strictEqual(info.pageRects.length, 4,
+    "DocumentInfo keeps every page rect despite the range");
+
+  const pages = events.filter((e) => e.event === "pageImage");
+  assert.strictEqual(pages.length, 1, "exactly one page image in range 2:2");
+  assert.strictEqual(pages[0].data.index, 1,
+    "the emitted page keeps its document-absolute index");
+  assert.strictEqual(events[events.length - 2].event, "status");
+});
+
+test("backwards range (firstPage=3&lastPage=2) surfaces INVALID_ARGUMENT", async () => {
+  const events = await renderEvents(
+    DOCX, "sample3.docx", "&firstPage=3&lastPage=2");
+  const err = events.find((e) => e.event === "error");
+  assert.ok(err, "an error event must be emitted");
+  assert.strictEqual(err.data.codeName, "INVALID_ARGUMENT");
+});
+
+test("format=webp emits WebP pages that name their encoding", async () => {
+  const events = await renderEvents(
+    DOCX, "sample3.docx", "&parts=PAGES&format=webp&quality=60");
+  const pages = events.filter((e) => e.event === "pageImage");
+  assert.ok(pages.length > 0);
+  for (const p of pages) {
+    assert.strictEqual(p.data.format, "PAGE_IMAGE_FORMAT_WEBP");
+    const bytes = Buffer.from(p.data.png, "base64");
+    assert.strictEqual(bytes.subarray(0, 4).toString("latin1"), "RIFF");
+    assert.strictEqual(bytes.subarray(8, 12).toString("latin1"), "WEBP");
+  }
+  assert.strictEqual(events[events.length - 2].event, "status");
+});
+
+test("format=jpeg emits JPEG pages", async () => {
+  const events = await renderEvents(
+    DOCX, "sample3.docx", "&parts=PAGES&format=jpeg");
+  const pages = events.filter((e) => e.event === "pageImage");
+  assert.ok(pages.length > 0);
+  for (const p of pages) {
+    assert.strictEqual(p.data.format, "PAGE_IMAGE_FORMAT_JPEG");
+    const bytes = Buffer.from(p.data.png, "base64");
+    assert.strictEqual(bytes[0], 0xff);
+    assert.strictEqual(bytes[1], 0xd8);
+  }
+});
+
+test("unknown format is rejected with HTTP 400", async () => {
+  const body = fs.readFileSync(DOCX);
+  const resp = await fetch(
+    `${base}/api/render?filename=sample3.docx&format=gif`,
+    { method: "POST", body });
+  assert.strictEqual(resp.status, 400);
+  const payload = await resp.json();
+  assert.match(payload.error.message, /unknown format/);
+});
+
+test("quality over 100 surfaces INVALID_ARGUMENT from the server", async () => {
+  const events = await renderEvents(
+    DOCX, "sample3.docx", "&format=jpeg&quality=101");
+  const error = events.find((e) => e.event === "error");
+  assert.ok(error, "expected an error event");
+  assert.strictEqual(error.data.codeName, "INVALID_ARGUMENT");
+  assertAlive();
+});
+
+test("non-numeric dpi is rejected with HTTP 400", async () => {
+  const resp = await fetch(
+    `${base}/api/render?filename=sample3.docx&dpi=abc`,
+    { method: "POST", body: fs.readFileSync(DOCX) });
+  assert.strictEqual(resp.status, 400);
+  const payload = await resp.json();
+  assert.match(payload.error.message, /invalid dpi/);
+});
+
+test("negative firstPage is rejected with HTTP 400", async () => {
+  const resp = await fetch(
+    `${base}/api/render?filename=sample3.docx&firstPage=-1`,
+    { method: "POST", body: fs.readFileSync(DOCX) });
+  assert.strictEqual(resp.status, 400);
+  const payload = await resp.json();
+  assert.match(payload.error.message, /invalid firstPage/);
+});
+
 test("spreadsheet render emits sheet and sheetRow events", async () => {
   const events = await renderEvents(XLSX, "sample3.xlsx");
   assert.ok(events.some((e) => e.event === "sheet"));

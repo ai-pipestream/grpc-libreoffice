@@ -19,6 +19,13 @@ const els = {
   partsAll: $("parts-all"),
   partsNone: $("parts-none"),
   partsDefault: $("parts-default"),
+  dpiSeg: $("dpi-seg"),
+  dpiCustom: $("dpi-custom"),
+  formatSeg: $("format-seg"),
+  formatQuality: $("format-quality"),
+  rangeFrom: $("range-from"),
+  rangeTo: $("range-to"),
+  roNote: $("ro-note"),
   errorBanner: $("error-banner"),
   errorTitle: $("error-title"),
   errorDetail: $("error-detail"),
@@ -200,6 +207,124 @@ els.partsDefault.addEventListener("click",
 
 buildPartsChips();
 
+/* ---------- render options: DPI and page range ---------- */
+
+// Selected preset DPI ("" = server default). A valid custom entry beats the
+// preset. Applies to StreamPages only; /api/pdf never sends dpi or range.
+let presetDpi = "";
+
+function customDpiValue() {
+  const raw = els.dpiCustom.value.trim();
+  if (!raw) return null;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+function effectiveDpi() {
+  const custom = customDpiValue();
+  if (custom != null) return custom;
+  return presetDpi ? Number(presetDpi) : null;
+}
+
+// Reads the from/to inputs; swaps a backwards pair so the server (which
+// rejects first > last with INVALID_ARGUMENT) never sees one.
+function effectiveRange() {
+  const parse = (el) => {
+    const n = Number(el.value.trim());
+    return el.value.trim() && Number.isInteger(n) && n >= 1 ? n : null;
+  };
+  let from = parse(els.rangeFrom);
+  let to = parse(els.rangeTo);
+  let swapped = false;
+  if (from != null && to != null && from > to) {
+    [from, to] = [to, from];
+    swapped = true;
+  }
+  return { from, to, swapped };
+}
+
+// Selected page image format ("" = PNG). The quality box only applies to
+// the lossy formats.
+let pageFormat = "";
+
+function effectiveQuality() {
+  const raw = els.formatQuality.value.trim();
+  if (!raw || !pageFormat) return null;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 1 && n <= 100 ? n : null;
+}
+
+function updateOptionsNote() {
+  const bits = [];
+  const dpi = effectiveDpi();
+  if (dpi != null) bits.push(`dpi ${dpi}` + (dpi < 24 || dpi > 600 ? " (server clamps to 24-600)" : ""));
+  const { from, to, swapped } = effectiveRange();
+  if (from != null || to != null) {
+    bits.push(`pages ${from ?? 1}-${to ?? "end"}` + (swapped ? " (swapped: from > to)" : ""));
+  }
+  if (pageFormat) {
+    bits.push(pageFormat + " q" + (effectiveQuality() ?? 85));
+  }
+  els.roNote.textContent = bits.length ? bits.join(" \u00b7 ") : "";
+  els.roNote.classList.toggle("ro-note-warn",
+    els.roNote.textContent.includes("swapped") ||
+    els.roNote.textContent.includes("clamps"));
+}
+
+function markDpiSeg() {
+  const custom = customDpiValue() != null;
+  for (const btn of els.dpiSeg.children) {
+    btn.classList.toggle("active", !custom && btn.dataset.dpi === presetDpi);
+  }
+}
+
+els.dpiSeg.addEventListener("click", (e) => {
+  const btn = e.target.closest(".ro-seg-btn");
+  if (!btn) return;
+  presetDpi = btn.dataset.dpi;
+  els.dpiCustom.value = "";
+  markDpiSeg();
+  updateOptionsNote();
+});
+
+els.dpiCustom.addEventListener("input", () => {
+  markDpiSeg();
+  updateOptionsNote();
+});
+
+els.rangeFrom.addEventListener("input", updateOptionsNote);
+els.rangeTo.addEventListener("input", updateOptionsNote);
+
+els.formatSeg.addEventListener("click", (e) => {
+  const btn = e.target.closest(".ro-seg-btn");
+  if (!btn) return;
+  pageFormat = btn.dataset.format;
+  els.formatQuality.disabled = !pageFormat;
+  for (const b of els.formatSeg.children) {
+    b.classList.toggle("active", b.dataset.format === pageFormat);
+  }
+  updateOptionsNote();
+});
+
+els.formatQuality.addEventListener("input", updateOptionsNote);
+
+// Query-string fragment for the current DPI and page range. Also returns
+// the values so the render session can label stats honestly.
+function renderOptionsQuery() {
+  let q = "";
+  const dpi = effectiveDpi();
+  if (dpi != null) q += `&dpi=${dpi}`;
+  const { from, to } = effectiveRange();
+  if (from != null) q += `&firstPage=${from}`;
+  if (to != null) q += `&lastPage=${to}`;
+  if (pageFormat) {
+    q += `&format=${pageFormat}`;
+    const quality = effectiveQuality();
+    if (quality != null) q += `&quality=${quality}`;
+  }
+  return { q, dpi, from, to };
+}
+
 /* ---------- content-count labels ---------- */
 
 const KIND_LABELS = {
@@ -241,6 +366,8 @@ const state = {
   firstPageMs: null,
   lastEventMs: 0,
   expectedPages: null,
+  rangeFrom: null, // page range sent with the active render, 1-based
+  rangeTo: null,
   liveTimer: null,
   startedAt: 0,
   lightboxIndex: -1,
@@ -374,6 +501,9 @@ async function startRender(file) {
   state.rendering = true;
   els.dropZone.classList.add("busy");
   resetSession(file);
+  const opts = renderOptionsQuery();
+  state.rangeFrom = opts.from;
+  state.rangeTo = opts.to;
 
   if (state.liveTimer) clearInterval(state.liveTimer);
   state.liveTimer = setInterval(() => {
@@ -385,7 +515,8 @@ async function startRender(file) {
 
   try {
     const resp = await fetch(
-      "/api/render?filename=" + encodeURIComponent(file.name) + partsQuery(),
+      "/api/render?filename=" + encodeURIComponent(file.name) +
+        partsQuery() + opts.q,
       {
         method: "POST",
         headers: {
@@ -480,7 +611,22 @@ function onDocumentInfo(info) {
   state.pageRects = info.pageRects || [];
   els.docPages.textContent =
     `${info.pageCount} page${info.pageCount === 1 ? "" : "s"}`;
-  els.statPages.textContent = `0 / ${info.pageCount}`;
+  els.statPages.textContent = pagesStatText();
+}
+
+// The "pages" stat: emitted count against the document's FULL page count
+// (DocumentInfo is never restricted by a page range). With a range active
+// the honest reading is "2 of 4 (range 2-3)", not "2 / 4 missing pages".
+function pagesStatText() {
+  const got = state.pages.length;
+  const total = state.expectedPages;
+  if (total == null) return String(got);
+  if (state.rangeFrom == null && state.rangeTo == null) {
+    return `${got} / ${total}`;
+  }
+  const lo = state.rangeFrom ?? 1;
+  const hi = Math.min(state.rangeTo ?? total, total);
+  return `${got} of ${total} (range ${lo}-${hi})`;
 }
 
 function onPageImage(page, tMs) {
@@ -488,7 +634,10 @@ function onPageImage(page, tMs) {
     state.firstPageMs = tMs;
     els.statFirstPage.textContent = formatMs(tMs);
   }
-  const dataUrl = "data:image/png;base64," + page.png;
+  const mime = page.format === "PAGE_IMAGE_FORMAT_JPEG" ? "image/jpeg"
+      : page.format === "PAGE_IMAGE_FORMAT_WEBP" ? "image/webp"
+      : "image/png";
+  const dataUrl = `data:${mime};base64,` + page.png;
   state.pages.push({
     index: page.index,
     dataUrl,
@@ -515,9 +664,7 @@ function onPageImage(page, tMs) {
   cell.addEventListener("click", () => openLightbox(arrayPos));
   els.pageGrid.appendChild(cell);
 
-  els.statPages.textContent = state.expectedPages != null
-    ? `${state.pages.length} / ${state.expectedPages}`
-    : String(state.pages.length);
+  els.statPages.textContent = pagesStatText();
   updatePps();
 }
 

@@ -243,8 +243,9 @@ counts.](docs/frontend.png)
 - `frontend/` is a demo web UI: a small Node BFF speaks gRPC to the server
   and streams events to the browser, which shows page images popping in as
   they arrive, live timing stats, typed-content counts, and one-click PDF
-  download. `npm install && npm start` in `frontend/`, then open
-  `http://localhost:8080`.
+  download. Render options (DPI, page range, and PNG/JPEG/WebP page format
+  with a quality knob) sit above the results. `npm install && npm start` in
+  `frontend/`, then open `http://localhost:8080`.
 - `clients/` holds example clients in Python, Node.js, and Java. Each is a
   small CLI with the same three subcommands: `info`, `pages <file> [outdir]`,
   `pdf <file> [out.pdf]`. See `clients/README.md`.

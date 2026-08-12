@@ -66,6 +66,19 @@ function parsePartsParam(url) {
   return parts.length ? parts : null;
 }
 
+// Parses one optional non-negative integer query param, or null when
+// absent. Throws on anything that is not a plain base-10 non-negative
+// integer (fractions, negatives, exponents, garbage).
+function parseNonNegativeIntParam(url, name) {
+  const raw = url.searchParams.get(name);
+  if (raw == null || raw.trim() === "") return null;
+  const t = raw.trim();
+  if (!/^\d+$/.test(t)) {
+    throw new Error(`invalid ${name} "${raw}": must be a non-negative integer`);
+  }
+  return Number(t);
+}
+
 function grpcErrorPayload(err) {
   return {
     code: err.code ?? grpc.status.UNKNOWN,
@@ -166,12 +179,35 @@ async function handleInfo(res) {
   });
 }
 
+// Maps the short ?format= names onto PageImageFormat enum names. Anything
+// else is a 400.
+const PAGE_FORMATS = {
+  png: "PAGE_IMAGE_FORMAT_PNG",
+  jpeg: "PAGE_IMAGE_FORMAT_JPEG",
+  webp: "PAGE_IMAGE_FORMAT_WEBP",
+};
+
+function parseFormatParam(url) {
+  const raw = url.searchParams.get("format");
+  if (raw == null || raw.trim() === "") return null;
+  const format = PAGE_FORMATS[raw.trim().toLowerCase()];
+  if (!format) {
+    throw new Error(`unknown format "${raw}": expected png, jpeg, or webp`);
+  }
+  return format;
+}
+
 async function handleRender(req, res, url) {
   const filename = resolveFilename(req, url);
   const contentType = req.headers["content-type"] || "";
-  let parts;
+  let parts, dpi, firstPage, lastPage, format, quality;
   try {
     parts = parsePartsParam(url);
+    dpi = parseNonNegativeIntParam(url, "dpi");
+    firstPage = parseNonNegativeIntParam(url, "firstPage");
+    lastPage = parseNonNegativeIntParam(url, "lastPage");
+    format = parseFormatParam(url);
+    quality = parseNonNegativeIntParam(url, "quality");
   } catch (err) {
     res.writeHead(400, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: { message: String(err.message) } }));
@@ -190,7 +226,10 @@ async function handleRender(req, res, url) {
   emit({
     event: "start",
     tMs: 0,
-    data: { filename, bytes: body.length, parts: parts || [] },
+    data: {
+      filename, bytes: body.length, parts: parts || [],
+      dpi, firstPage, lastPage, format, quality,
+    },
   });
 
   const call = client.StreamPages();
@@ -219,8 +258,20 @@ async function handleRender(req, res, url) {
     if (!ended) call.cancel();
   });
 
+  // StreamOptions on the first chunk. A backwards page range is forwarded
+  // as-is: the server rejects it with INVALID_ARGUMENT, which surfaces as
+  // the NDJSON error event.
+  const options = {};
+  if (parts) options.parts = parts;
+  if (dpi != null) options.renderDpi = dpi;
+  if (firstPage != null) options.firstPage = firstPage;
+  if (lastPage != null) options.lastPage = lastPage;
+  if (format != null) options.pageFormat = format;
+  // An out-of-range quality is forwarded: the server's INVALID_ARGUMENT
+  // surfaces as the NDJSON error event, like a backwards page range.
+  if (quality != null) options.pageQuality = quality;
   sendUpload(call, body, filename, contentType,
-    parts ? { options: { parts } } : null);
+    Object.keys(options).length ? { options } : null);
 }
 
 // Lists the demo fixture files (regular files only) with their sizes.

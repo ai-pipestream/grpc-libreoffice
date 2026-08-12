@@ -545,6 +545,89 @@ main {
 
 .btn-small { padding: 5px 12px; font-size: 12px; }
 
+/* ---------- render options row ---------- */
+
+.render-options {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 22px;
+  margin-top: 10px;
+  padding: 10px 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+}
+
+.ro-title {
+  font-weight: 600;
+  font-size: 13.5px;
+  color: var(--text-dim);
+}
+
+.ro-group { display: flex; align-items: center; gap: 8px; }
+
+.ro-name {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.7px;
+  color: var(--text-dim);
+}
+
+.ro-seg {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.ro-seg-btn {
+  padding: 4px 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.ro-seg-btn:hover { color: var(--text); }
+
+.ro-seg-btn.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.ro-num {
+  width: 74px;
+  padding: 5px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+.ro-num::placeholder { color: var(--text-dim); opacity: 0.7; }
+
+.ro-num:focus { outline: none; border-color: var(--accent); }
+
+.ro-dash { color: var(--text-dim); }
+
+.ro-note {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--accent);
+}
+
+.ro-note-warn { color: var(--warn); }
+
 /* ---------- typed-content panel ---------- */
 
 .content-panel {

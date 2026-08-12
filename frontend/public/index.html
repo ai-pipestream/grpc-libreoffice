@@ -64,6 +64,42 @@
     </div>
   </details>
 
+  <section class="render-options" id="render-options" aria-label="Render options">
+    <span class="ro-title">Render options</span>
+    <div class="ro-group">
+      <span class="ro-name">DPI</span>
+      <div class="ro-seg" id="dpi-seg" role="group" aria-label="Render DPI">
+        <button type="button" class="ro-seg-btn active" data-dpi="">Default (144)</button>
+        <button type="button" class="ro-seg-btn" data-dpi="72">72</button>
+        <button type="button" class="ro-seg-btn" data-dpi="96">96</button>
+        <button type="button" class="ro-seg-btn" data-dpi="192">192</button>
+        <button type="button" class="ro-seg-btn" data-dpi="300">300</button>
+      </div>
+      <input type="number" id="dpi-custom" class="ro-num ro-num-dpi"
+             min="24" max="600" step="1" placeholder="custom"
+             aria-label="Custom DPI">
+    </div>
+    <div class="ro-group">
+      <span class="ro-name">Pages</span>
+      <input type="number" id="range-from" class="ro-num" min="1" step="1"
+             placeholder="from" aria-label="First page">
+      <span class="ro-dash">&ndash;</span>
+      <input type="number" id="range-to" class="ro-num" min="1" step="1"
+             placeholder="to" aria-label="Last page">
+    </div>
+    <div class="ro-group">
+      <span class="ro-name">Format</span>
+      <div class="ro-seg" id="format-seg" role="group" aria-label="Page image format">
+        <button type="button" class="ro-seg-btn active" data-format="">PNG</button>
+        <button type="button" class="ro-seg-btn" data-format="jpeg">JPEG</button>
+        <button type="button" class="ro-seg-btn" data-format="webp">WebP</button>
+      </div>
+      <input type="number" id="format-quality" class="ro-num" min="1" max="100"
+             step="1" placeholder="q 85" aria-label="Lossy quality" disabled>
+    </div>
+    <span class="ro-note" id="ro-note"></span>
+  </section>
+
   <section class="banner banner-error hidden" id="error-banner" role="alert">
     <div>
       <strong id="error-title">Error</strong>
