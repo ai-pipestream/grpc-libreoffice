@@ -3,9 +3,15 @@
 
 Subcommands:
   info                     print server versions, limits, accepted formats
-  pages <file> [outdir] [--dpi N]
-                           render every page to PNG, dump typed-content stats
+  pages <file> [outdir]    render pages; StreamOptions flags below
   pdf <file> [out.pdf]     convert the document to a PDF
+
+pages flags (all optional; omitted means the server default):
+  --dpi N
+  --first-page N / --last-page N   1-based inclusive page-image range
+  --format png|jpeg|webp           page image encoding
+  --quality N                      lossy quality 1-100 (ignored for PNG)
+  --parts PAGES,PARAGRAPHS,...     DocumentPart names (short or DOCUMENT_PART_*)
 
 The server address defaults to localhost:50053; override with --addr or the
 GRLIBRE_ADDR environment variable.
@@ -28,6 +34,24 @@ CHUNK_SIZE = 256 * 1024
 # Page PNGs and embedded images can easily exceed gRPC's 4 MiB default.
 MAX_MESSAGE_BYTES = 128 * 1024 * 1024
 
+FORMATS = {
+    "": 0,
+    "png": pb.PAGE_IMAGE_FORMAT_PNG,
+    "jpeg": pb.PAGE_IMAGE_FORMAT_JPEG,
+    "jpg": pb.PAGE_IMAGE_FORMAT_JPEG,
+    "webp": pb.PAGE_IMAGE_FORMAT_WEBP,
+}
+
+PAGE_EXT = {
+    pb.PAGE_IMAGE_FORMAT_JPEG: "jpg",
+    pb.PAGE_IMAGE_FORMAT_WEBP: "webp",
+}
+
+PAGE_LABEL = {
+    pb.PAGE_IMAGE_FORMAT_JPEG: "jpeg",
+    pb.PAGE_IMAGE_FORMAT_WEBP: "webp",
+}
+
 
 def make_stub(addr):
     channel = grpc.insecure_channel(
@@ -35,6 +59,57 @@ def make_stub(addr):
         options=[("grpc.max_receive_message_length", MAX_MESSAGE_BYTES)],
     )
     return pb_grpc.OfficeRenderServiceStub(channel)
+
+
+def parse_parts(raw):
+    """Comma list of DocumentPart names → enum values. Empty string → []."""
+    if not raw:
+        return []
+    parts = []
+    for token in raw.split(","):
+        t = token.strip().upper()
+        if not t:
+            continue
+        name = t if t.startswith("DOCUMENT_PART_") else "DOCUMENT_PART_" + t
+        try:
+            parts.append(pb.DocumentPart.Value(name))
+        except ValueError:
+            raise SystemExit(
+                f"unknown part {token!r}: expected a DocumentPart name "
+                f"(PAGES or DOCUMENT_PART_PAGES)"
+            )
+    return parts
+
+
+def stream_options(args):
+    """Build StreamOptions from pages flags, or None when every flag is default."""
+    parts = parse_parts(args.parts)
+    fmt = FORMATS[args.format or ""]
+    if not (args.dpi or args.first_page or args.last_page or fmt
+            or args.quality or parts):
+        return None
+    opts = pb.StreamOptions()
+    if args.dpi:
+        opts.render_dpi = args.dpi
+    if args.first_page:
+        opts.first_page = args.first_page
+    if args.last_page:
+        opts.last_page = args.last_page
+    if fmt:
+        opts.page_format = fmt
+    if args.quality:
+        opts.page_quality = args.quality
+    if parts:
+        opts.parts.extend(parts)
+    return opts
+
+
+def page_ext(fmt):
+    return PAGE_EXT.get(fmt, "png")
+
+
+def page_label(fmt):
+    return PAGE_LABEL.get(fmt, "png")
 
 
 def chunk_requests(path, wrap):
@@ -101,12 +176,14 @@ def cmd_pages(stub, args):
     first_page_s = None
     pages = 0
     counts = {}
+    options = stream_options(args)
+
     def wrap(chunk, first):
         req = pb.StreamPagesRequest(chunk=chunk)
-        # render_dpi resolves to the first nonzero value in the upload
-        # stream, so it must ride the first chunk.
-        if first and args.dpi:
-            req.options.render_dpi = args.dpi
+        # StreamOptions resolve to the first nonzero/non-empty value in the
+        # upload stream, so they must ride the first chunk.
+        if first and options is not None:
+            req.options.CopyFrom(options)
         return req
 
     responses = stub.StreamPages(chunk_requests(args.file, wrap))
@@ -118,12 +195,13 @@ def cmd_pages(stub, args):
             if first_page_s is None:
                 first_page_s = time.monotonic() - t0
             img = resp.page_image
-            name = f"page-{img.index + 1:04d}.png"
+            ext = page_ext(img.format)
+            name = f"page-{img.index + 1:04d}.{ext}"
             with open(os.path.join(outdir, name), "wb") as f:
                 f.write(img.png)
             pages += 1
             print(f"  {name}  {img.width_px}x{img.height_px}px @ {img.dpi} dpi  "
-                  f"{len(img.png):,} bytes")
+                  f"{page_label(img.format)}  {len(img.png):,} bytes")
         elif event == "status":
             total_s = time.monotonic() - t0
             print()
@@ -169,11 +247,22 @@ def main():
 
     sub.add_parser("info", help="print server capabilities")
 
-    p = sub.add_parser("pages", help="render every page as PNG")
+    p = sub.add_parser("pages", help="render pages (PNG by default)")
     p.add_argument("file")
     p.add_argument("outdir", nargs="?", default="pages-out")
     p.add_argument("--dpi", type=int, default=0,
                    help="render DPI (server clamps to [24,600]; 0 = server default)")
+    p.add_argument("--first-page", type=int, default=0, dest="first_page",
+                   help="first page to paint, 1-based inclusive (0 = from the start)")
+    p.add_argument("--last-page", type=int, default=0, dest="last_page",
+                   help="last page to paint, 1-based inclusive (0 = through the end)")
+    p.add_argument("--format", default=None, choices=["png", "jpeg", "jpg", "webp"],
+                   help="page image encoding (default PNG)")
+    p.add_argument("--quality", type=int, default=0,
+                   help="lossy quality 1-100 (0 = server default 85; ignored for PNG)")
+    p.add_argument("--parts", default="",
+                   help="comma list of DocumentPart names, e.g. PAGES,PARAGRAPHS "
+                        "(short or DOCUMENT_PART_*); omitted = server default")
 
     p = sub.add_parser("pdf", help="convert to PDF")
     p.add_argument("file")

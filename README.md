@@ -248,7 +248,9 @@ counts.](docs/frontend.png)
   `frontend/`, then open `http://localhost:8080`.
 - `clients/` holds example clients in Python, Node.js, and Java. Each is a
   small CLI with the same three subcommands: `info`, `pages <file> [outdir]`,
-  `pdf <file> [out.pdf]`. See `clients/README.md`.
+  `pdf <file> [out.pdf]`. `pages` exposes the `StreamOptions` knobs (`--dpi`,
+  `--first-page`/`--last-page`, `--format`/`--quality`, `--parts`). See
+  `clients/README.md`.
 - `bench/run.sh` is the speed test: per-document latency (time to first
   page, total, pages/sec) in pages-only, full-extraction, and PDF modes,
   plus a concurrency sweep for throughput. See `bench/README.md` for sample

@@ -2,7 +2,9 @@
 // Example CLI client for the grpc-libreoffice OfficeRenderService.
 //
 //   node client.js info
-//   node client.js pages <file> [outdir] [--dpi <n>]
+//   node client.js pages <file> [outdir] [--dpi N] [--first-page N]
+//        [--last-page N] [--format png|jpeg|webp] [--quality N]
+//        [--parts PAGES,PARAGRAPHS,...]
 //   node client.js pdf <file> [out.pdf]
 //
 // Server address defaults to localhost:50053; override with GRLIBRE_ADDR.
@@ -20,6 +22,13 @@ const CHUNK_SIZE = 256 * 1024;
 // Page PNGs and embedded images can exceed gRPC's 4 MiB default.
 const MAX_MESSAGE_BYTES = 128 * 1024 * 1024;
 
+const FORMAT_ENUM = {
+  png: "PAGE_IMAGE_FORMAT_PNG",
+  jpeg: "PAGE_IMAGE_FORMAT_JPEG",
+  jpg: "PAGE_IMAGE_FORMAT_JPEG",
+  webp: "PAGE_IMAGE_FORMAT_WEBP",
+};
+
 const packageDefinition = protoLoader.loadSync(
   path.join(PROTO_ROOT, "ai/pipestream/office/v1/office_service.proto"),
   {
@@ -34,6 +43,12 @@ const packageDefinition = protoLoader.loadSync(
 const officeV1 = grpc.loadPackageDefinition(packageDefinition).ai.pipestream
   .office.v1;
 
+const DOCUMENT_PART_NAMES = new Set(
+  officeV1.DocumentPart?.type?.value?.map((v) => v.name)
+    ?? Object.keys(officeV1.DocumentPart || {}).filter((k) =>
+      k.startsWith("DOCUMENT_PART_")),
+);
+
 function makeClient() {
   const addr = process.env.GRLIBRE_ADDR || "localhost:50053";
   return new officeV1.OfficeRenderService(
@@ -47,6 +62,73 @@ function fail(err) {
   const code = grpc.status[err.code] ?? err.code;
   console.error(`gRPC error: ${code}: ${err.details || err.message}`);
   process.exit(1);
+}
+
+function parsePositiveInt(flag, raw) {
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isInteger(n) || n <= 0) {
+    console.error(`${flag} needs a positive integer`);
+    process.exit(2);
+  }
+  return n;
+}
+
+function parseParts(raw) {
+  if (!raw) return [];
+  const parts = [];
+  for (const token of raw.split(",")) {
+    const t = token.trim().toUpperCase();
+    if (!t) continue;
+    const full = t.startsWith("DOCUMENT_PART_") ? t : "DOCUMENT_PART_" + t;
+    if (!DOCUMENT_PART_NAMES.has(full)) {
+      console.error(
+        `unknown part ${JSON.stringify(token)}: expected a DocumentPart name ` +
+          `(PAGES or DOCUMENT_PART_PAGES)`,
+      );
+      process.exit(2);
+    }
+    parts.push(full);
+  }
+  return parts;
+}
+
+function streamOptions(opts) {
+  const parts = parseParts(opts.parts);
+  const format = opts.format ? FORMAT_ENUM[opts.format] : null;
+  if (!format && opts.format) {
+    console.error("--format must be png, jpeg, or webp");
+    process.exit(2);
+  }
+  if (
+    !opts.dpi &&
+    !opts.firstPage &&
+    !opts.lastPage &&
+    !format &&
+    !opts.quality &&
+    parts.length === 0
+  ) {
+    return null;
+  }
+  const options = {};
+  if (opts.dpi) options.render_dpi = opts.dpi;
+  if (opts.firstPage) options.first_page = opts.firstPage;
+  if (opts.lastPage) options.last_page = opts.lastPage;
+  if (format) options.page_format = format;
+  if (opts.quality) options.page_quality = opts.quality;
+  if (parts.length) options.parts = parts;
+  return options;
+}
+
+function pageExt(format) {
+  if (format === "PAGE_IMAGE_FORMAT_JPEG") return "jpg";
+  if (format === "PAGE_IMAGE_FORMAT_WEBP") return "webp";
+  return "png";
+}
+
+function pageLabel(format) {
+  if (format === "PAGE_IMAGE_FORMAT_JPEG") return "jpeg";
+  if (format === "PAGE_IMAGE_FORMAT_WEBP") return "webp";
+  return "png";
 }
 
 // Writes `file` into the call as 256 KiB DocumentChunks, last one complete.
@@ -111,13 +193,14 @@ function cmdInfo() {
   });
 }
 
-function cmdPages(file, outdir = "pages-out", dpi = 0) {
+function cmdPages(file, outdir, opts) {
   fs.mkdirSync(outdir, { recursive: true });
   const client = makeClient();
   const t0 = performance.now();
   let firstPageMs = null;
   let pages = 0;
   const counts = new Map();
+  const options = streamOptions(opts);
 
   const call = client.StreamPages();
   call.on("data", (resp) => {
@@ -128,12 +211,12 @@ function cmdPages(file, outdir = "pages-out", dpi = 0) {
       case "page_image": {
         if (firstPageMs === null) firstPageMs = performance.now() - t0;
         const img = resp.page_image;
-        const name = `page-${String(img.index + 1).padStart(4, "0")}.png`;
+        const name = `page-${String(img.index + 1).padStart(4, "0")}.${pageExt(img.format)}`;
         fs.writeFileSync(path.join(outdir, name), img.png);
         pages += 1;
         console.log(
           `  ${name}  ${img.width_px}x${img.height_px}px @ ${img.dpi} dpi  ` +
-            `${img.png.length.toLocaleString()} bytes`,
+            `${pageLabel(img.format)}  ${img.png.length.toLocaleString()} bytes`,
         );
         break;
       }
@@ -159,7 +242,7 @@ function cmdPages(file, outdir = "pages-out", dpi = 0) {
     }
   });
   call.on("error", fail);
-  uploadFile(call, file, dpi > 0 ? { options: { render_dpi: dpi } } : {});
+  uploadFile(call, file, options ? { options } : {});
 }
 
 function cmdPdf(file, out = "out.pdf") {
@@ -194,30 +277,77 @@ function cmdPdf(file, out = "out.pdf") {
   uploadFile(call, file);
 }
 
+const PAGES_USAGE =
+  "usage: node client.js pages <file> [outdir] [--dpi <n>] " +
+  "[--first-page <n>] [--last-page <n>] [--format png|jpeg|webp] " +
+  "[--quality <n>] [--parts PAGES,PARAGRAPHS,...]";
+
+function parsePagesArgs(rest) {
+  const opts = {
+    dpi: 0,
+    firstPage: 0,
+    lastPage: 0,
+    format: "",
+    quality: 0,
+    parts: "",
+  };
+  const positional = [];
+  let i = 0;
+  const need = (flag) => {
+    if (i + 1 >= rest.length) {
+      console.error(`${flag} needs a value`);
+      process.exit(2);
+    }
+    return rest[++i];
+  };
+  for (; i < rest.length; i++) {
+    const a = rest[i];
+    switch (a) {
+      case "--dpi":
+        opts.dpi = parsePositiveInt("--dpi", need("--dpi"));
+        break;
+      case "--first-page":
+        opts.firstPage = parsePositiveInt("--first-page", need("--first-page"));
+        break;
+      case "--last-page":
+        opts.lastPage = parsePositiveInt("--last-page", need("--last-page"));
+        break;
+      case "--format":
+        opts.format = need("--format").toLowerCase();
+        if (!(opts.format in FORMAT_ENUM)) {
+          console.error("--format must be png, jpeg, or webp");
+          process.exit(2);
+        }
+        break;
+      case "--quality":
+        opts.quality = parsePositiveInt("--quality", need("--quality"));
+        break;
+      case "--parts":
+        opts.parts = need("--parts");
+        break;
+      default:
+        if (a.startsWith("-")) {
+          console.error(`unknown flag ${a}`);
+          process.exit(2);
+        }
+        positional.push(a);
+    }
+  }
+  return { positional, opts };
+}
+
 const [cmd, ...rest] = process.argv.slice(2);
 switch (cmd) {
   case "info":
     cmdInfo();
     break;
   case "pages": {
-    let dpi = 0;
-    const positional = [];
-    for (let i = 0; i < rest.length; i++) {
-      if (rest[i] === "--dpi") {
-        dpi = Number.parseInt(rest[++i], 10);
-        if (!Number.isInteger(dpi) || dpi <= 0) {
-          console.error("--dpi needs a positive integer");
-          process.exit(2);
-        }
-      } else {
-        positional.push(rest[i]);
-      }
-    }
+    const { positional, opts } = parsePagesArgs(rest);
     if (!positional[0]) {
-      console.error("usage: node client.js pages <file> [outdir] [--dpi <n>]");
+      console.error(PAGES_USAGE);
       process.exit(2);
     }
-    cmdPages(positional[0], positional[1], dpi);
+    cmdPages(positional[0], positional[1] || "pages-out", opts);
     break;
   }
   case "pdf":
@@ -229,7 +359,8 @@ switch (cmd) {
     break;
   default:
     console.error(
-      "usage: node client.js <info | pages <file> [outdir] [--dpi <n>] | pdf <file> [out.pdf]>",
+      "usage: node client.js <info | pages <file> [outdir] [options] | pdf <file> [out.pdf]>",
     );
+    console.error(PAGES_USAGE);
     process.exit(2);
 }

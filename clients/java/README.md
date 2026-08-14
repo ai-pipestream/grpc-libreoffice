@@ -17,13 +17,19 @@ Gradle 9.x works identically (`gradle run ...`).
 ./gradlew run --args="info"
 ./gradlew run --args="pages ../../fixtures/sample3.docx out"
 ./gradlew run --args="pages ../../fixtures/sample3.docx out --dpi 72"
+./gradlew run --args="pages ../../fixtures/sample3.docx out --format webp --quality 60"
+./gradlew run --args="pages ../../fixtures/sample3.docx out --first-page 2 --last-page 2 --parts PAGES"
 ./gradlew run --args="pdf ../../fixtures/sample3.docx out.pdf"
 ```
 
-`pages --dpi <n>` requests a render DPI (`StreamOptions.render_dpi`, sent on
-the first upload chunk; the server clamps it to [24,600], 0 or omitted means
-the server default). Each page line prints the DPI the page actually
-rendered at.
+`pages` flags map onto `StreamOptions` on the first upload chunk:
+
+- `--dpi <n>` — `render_dpi` (server clamps to [24,600]; 0 or omitted = server default)
+- `--first-page` / `--last-page` — 1-based inclusive page-image range
+- `--format png|jpeg|webp` and `--quality <n>` — page encoding (files use `.png` / `.jpg` / `.webp` from `PageImage.format`)
+- `--parts PAGES,PARAGRAPHS,...` — short or `DOCUMENT_PART_*` names
+
+Each page line prints the DPI and encoding the page actually rendered at.
 
 Server address: `GRLIBRE_ADDR` environment variable
 (default `localhost:50053`).

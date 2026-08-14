@@ -7,7 +7,7 @@ and Java. Each client exposes the same three subcommands:
 | Subcommand | What it does |
 |---|---|
 | `info` | Print server/LibreOffice versions, limits, and accepted formats. |
-| `pages <file> [outdir] [--dpi <n>]` | Upload the file, save every rendered page as `page-NNNN.png`, summarize typed content events, print RenderStatus and timing. `--dpi` sets `StreamOptions.render_dpi` on the first upload chunk (server clamps to [24,600]; omitted or 0 = server default); each page line shows the DPI it actually rendered at (`PageImage.dpi`). |
+| `pages <file> [outdir] [options]` | Upload the file, save every rendered page as `page-NNNN.<ext>`, summarize typed content events, print RenderStatus and timing. Flags map 1:1 onto `StreamOptions` on the first upload chunk: `--dpi <n>` (`render_dpi`, server clamps to [24,600]); `--first-page` / `--last-page` (1-based inclusive page-image range); `--format png\|jpeg\|webp` and `--quality <n>` (page encoding; files use `.png` / `.jpg` / `.webp` from `PageImage.format`); `--parts PAGES,PARAGRAPHS,...` (short or `DOCUMENT_PART_*` names). Omitted flags mean the server default. Each page line shows the DPI and encoding the page actually rendered at. |
 | `pdf <file> [out.pdf]` | Upload the file, write the streamed PDF, print byte count and timing. |
 
 All clients upload the document as ~256 KiB `DocumentChunk`s with
@@ -34,6 +34,8 @@ python3 -m venv .venv
 .venv/bin/python client.py info
 .venv/bin/python client.py pages ../../fixtures/sample3.docx out
 .venv/bin/python client.py pages ../../fixtures/sample3.docx out --dpi 72
+.venv/bin/python client.py pages ../../fixtures/sample3.docx out --format webp --quality 60
+.venv/bin/python client.py pages ../../fixtures/sample3.docx out --first-page 2 --last-page 2 --parts PAGES
 .venv/bin/python client.py pdf ../../fixtures/sample3.docx out.pdf
 ```
 
@@ -47,6 +49,8 @@ npm install
 node client.js info
 node client.js pages ../../fixtures/sample3.docx out
 node client.js pages ../../fixtures/sample3.docx out --dpi 72
+node client.js pages ../../fixtures/sample3.docx out --format webp --quality 60
+node client.js pages ../../fixtures/sample3.docx out --first-page 2 --last-page 2 --parts PAGES
 node client.js pdf ../../fixtures/sample3.docx out.pdf
 ```
 
@@ -61,6 +65,8 @@ cd clients/java
 ./gradlew run --args="info"
 ./gradlew run --args="pages ../../fixtures/sample3.docx out"
 ./gradlew run --args="pages ../../fixtures/sample3.docx out --dpi 72"
+./gradlew run --args="pages ../../fixtures/sample3.docx out --format webp --quality 60"
+./gradlew run --args="pages ../../fixtures/sample3.docx out --first-page 2 --last-page 2 --parts PAGES"
 ./gradlew run --args="pdf ../../fixtures/sample3.docx out.pdf"
 ```
 
@@ -75,6 +81,9 @@ missing client prerequisites (Python venv + stubs, `npm ci`, Gradle
 outputs must carry the `%PDF` magic with byte sizes agreeing within 1%, a
 file with an unresolvable extension must fail with a nonzero exit, and
 `pages --dpi 72` against the private server's 144-dpi default must produce a
-first PNG exactly half the default run's pixel width. It prints
-a per-language PASS/FAIL table and exits nonzero on any failure. It also runs
-as an optional leg of the smoke test: `scripts/e2e-smoke.sh --clients`.
+first PNG exactly half the default run's pixel width, `pages --first-page 2
+--last-page 2 --parts PAGES` must emit exactly one `page-0002.png`, and
+`pages --format webp --parts PAGES` must emit WebP files with the RIFF/WEBP
+magic. It prints a per-language PASS/FAIL table and exits nonzero on any
+failure. It also runs as an optional leg of the smoke test:
+`scripts/e2e-smoke.sh --clients`.

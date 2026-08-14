@@ -11,6 +11,9 @@
 #   error   a file with an unresolvable extension must fail (nonzero exit)
 #   dpi     pages --dpi 72 against the server's 144-dpi default: the first
 #           PNG's pixel width must be exactly half the default run's width
+#   range   pages --first-page 2 --last-page 2 --parts PAGES: exactly one
+#           page-0002.png (document-absolute index)
+#   format  pages --format webp --parts PAGES: page-*.webp with RIFF/WEBP magic
 #
 # Prints a per-language PASS/FAIL table and exits nonzero on any failure.
 # Client setup (venv, stubs, node_modules, gradle installDist) happens lazily.
@@ -44,7 +47,9 @@ setup_python() {
     python3 -m venv "$dir/.venv"
     "$dir/.venv/bin/pip" install --quiet -r "$dir/requirements.txt"
   fi
-  if [ ! -f "$dir/gen/ai/pipestream/office/v1/office_service_pb2.py" ]; then
+  local stub="$dir/gen/ai/pipestream/office/v1/office_service_pb2.py"
+  local proto="$ROOT/proto/ai/pipestream/office/v1/office_service.proto"
+  if [ ! -f "$stub" ] || [ "$proto" -nt "$stub" ]; then
     echo "[setup] generating python stubs"
     (cd "$dir" && PYTHON=.venv/bin/python ./generate.sh)
   fi
@@ -60,7 +65,10 @@ setup_node() {
 
 JAVA_LAUNCHER="$ROOT/clients/java/build/install/grlibre-java-client/bin/grlibre-java-client"
 setup_java() {
-  if [ ! -x "$JAVA_LAUNCHER" ]; then
+  local src="$ROOT/clients/java/src/main/java/ai/pipestream/office/examples/OfficeClient.java"
+  local proto="$ROOT/proto/ai/pipestream/office/v1/office_service.proto"
+  if [ ! -x "$JAVA_LAUNCHER" ] || [ "$src" -nt "$JAVA_LAUNCHER" ] \
+      || [ "$proto" -nt "$JAVA_LAUNCHER" ]; then
     echo "[setup] gradle installDist in clients/java"
     (cd "$ROOT/clients/java" && ./gradlew -q installDist)
   fi
@@ -95,7 +103,7 @@ export GRLIBRE_ADDR="localhost:$PORT"
 # ---- checks -------------------------------------------------------------------
 
 LANGS=(python node java)
-TESTS=(info pages pdf error dpi)
+TESTS=(info pages pdf error dpi range format)
 declare -A RESULT   # RESULT[lang/test] = PASS | FAIL(reason)
 declare -A PAGE_COUNT PDF_SIZE PAGE_WIDTH
 FAILED=0
@@ -109,6 +117,12 @@ fail() { # fail <lang> <test> <reason>
 pass() { RESULT["$1/$2"]="PASS"; }
 
 is_png() { [ -s "$1" ] && [ "$(head -c 8 "$1" | od -An -tx1 | tr -d ' \n')" = "89504e470d0a1a0a" ]; }
+
+# WebP: RIFF....WEBP
+is_webp() {
+  [ -s "$1" ] && [ "$(head -c 4 "$1")" = "RIFF" ] \
+    && [ "$(dd if="$1" bs=1 skip=8 count=4 2>/dev/null)" = "WEBP" ]
+}
 
 # IHDR pixel width: bytes 16..19 of the file, big-endian.
 png_width() {
@@ -174,6 +188,51 @@ for lang in "${LANGS[@]}"; do
     fi
   else
     fail "$lang" dpi "exit $?"
+  fi
+
+  # range: page 2 only, document-absolute filename, pages-only so it stays cheap
+  rangedir="$WORK/pages-$lang-range"
+  mkdir -p "$rangedir"
+  if run_client "$lang" pages "$FIXTURE" "$rangedir" \
+      --first-page 2 --last-page 2 --parts PAGES \
+      >"$WORK/logs/$lang-range.log" 2>&1; then
+    count=0
+    for f in "$rangedir"/page-*; do
+      [ -e "$f" ] || continue
+      count=$((count + 1))
+    done
+    if [ "$count" -ne 1 ]; then
+      fail "$lang" range "expected 1 page file, got $count"
+    elif ! is_png "$rangedir/page-0002.png"; then
+      fail "$lang" range "missing page-0002.png (document-absolute index)"
+    else
+      pass "$lang" range
+    fi
+  else
+    fail "$lang" range "exit $?"
+  fi
+
+  # format: WebP magic and .webp extension
+  fmtdir="$WORK/pages-$lang-webp"
+  mkdir -p "$fmtdir"
+  if run_client "$lang" pages "$FIXTURE" "$fmtdir" \
+      --format webp --parts PAGES \
+      >"$WORK/logs/$lang-format.log" 2>&1; then
+    count=0; bad=""
+    for f in "$fmtdir"/page-*.webp; do
+      [ -e "$f" ] || continue
+      count=$((count + 1))
+      is_webp "$f" || bad="$bad $(basename "$f")"
+    done
+    if [ "$count" -eq 0 ]; then
+      fail "$lang" format "no page-*.webp produced"
+    elif [ -n "$bad" ]; then
+      fail "$lang" format "bad WebP:$bad"
+    else
+      pass "$lang" format
+    fi
+  else
+    fail "$lang" format "exit $?"
   fi
 
   # pdf

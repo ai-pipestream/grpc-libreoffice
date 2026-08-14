@@ -4,10 +4,12 @@ import ai.pipestream.office.v1.ConvertToPdfRequest;
 import ai.pipestream.office.v1.ConvertToPdfResponse;
 import ai.pipestream.office.v1.DocumentChunk;
 import ai.pipestream.office.v1.DocumentInfo;
+import ai.pipestream.office.v1.DocumentPart;
 import ai.pipestream.office.v1.GetServiceInfoRequest;
 import ai.pipestream.office.v1.GetServiceInfoResponse;
 import ai.pipestream.office.v1.OfficeRenderServiceGrpc;
 import ai.pipestream.office.v1.PageImage;
+import ai.pipestream.office.v1.PageImageFormat;
 import ai.pipestream.office.v1.RenderStatus;
 import ai.pipestream.office.v1.StreamOptions;
 import ai.pipestream.office.v1.StreamPagesRequest;
@@ -42,6 +44,8 @@ import java.util.function.Consumer;
  *   gradle run --args="info"
  *   gradle run --args="pages ../../fixtures/sample3.docx out"
  *   gradle run --args="pages ../../fixtures/sample3.docx out --dpi 72"
+ *   gradle run --args="pages ../../fixtures/sample3.docx out --format webp --quality 60"
+ *   gradle run --args="pages ../../fixtures/sample3.docx out --first-page 2 --last-page 2"
  *   gradle run --args="pdf ../../fixtures/sample3.docx out.pdf"
  * </pre>
  *
@@ -71,27 +75,8 @@ public final class OfficeClient {
             switch (args[0]) {
                 case "info" -> info(channel);
                 case "pages" -> {
-                    int dpi = 0;
-                    List<String> positional = new ArrayList<>();
-                    for (int i = 1; i < args.length; i++) {
-                        if ("--dpi".equals(args[i])) {
-                            if (i + 1 >= args.length) {
-                                usage();
-                            }
-                            dpi = Integer.parseInt(args[++i]);
-                            if (dpi <= 0) {
-                                usage();
-                            }
-                        } else {
-                            positional.add(args[i]);
-                        }
-                    }
-                    if (positional.isEmpty()) {
-                        usage();
-                    }
-                    pages(channel, Path.of(positional.get(0)),
-                            Path.of(positional.size() > 1 ? positional.get(1) : "pages-out"),
-                            dpi);
+                    PagesFlags flags = parsePagesFlags(args);
+                    pages(channel, Path.of(flags.file), Path.of(flags.outdir), flags);
                 }
                 case "pdf" -> {
                     if (args.length < 2) {
@@ -115,8 +100,153 @@ public final class OfficeClient {
 
     private static void usage() {
         System.err.println(
-                "usage: OfficeClient <info | pages <file> [outdir] [--dpi <n>] | pdf <file> [out.pdf]>");
+                "usage: OfficeClient <info | pages <file> [outdir] [options] | pdf <file> [out.pdf]>");
+        System.err.println(
+                "pages options: --dpi <n> --first-page <n> --last-page <n> "
+                        + "--format png|jpeg|webp --quality <n> --parts PAGES,PARAGRAPHS,...");
         System.exit(2);
+    }
+
+    /** Parsed flags for the pages subcommand. */
+    private static final class PagesFlags {
+        String file;
+        String outdir = "pages-out";
+        int dpi;
+        int firstPage;
+        int lastPage;
+        PageImageFormat format = PageImageFormat.PAGE_IMAGE_FORMAT_UNSPECIFIED;
+        int quality;
+        final List<DocumentPart> parts = new ArrayList<>();
+    }
+
+    private static int requirePositive(String flag, String raw) {
+        int n;
+        try {
+            n = Integer.parseInt(raw);
+        } catch (NumberFormatException e) {
+            usage();
+            return 0;
+        }
+        if (n <= 0) {
+            usage();
+        }
+        return n;
+    }
+
+    private static PageImageFormat parseFormat(String raw) {
+        return switch (raw.toLowerCase(Locale.ROOT)) {
+            case "png" -> PageImageFormat.PAGE_IMAGE_FORMAT_PNG;
+            case "jpeg", "jpg" -> PageImageFormat.PAGE_IMAGE_FORMAT_JPEG;
+            case "webp" -> PageImageFormat.PAGE_IMAGE_FORMAT_WEBP;
+            default -> {
+                System.err.println("--format must be png, jpeg, or webp");
+                System.exit(2);
+                yield PageImageFormat.PAGE_IMAGE_FORMAT_UNSPECIFIED;
+            }
+        };
+    }
+
+    private static List<DocumentPart> parseParts(String raw) {
+        List<DocumentPart> parts = new ArrayList<>();
+        for (String token : raw.split(",")) {
+            String t = token.trim().toUpperCase(Locale.ROOT);
+            if (t.isEmpty()) {
+                continue;
+            }
+            String name = t.startsWith("DOCUMENT_PART_") ? t : "DOCUMENT_PART_" + t;
+            try {
+                DocumentPart part = DocumentPart.valueOf(name);
+                if (part == DocumentPart.UNRECOGNIZED
+                        || part == DocumentPart.DOCUMENT_PART_UNSPECIFIED) {
+                    throw new IllegalArgumentException(token);
+                }
+                parts.add(part);
+            } catch (IllegalArgumentException e) {
+                System.err.printf(
+                        "unknown part %s: expected a DocumentPart name "
+                                + "(PAGES or DOCUMENT_PART_PAGES)%n",
+                        token);
+                System.exit(2);
+            }
+        }
+        return parts;
+    }
+
+    private static PagesFlags parsePagesFlags(String[] args) {
+        PagesFlags flags = new PagesFlags();
+        List<String> positional = new ArrayList<>();
+        for (int i = 1; i < args.length; i++) {
+            String a = args[i];
+            if (!a.startsWith("--")) {
+                positional.add(a);
+                continue;
+            }
+            if (i + 1 >= args.length) {
+                usage();
+            }
+            String value = args[++i];
+            switch (a) {
+                case "--dpi" -> flags.dpi = requirePositive(a, value);
+                case "--first-page" -> flags.firstPage = requirePositive(a, value);
+                case "--last-page" -> flags.lastPage = requirePositive(a, value);
+                case "--format" -> flags.format = parseFormat(value);
+                case "--quality" -> flags.quality = requirePositive(a, value);
+                case "--parts" -> flags.parts.addAll(parseParts(value));
+                default -> usage();
+            }
+        }
+        if (positional.isEmpty()) {
+            usage();
+        }
+        flags.file = positional.get(0);
+        if (positional.size() > 1) {
+            flags.outdir = positional.get(1);
+        }
+        return flags;
+    }
+
+    private static StreamOptions pagesOptions(PagesFlags flags) {
+        if (flags.dpi <= 0 && flags.firstPage <= 0 && flags.lastPage <= 0
+                && flags.format == PageImageFormat.PAGE_IMAGE_FORMAT_UNSPECIFIED
+                && flags.quality <= 0 && flags.parts.isEmpty()) {
+            return null;
+        }
+        StreamOptions.Builder b = StreamOptions.newBuilder();
+        if (flags.dpi > 0) {
+            b.setRenderDpi(flags.dpi);
+        }
+        if (flags.firstPage > 0) {
+            b.setFirstPage(flags.firstPage);
+        }
+        if (flags.lastPage > 0) {
+            b.setLastPage(flags.lastPage);
+        }
+        if (flags.format != PageImageFormat.PAGE_IMAGE_FORMAT_UNSPECIFIED) {
+            b.setPageFormat(flags.format);
+        }
+        if (flags.quality > 0) {
+            b.setPageQuality(flags.quality);
+        }
+        if (!flags.parts.isEmpty()) {
+            b.addAllParts(flags.parts);
+        }
+        return b.build();
+    }
+
+    private static String pageExt(PageImageFormat format) {
+        return switch (format) {
+            case PAGE_IMAGE_FORMAT_JPEG -> "jpg";
+            case PAGE_IMAGE_FORMAT_WEBP -> "webp";
+            default -> "png";
+        };
+    }
+
+    private static String pageLabel(PageImageFormat format) {
+        return switch (format) {
+            case PAGE_IMAGE_FORMAT_JPEG -> "jpeg";
+            case PAGE_IMAGE_FORMAT_WEBP -> "webp";
+            default -> "png";
+        };
     }
 
     private static void info(ManagedChannel channel) {
@@ -134,7 +264,7 @@ public final class OfficeClient {
                 String.join(", ", resp.getSupportedFormatsList()));
     }
 
-    private static void pages(ManagedChannel channel, Path file, Path outdir, int dpi)
+    private static void pages(ManagedChannel channel, Path file, Path outdir, PagesFlags flags)
             throws IOException, InterruptedException {
         Files.createDirectories(outdir);
         long t0 = System.nanoTime();
@@ -151,17 +281,18 @@ public final class OfficeClient {
                                 case PAGE_IMAGE -> {
                                     firstPageNanos.compareAndSet(null, System.nanoTime() - t0);
                                     PageImage img = resp.getPageImage();
-                                    Path out = outdir.resolve(
-                                            String.format("page-%04d.png", img.getIndex() + 1));
+                                    Path out = outdir.resolve(String.format("page-%04d.%s",
+                                            img.getIndex() + 1, pageExt(img.getFormat())));
                                     try {
                                         Files.write(out, img.getPng().toByteArray());
                                     } catch (IOException e) {
                                         throw new UncheckedIOException(e);
                                     }
                                     pagesSaved[0]++;
-                                    System.out.printf("  %s  %dx%dpx @ %d dpi  %,d bytes%n",
+                                    System.out.printf("  %s  %dx%dpx @ %d dpi  %s  %,d bytes%n",
                                             out.getFileName(), img.getWidthPx(),
-                                            img.getHeightPx(), img.getDpi(), img.getPng().size());
+                                            img.getHeightPx(), img.getDpi(),
+                                            pageLabel(img.getFormat()), img.getPng().size());
                                 }
                                 case STATUS -> {
                                     long totalMs = (System.nanoTime() - t0) / 1_000_000;
@@ -188,12 +319,13 @@ public final class OfficeClient {
                             }
                         }));
 
+        StreamOptions options = pagesOptions(flags);
         streamDocument(file, upload, (chunk, first) -> {
             StreamPagesRequest.Builder req = StreamPagesRequest.newBuilder().setChunk(chunk);
-            // render_dpi resolves to the first nonzero value in the upload
-            // stream, so it must ride the first chunk.
-            if (first && dpi > 0) {
-                req.setOptions(StreamOptions.newBuilder().setRenderDpi(dpi));
+            // StreamOptions resolve to the first nonzero/non-empty value in
+            // the upload stream, so they must ride the first chunk.
+            if (first && options != null) {
+                req.setOptions(options);
             }
             return req.build();
         });
