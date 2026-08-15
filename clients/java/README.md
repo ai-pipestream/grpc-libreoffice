@@ -20,6 +20,7 @@ Gradle 9.x works identically (`gradle run ...`).
 ./gradlew run --args="pages ../../fixtures/sample3.docx out --format webp --quality 60"
 ./gradlew run --args="pages ../../fixtures/sample3.docx out --first-page 2 --last-page 2 --parts PAGES"
 ./gradlew run --args="pdf ../../fixtures/sample3.docx out.pdf"
+./gradlew run --args="pdf ../../fixtures/sample3.docx out.pdf --redact 0:120"
 ```
 
 `pages` flags map onto `StreamOptions` on the first upload chunk:

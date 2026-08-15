@@ -87,8 +87,25 @@ public final class OfficeClient {
                     if (args.length < 2) {
                         usage();
                     }
-                    pdf(channel, Path.of(args[1]),
-                            Path.of(args.length > 2 ? args[2] : "out.pdf"));
+                    List<TextSpan> redacts = new ArrayList<>();
+                    List<String> positional = new ArrayList<>();
+                    for (int i = 1; i < args.length; i++) {
+                        if ("--redact".equals(args[i])) {
+                            if (i + 1 >= args.length) {
+                                System.err.println("--redact needs START:END");
+                                System.exit(2);
+                            }
+                            redacts.add(parseRedact(args[++i]));
+                        } else {
+                            positional.add(args[i]);
+                        }
+                    }
+                    if (positional.isEmpty()) {
+                        usage();
+                    }
+                    pdf(channel, Path.of(positional.get(0)),
+                            Path.of(positional.size() > 1 ? positional.get(1) : "out.pdf"),
+                            redacts);
                 }
                 case "todoc" -> {
                     PagesFlags flags = parsePagesFlags(args);
@@ -110,7 +127,8 @@ public final class OfficeClient {
     private static void usage() {
         System.err.println(
                 "usage: OfficeClient <info | pages <file> [outdir] [options] | "
-                        + "pdf <file> [out.pdf] | todoc <file> [options]>");
+                        + "pdf <file> [out.pdf] [--redact START:END] | "
+                        + "todoc <file> [options]>");
         System.err.println(
                 "pages options: --dpi <n> --first-page <n> --last-page <n> "
                         + "--format png|jpeg|webp|svg --quality <n> --parts PAGES,PARAGRAPHS,... "
@@ -494,8 +512,8 @@ public final class OfficeClient {
         state.awaitDone();
     }
 
-    private static void pdf(ManagedChannel channel, Path file, Path out)
-            throws IOException, InterruptedException {
+    private static void pdf(ManagedChannel channel, Path file, Path out,
+            List<TextSpan> redacts) throws IOException, InterruptedException {
         long t0 = System.nanoTime();
         long[] total = {0};
         try (OutputStream os = Files.newOutputStream(out)) {
@@ -521,8 +539,14 @@ public final class OfficeClient {
                                 }
                             }));
 
-            streamDocument(file, upload,
-                    (chunk, first) -> ConvertToPdfRequest.newBuilder().setChunk(chunk).build());
+            streamDocument(file, upload, (chunk, first) -> {
+                ConvertToPdfRequest.Builder b =
+                        ConvertToPdfRequest.newBuilder().setChunk(chunk);
+                if (first) {
+                    b.addAllRedactSpans(redacts);
+                }
+                return b.build();
+            });
             state.awaitDone();
         }
         System.out.printf("wrote       : %,d bytes -> %s%n", total[0], out);

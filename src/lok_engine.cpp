@@ -188,7 +188,8 @@ std::string export_page_svg(lok::Document* document, const PageRect& page,
 bool paint_pages(lok::Document* document, const RenderOptions& options,
                  const std::vector<PageRect>& pages, bool bgra, int out_fd,
                  long* output_bytes, std::string* error,
-                 const std::vector<RedactBox>& redact) {
+                 const std::vector<RedactBox>& redact,
+                 std::vector<std::string>* warnings) {
   struct RawPage {
     int index;
     int width_px;
@@ -249,6 +250,7 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
     }
   });
 
+  bool svg_fallback_warned = false;
   for (size_t index = 0; encoder_ok && index < pages.size(); index++) {
     int page_number = static_cast<int>(index) + 1;
     if (options.first_page > 0 && page_number < options.first_page) continue;
@@ -259,12 +261,20 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
     if (options.vector_format == officev1::PAGE_VECTOR_FORMAT_SVG) {
       std::string svg = export_page_svg(document, page, options.work_dir);
       if (svg.empty()) {
-        svg = export_page_svg_uno(page_number, nullptr);
+        svg = export_page_svg_uno(page_number);
       }
       if (svg.empty() || svg.find("<svg") == std::string::npos) {
         // Writer (and some other classes) have no SVG store filter.
         // Paint the page and wrap the PNG in an SVG so the wire format
-        // stays PAGE_IMAGE_FORMAT_SVG.
+        // stays PAGE_IMAGE_FORMAT_SVG. The caller asked for vector output
+        // and gets raster, so the downgrade lands in the status warnings,
+        // once for the whole document.
+        if (!svg_fallback_warned && warnings != nullptr) {
+          warnings->push_back(
+              "vector SVG unavailable for this document class; pages are "
+              "PNG wrapped in SVG");
+          svg_fallback_warned = true;
+        }
         double scale = options.dpi / kTwipsPerInch;
         if (options.max_width_px > 0 && page.width > 0) {
           scale = static_cast<double>(options.max_width_px) / page.width;
@@ -584,7 +594,7 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     std::vector<std::string> typed_warnings = option_warnings;
     if (ok && options.parts.wants(officev1::DOCUMENT_PART_PAGES)) {
       if (!paint_pages(document, options, pages, bgra, out_fd, &output_bytes,
-                       error, redact)) {
+                       error, redact, &typed_warnings)) {
         delete document;
         return kExitRenderFailure;
       }
@@ -649,6 +659,7 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     PdfExportOptions pdf;
     pdf.first_page = options.first_page;
     pdf.last_page = options.last_page;
+    pdf.skip_hidden = options.skip_hidden;
     if (ok && !export_pdf_stream(
                   pdf_filter, kPdfChunkBytes,
                   [&](std::string&& chunk) {

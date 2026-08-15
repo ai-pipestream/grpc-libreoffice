@@ -8,7 +8,7 @@ and Java. Each client exposes the same subcommands:
 |---|---|
 | `info` | Print server/LibreOffice versions, limits, and accepted formats. |
 | `pages <file> [outdir] [options]` | Upload the file, save every rendered page as `page-NNNN.<ext>`, summarize typed content events, print RenderStatus and timing. Flags map 1:1 onto `StreamOptions` on the first upload chunk: `--dpi <n>` (`render_dpi`, server clamps to [24,600]); `--first-page` / `--last-page` (1-based inclusive page-image range); `--format png\|jpeg\|webp\|svg` and `--quality <n>` (page encoding; files use `.png` / `.jpg` / `.webp` / `.svg` from `PageImage.format`); `--parts PAGES,PARAGRAPHS,...` (short or `DOCUMENT_PART_*` names); `--max-width <n>` (fit-to-width); `--grayscale`; `--timeout <n>`; `--tracked-changes as-is\|final\|original\|markup`; `--skip-hidden`; `--used-range`; `--notes`; `--form NAME=VALUE`; `--redact START:END`; `--repair`. Omitted flags mean the server default. Each page line shows the DPI and encoding the page actually rendered at. |
-| `pdf <file> [out.pdf]` | Upload the file, write the streamed PDF, print byte count and timing. |
+| `pdf <file> [out.pdf]` | Upload the file, write the streamed PDF, print byte count and timing. All clients take `--redact START:END` (repeatable, annotation-space span painted as an opaque box in the PDF); the Python client additionally exposes `--first-page` / `--last-page`, `--timeout`, `--tracked-changes`, `--skip-hidden`, `--form`, and `--repair` on the PDF path. |
 | `todoc <file> [options]` | Same upload as `pages`; fold the event stream into one `Document` and print item counts. |
 
 All clients upload the document as ~256 KiB `DocumentChunk`s with
@@ -90,7 +90,9 @@ first PNG exactly half the default run's pixel width, `pages --first-page 2
 `pages --format webp --parts PAGES` must emit WebP files with the RIFF/WEBP
 magic, `pages --grayscale --parts PAGES` must still emit PNG, `pages
 --max-width 200 --parts PAGES` must paint a first page at most 200 px
-wide, and `pages --format svg --parts PAGES` must emit SVG files containing
-`<svg`. It prints a per-language PASS/FAIL table and exits nonzero on any
+wide, `pages --format svg --parts PAGES` must emit SVG files containing
+`<svg`, and `pdf --redact 0:120` on a text-only fixture must rasterize with
+a solid black run its unredacted baseline lacks (skipped without
+`pdftoppm`). It prints a per-language PASS/FAIL table and exits nonzero on any
 failure. It also runs as an optional leg of the smoke test:
 `scripts/e2e-smoke.sh --clients`.

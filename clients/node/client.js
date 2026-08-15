@@ -8,7 +8,7 @@
 //        [--timeout N] [--tracked-changes MODE] [--skip-hidden]
 //        [--used-range] [--notes] [--form NAME=VALUE] [--redact START:END]
 //        [--repair]
-//   node client.js pdf <file> [out.pdf]
+//   node client.js pdf <file> [out.pdf] [--redact START:END]
 //   node client.js todoc <file>
 //
 // Server address defaults to localhost:50053; override with GRLIBRE_ADDR.
@@ -335,7 +335,7 @@ function cmdTodoc(file, opts) {
   uploadFile(call, file, extra);
 }
 
-function cmdPdf(file, out = "out.pdf") {
+function cmdPdf(file, out = "out.pdf", redacts = []) {
   const client = makeClient();
   const t0 = performance.now();
   let total = 0;
@@ -364,7 +364,10 @@ function cmdPdf(file, out = "out.pdf") {
     fs.closeSync(fd);
     fail(err);
   });
-  uploadFile(call, file);
+  const firstExtra = redacts.length
+    ? { redact_spans: redacts.map(parseRedact) }
+    : {};
+  uploadFile(call, file, firstExtra);
 }
 
 const PAGES_USAGE =
@@ -486,13 +489,29 @@ switch (cmd) {
     cmdPages(positional[0], positional[1] || "pages-out", opts);
     break;
   }
-  case "pdf":
-    if (!rest[0]) {
-      console.error("usage: node client.js pdf <file> [out.pdf]");
+  case "pdf": {
+    const positional = [];
+    const redacts = [];
+    for (let i = 0; i < rest.length; i++) {
+      if (rest[i] === "--redact") {
+        if (i + 1 >= rest.length) {
+          console.error("--redact needs START:END");
+          process.exit(2);
+        }
+        redacts.push(rest[++i]);
+      } else {
+        positional.push(rest[i]);
+      }
+    }
+    if (!positional[0]) {
+      console.error(
+        "usage: node client.js pdf <file> [out.pdf] [--redact START:END]",
+      );
       process.exit(2);
     }
-    cmdPdf(rest[0], rest[1]);
+    cmdPdf(positional[0], positional[1], redacts);
     break;
+  }
   case "todoc": {
     const { positional, opts } = parsePagesArgs(rest);
     if (!positional[0]) {

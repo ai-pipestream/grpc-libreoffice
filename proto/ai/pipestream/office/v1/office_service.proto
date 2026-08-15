@@ -423,7 +423,11 @@ message ConvertToPdfRequest {
   // Character spans to redact on the exported PDF; same contract as
   // StreamOptions.redact_spans.
   repeated TextSpan redact_spans = 6;
-  // When true, hidden sheets and hidden slides are omitted from the PDF.
+  // When true, hidden sheets and hidden slides are guaranteed omitted from
+  // the PDF, and DocumentInfo.page_count / page_rects describe only the
+  // visible set. When false, the office core's own defaults apply: hidden
+  // sheets are never exported, and hidden slides follow the installation's
+  // configured pdf filter defaults (omitted in a stock installation).
   bool skip_hidden = 7;
   // First page to include in the PDF, 1-based inclusive. Zero means from
   // the first page. A negative value, or first_page > last_page when both

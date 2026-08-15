@@ -104,6 +104,11 @@ struct PdfExportOptions {
   int first_page = 0;
   // Last page, 1-based inclusive; 0 means through the end.
   int last_page = 0;
+  // Pins ExportHiddenSlides=false in FilterData. The impress pdf filter
+  // omits hidden slides by default, but that default is installation
+  // configuration; only an explicit FilterData entry guarantees it. Calc
+  // needs no equivalent: its pdf filter never exports hidden sheets.
+  bool skip_hidden = false;
 };
 
 bool export_pdf_stream(const std::string& filter_name, size_t chunk_limit,
@@ -183,9 +188,10 @@ void describe_parts(std::vector<PartLayout>* parts,
                     std::vector<std::string>* warnings);
 
 // Exports one page of the loaded document as SVG through the UNO graphic
-// export filter. page_number is 1-based. Returns empty on failure.
-std::string export_page_svg_uno(int page_number,
-                                std::vector<std::string>* warnings);
+// export filter. page_number is 1-based. Returns empty on failure, silently:
+// document classes without an SVG store filter fail on every page, and the
+// caller's raster fallback is the designed handling.
+std::string export_page_svg_uno(int page_number);
 
 }  // namespace grlibre
 

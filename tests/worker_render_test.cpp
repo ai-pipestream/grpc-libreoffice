@@ -146,6 +146,17 @@ std::string fold_pdf(const std::vector<std::string>& payloads) {
   return pdf;
 }
 
+// The DocumentInfo event of a pdf-mode payload list.
+officev1::DocumentInfo pdf_info(const std::vector<std::string>& payloads) {
+  officev1::DocumentInfo info;
+  for (const std::string& payload : payloads) {
+    officev1::ConvertToPdfResponse event;
+    require(event.ParseFromString(payload), "pdf event parses");
+    if (event.has_document_info()) info = event.document_info();
+  }
+  return info;
+}
+
 // Rasterizes a PDF with pdftoppm into a scratch dir and returns one P6
 // PPM byte buffer per page. Requires poppler-utils, present in CI and the
 // dev image alongside soffice.
@@ -2215,6 +2226,19 @@ void verify_stream_option_extras() {
             "svg page format named");
     require(run.pages[0].png().find("<svg") != std::string::npos,
             "svg payload carries an <svg tag");
+    // The raster fallback (PNG wrapped in an SVG) must announce itself in
+    // the status warnings, exactly once; a true vector page must not.
+    const bool wrapped =
+        run.pages[0].png().find("data:image/png;base64,") != std::string::npos;
+    int downgrade_warnings = 0;
+    require(run.got_status, "svg render carries a final status");
+    for (const std::string& warning : run.status.warnings()) {
+      if (warning.find("vector SVG unavailable") != std::string::npos) {
+        downgrade_warnings++;
+      }
+    }
+    require(downgrade_warnings == (wrapped ? 1 : 0),
+            "raster-fallback warning matches the payload kind");
   }
   {
     // PAGE_VECTOR_FORMAT_NONE forces raster even when page_format names
@@ -2337,6 +2361,36 @@ void verify_pdf_page_range() {
   std::vector<std::string> pages = rasterize_pdf(fold_pdf(payloads));
   require(pages.size() == 1, "1:1 range exports exactly one page, got "
                                  + std::to_string(pages.size()));
+}
+
+// skip_hidden on the pdf path. The office core's pdf filter never exports
+// the hidden sheet, flag or no flag; what skip_hidden adds is a
+// DocumentInfo that describes only the visible set, so page_count matches
+// the PDF instead of counting sheets the PDF does not contain.
+void verify_pdf_skip_hidden() {
+  {
+    std::vector<std::string> payloads;
+    auto outcome = run("pdf", "fods", kTwoSheetFods, &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "default pdf ok: " + outcome.detail);
+    require(pdf_info(payloads).page_count() == 2,
+            "default DocumentInfo counts the hidden sheet");
+    require(rasterize_pdf(fold_pdf(payloads)).size() == 1,
+            "pdf filter omits the hidden sheet by default");
+  }
+  {
+    officev1::StreamOptions extras;
+    extras.set_skip_hidden(true);
+    std::vector<std::string> payloads;
+    auto outcome =
+        run_with_extras("pdf", "fods", kTwoSheetFods, extras, &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "skip_hidden pdf ok: " + outcome.detail);
+    require(pdf_info(payloads).page_count() == 1,
+            "skip_hidden DocumentInfo matches the exported PDF");
+    require(rasterize_pdf(fold_pdf(payloads)).size() == 1,
+            "skip_hidden PDF has one page");
+  }
 }
 
 // Sheet visibility and used-range cropping on a flat ODS with a hidden
@@ -2481,6 +2535,7 @@ int main() {
   verify_redact_spans_change_pages();
   verify_pdf_redaction_paints_black_box();
   verify_pdf_page_range();
+  verify_pdf_skip_hidden();
   verify_sheet_visibility_and_used_range();
   verify_notes_pages();
   verify_tracked_change_display();

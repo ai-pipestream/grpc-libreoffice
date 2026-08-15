@@ -17,6 +17,11 @@
 #   gray    pages --grayscale --parts PAGES: still PNG magic
 #   width   pages --max-width 200 --parts PAGES: first page width <= 200
 #   svg     pages --format svg --parts PAGES: page-*.svg containing <svg
+#   rpdf    pdf --redact 0:120 on a plain-text fixture: rasterized page 1
+#           shows a solid black run the unredacted pdf lacks (a text-only
+#           fixture keeps the negative control honest; table borders in the
+#           docx fixture rasterize as long black runs on their own).
+#           Skipped when pdftoppm is absent.
 #
 # Prints a per-language PASS/FAIL table and exits nonzero on any failure.
 # Client setup (venv, stubs, node_modules, gradle installDist) happens lazily.
@@ -106,7 +111,7 @@ export GRLIBRE_ADDR="localhost:$PORT"
 # ---- checks -------------------------------------------------------------------
 
 LANGS=(python node java)
-TESTS=(info pages pdf error dpi range format gray width svg)
+TESTS=(info pages pdf rpdf error dpi range format gray width svg)
 declare -A RESULT   # RESULT[lang/test] = PASS | FAIL(reason)
 declare -A PAGE_COUNT PDF_SIZE PAGE_WIDTH
 FAILED=0
@@ -129,6 +134,43 @@ is_webp() {
 
 is_svg() { [ -s "$1" ] && grep -q "<svg" "$1"; }
 
+# Whether page 1 of a PDF rasterizes with a horizontal run of >= 50
+# near-black pixels. A redaction box always produces one; glyphs at 100 dpi
+# never do. Prints 1 or 0.
+has_black_run() {
+  local prefix="$WORK/ppm-check-$$"
+  rm -f "$prefix"*.ppm
+  pdftoppm -r 100 -f 1 -l 1 "$1" "$prefix" >/dev/null 2>&1 || { echo 0; return; }
+  local ppm
+  ppm=$(ls "$prefix"*.ppm 2>/dev/null | head -1)
+  [ -n "$ppm" ] || { echo 0; return; }
+  python3 - "$ppm" <<'PY'
+import sys
+with open(sys.argv[1], "rb") as f:
+    assert f.readline().strip() == b"P6"
+    line = f.readline()
+    while line.startswith(b"#"):
+        line = f.readline()
+    width, height = map(int, line.split())
+    f.readline()  # maxval
+    data = f.read()
+best = 0
+for y in range(height):
+    row = data[y * width * 3:(y + 1) * width * 3]
+    run = 0
+    for x in range(width):
+        r, g, b = row[x * 3:x * 3 + 3]
+        if r < 40 and g < 40 and b < 40:
+            run += 1
+            if run > best:
+                best = run
+        else:
+            run = 0
+print(1 if best >= 50 else 0)
+PY
+  rm -f "$prefix"*.ppm
+}
+
 # IHDR pixel width: bytes 16..19 of the file, big-endian.
 png_width() {
   python3 -c 'import struct, sys
@@ -139,6 +181,15 @@ with open(sys.argv[1], "rb") as f:
 
 BAD_FILE="$WORK/x.unknownext"
 cp "$FIXTURE" "$BAD_FILE"
+
+# Text-only redaction fixture: no borders or images, so any long black run
+# in the rasterized PDF can only be a redaction box.
+REDACT_FIXTURE="$WORK/redact-fixture.txt"
+{
+  echo "First line of the redaction fixture."
+  echo "Second line holds the SECRET-VALUE to hide from the export."
+  echo "Third line stays visible below the redaction."
+} > "$REDACT_FIXTURE"
 
 for lang in "${LANGS[@]}"; do
   echo "== $lang =="
@@ -309,6 +360,30 @@ for lang in "${LANGS[@]}"; do
     fi
   else
     fail "$lang" pdf "exit $?"
+  fi
+
+  # rpdf: --redact must paint an actual black box into the exported PDF.
+  # An unredacted export of the same text-only fixture is the negative
+  # control: it must rasterize without any long black run.
+  rpdf="$WORK/redacted-$lang.pdf"
+  rpdf_base="$WORK/redact-baseline-$lang.pdf"
+  if ! command -v pdftoppm >/dev/null 2>&1; then
+    :  # leave rpdf as SKIP in the table
+  elif run_client "$lang" pdf "$REDACT_FIXTURE" "$rpdf" --redact 0:120 \
+      >"$WORK/logs/$lang-rpdf.log" 2>&1 \
+      && run_client "$lang" pdf "$REDACT_FIXTURE" "$rpdf_base" \
+      >>"$WORK/logs/$lang-rpdf.log" 2>&1; then
+    if [ ! -s "$rpdf" ] || [ "$(head -c 4 "$rpdf")" != "%PDF" ]; then
+      fail "$lang" rpdf "missing %PDF magic"
+    elif [ "$(has_black_run "$rpdf")" != "1" ]; then
+      fail "$lang" rpdf "no black redaction box on rasterized page 1"
+    elif [ "$(has_black_run "$rpdf_base")" = "1" ]; then
+      fail "$lang" rpdf "unredacted baseline already has a black run; check is vacuous"
+    else
+      pass "$lang" rpdf
+    fi
+  else
+    fail "$lang" rpdf "exit $?"
   fi
 
   # error path: unresolvable extension must fail

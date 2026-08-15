@@ -18,6 +18,7 @@ node client.js pages ../../fixtures/sample3.docx out --dpi 72
 node client.js pages ../../fixtures/sample3.docx out --format webp --quality 60
 node client.js pages ../../fixtures/sample3.docx out --first-page 2 --last-page 2 --parts PAGES
 node client.js pdf ../../fixtures/sample3.docx out.pdf
+node client.js pdf ../../fixtures/sample3.docx out.pdf --redact 0:120
 ```
 
 `pages` flags map onto `StreamOptions` on the first upload chunk:

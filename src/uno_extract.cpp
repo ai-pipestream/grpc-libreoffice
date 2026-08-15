@@ -4073,16 +4073,26 @@ bool export_pdf_stream(const std::string& filter_name, size_t chunk_limit,
     // and changes the output. Any future filter option must be merged into
     // this sequence, keeping it non-empty.
     const bool ranged = pdf.first_page > 0 || pdf.last_page > 0;
-    css::uno::Sequence<css::beans::PropertyValue> filter_data(ranged ? 2 : 1);
-    filter_data.getArray()[0].Name = "ExportBookmarks";
-    filter_data.getArray()[0].Value <<= true;
+    css::uno::Sequence<css::beans::PropertyValue> filter_data(
+        1 + (ranged ? 1 : 0) + (pdf.skip_hidden ? 1 : 0));
+    sal_Int32 slot = 0;
+    filter_data.getArray()[slot].Name = "ExportBookmarks";
+    filter_data.getArray()[slot++].Value <<= true;
     if (ranged) {
       const int first = pdf.first_page > 0 ? pdf.first_page : 1;
       const int last = pdf.last_page > 0 ? pdf.last_page : 9999;
       std::string range = std::to_string(first) + "-" + std::to_string(last);
-      filter_data.getArray()[1].Name = "PageRange";
-      filter_data.getArray()[1].Value <<=
+      filter_data.getArray()[slot].Name = "PageRange";
+      filter_data.getArray()[slot++].Value <<=
           rtl::OUString::createFromAscii(range.c_str());
+    }
+    if (pdf.skip_hidden) {
+      // An installation configured with ExportHiddenSlides=true would
+      // otherwise include hidden slides; unlisted FilterData entries fall
+      // back to that configuration. Unknown entries are ignored by the
+      // non-impress filters.
+      filter_data.getArray()[slot].Name = "ExportHiddenSlides";
+      filter_data.getArray()[slot++].Value <<= false;
     }
     css::uno::Sequence<css::beans::PropertyValue> descriptor(3);
     css::beans::PropertyValue* props = descriptor.getArray();
@@ -4531,9 +4541,7 @@ void apply_redact_shapes(const std::vector<RedactBox>& boxes,
   }
 }
 
-std::string export_page_svg_uno(int page_number,
-                                std::vector<std::string>* warnings) {
-  Warner warner(warnings);
+std::string export_page_svg_uno(int page_number) {
   if (page_number < 1) return {};
   try {
     Reference<css::uno::XComponentContext> context = process_context();
@@ -4561,8 +4569,10 @@ std::string export_page_svg_uno(int page_number,
     props[2].Value <<= filter_data;
     storable->storeToURL(oustring("private:stream"), descriptor);
     if (bytes.find("<svg") != std::string::npos) return bytes;
-  } catch (const css::uno::Exception& error) {
-    warner.warn("svg export", error);
+  } catch (const css::uno::Exception&) {
+    // Document classes without an SVG store filter (Writer among them)
+    // throw here on every page; the caller's raster fallback handles it
+    // and reports the downgrade once per document.
     return {};
   }
   return {};
