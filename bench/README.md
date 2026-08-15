@@ -1,4 +1,4 @@
-# bench — speed test for the render service
+# bench: speed test for the render service
 
 Measures per-document latency and whole-service throughput against a running
 `grlibre-server`, using the documents in `../fixtures/`.
@@ -15,20 +15,20 @@ Measures per-document latency and whole-service throughput against a running
 
 `--pages` exercises the page-range feature: on the 224-page sample4.docx,
 `--pages 100` returns that single page in ~650 ms where the full paint takes
-~14 s — the load and layout are paid once, the other 223 paints never happen.
+~14 s; the load and layout are paid once, the other 223 paints never happen.
 
 `--format webp` (with optional `--quality`) selects the lossy page
 encodings: on this corpus WebP cuts page payloads 2-4x against PNG at a
-small encode-time cost, while JPEG usually loses to PNG on text pages —
-document pages are not photographs.
+small encode-time cost, while JPEG usually loses to PNG on text pages,
+because document pages are not photographs.
 
 Three modes per file:
 
-- `pages-only` — `StreamPages` with `parts=[DOCUMENT_PART_PAGES]`: pure
+- `pages-only`: `StreamPages` with `parts=[DOCUMENT_PART_PAGES]`: pure
   render speed, no typed-content extraction work.
-- `pages-full` — `StreamPages` with no selection: render plus the full typed
+- `pages-full`: `StreamPages` with no selection: render plus the full typed
   extraction (paragraphs, tables, sheets, slides, comments, ...).
-- `pdf` — `ConvertToPdf`.
+- `pdf`: `ConvertToPdf`.
 
 Reported per file: time to `DocumentInfo` (ttfb), time to first page/PDF
 chunk (ttfp), median total wall time, pages/sec, output size. The

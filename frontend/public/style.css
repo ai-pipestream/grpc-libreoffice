@@ -618,6 +618,15 @@ main {
 
 .ro-num:focus { outline: none; border-color: var(--accent); }
 
+.ro-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+
 .ro-dash { color: var(--text-dim); }
 
 .ro-note {

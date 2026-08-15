@@ -14,7 +14,7 @@ struct WorkerOutcome {
     kOk,                    // exit 0, all frames delivered
     kLoadFailure,           // office core could not load the document
     kRepairNeedsOptIn,      // broken package; repair not opted into
-    kRepairUnimplemented,   // repair opted into but not implemented
+    kRepairUnimplemented,   // older worker exit 7; current workers do not emit this
     kWorkDirNotTmpfs,       // deployment error: work dir is not tmpfs
     kTimeout,               // deadline elapsed; worker was killed
     kAborted,               // the frame consumer declined further frames

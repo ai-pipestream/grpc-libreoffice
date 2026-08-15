@@ -20,4 +20,8 @@ std::string encode_png(const std::uint8_t* pixels, int width, int height, bool b
 std::string encode_image(const std::uint8_t* pixels, int width, int height,
                          bool bgra, ImageFormat format, int quality);
 
+// Converts a 32-bit-per-pixel buffer to grayscale in place, keeping alpha.
+// Rec. 601 luma. When bgra is true the buffer is BGRA, otherwise RGBA.
+void grayscale_pixels(std::uint8_t* pixels, int width, int height, bool bgra);
+
 }  // namespace grlibre

@@ -31,6 +31,7 @@ sourceSets {
             // The repo's proto tree; only the office service is needed.
             srcDir '../../proto'
             include 'ai/pipestream/office/v1/office_service.proto'
+            include 'ai/pipestream/document/v1/document.proto'
         }
     }
 }

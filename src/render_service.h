@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -17,6 +18,8 @@ namespace grlibre {
 // default and the per-request StreamOptions.render_dpi override.
 inline constexpr int kMinRenderDpi = 24;
 inline constexpr int kMaxRenderDpi = 600;
+inline constexpr int kMaxTimeoutSeconds = 600;
+inline constexpr int kMaxWidthPx = 8192;
 
 // Server-side configuration shared by every request.
 struct ServiceConfig {
@@ -57,6 +60,11 @@ class RenderServiceImpl final
       const ai::pipestream::office::v1::GetServiceInfoRequest* request,
       ai::pipestream::office::v1::GetServiceInfoResponse* response) override;
 
+  grpc::Status ToDocument(
+      grpc::ServerContext* context,
+      grpc::ServerReader<ai::pipestream::office::v1::StreamPagesRequest>* reader,
+      ai::pipestream::office::v1::ToDocumentResponse* response) override;
+
   // Documents fully rendered / rejected before render / failed in render.
   std::atomic<long> rendered{0};
   std::atomic<long> rejected{0};
@@ -66,9 +74,14 @@ class RenderServiceImpl final
   // Blocks until a render slot frees up; RAII-released.
   class SlotGuard;
 
-  template <typename Response, typename Request>
-  grpc::Status render(const char* mode,
-                      grpc::ServerReaderWriter<Response, Request>* stream);
+  // default_parts is the worker parts token used when no request in the
+  // upload stream selected parts: "all" for the streaming RPCs,
+  // "all-but-pages" for ToDocument (page images are omitted from the mapped
+  // document unless explicitly selected).
+  template <typename Response, typename Request, typename In>
+  grpc::Status render(const char* mode, In* in,
+                      const std::function<bool(Response&&)>& write,
+                      const char* default_parts = "all");
 
   ServiceConfig config_;
   std::vector<std::string> supported_formats_;

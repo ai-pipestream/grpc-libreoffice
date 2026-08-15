@@ -26,6 +26,22 @@ The server exists for three reasons:
    the core's own staging, is an explicit per-request opt-in
    (`allow_package_repair`) and off by default.
 
+## Request flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as grlibre-server
+    participant W as grlibre-worker
+    participant L as LibreOffice core
+    C->>S: stream upload chunks + options (StreamPages / ConvertToPdf / ToDocument)
+    S->>W: spawn worker, document bytes on stdin
+    W->>L: load document (staged on tmpfs, unlinked after load)
+    L-->>W: painted pages, typed content, or PDF export stream
+    W-->>S: length-prefixed response events on stdout
+    S-->>C: DocumentInfo, PageImage / PdfChunk / typed events, RenderStatus
+```
+
 ## API
 
 `ai.pipestream.office.v1.OfficeRenderService` (see `proto/`, linted with buf
@@ -101,18 +117,28 @@ at STANDARD plus COMMENTS):
   selection round-trip per cell and therefore must be listed explicitly.
   The work behind an unselected part is skipped, not just its emission.
   `StreamOptions` also carries an optional per-request `render_dpi`
-  (clamped to 24–600, zero means the server default); every page reports
+  (clamped to 24-600, zero means the server default); every page reports
   the DPI it actually rendered at in `PageImage.dpi`. A 1-based inclusive
   `first_page`/`last_page` range restricts which pages are painted at all
   (zero means unbounded on that side): pages outside it are never rendered,
   while `DocumentInfo` keeps the full page count and typed content is
-  unaffected — page 50 of a 224-page document costs one page's paint, not
+  unaffected: page 50 of a 224-page document costs one page's paint, not
   224. Page images encode as lossless PNG by default; a request can select
   lossy JPEG or WebP with a quality knob (`page_format`, `page_quality`,
-  default 85), and every `PageImage` names the encoding it carries in its
-  `format` field. Measured on document pages, WebP at the default quality
-  cuts payloads 2-4x against PNG; JPEG only pays off on photographic
-  pages and can exceed PNG on text.
+  default 85), or SVG vector pages (`vector_format` / `page_format=SVG`).
+  Every `PageImage` names the encoding it carries in its `format` field.
+  Measured on document pages, WebP at the default quality cuts payloads
+  2-4x against PNG; JPEG only pays off on photographic pages and can
+  exceed PNG on text. `max_width_px` fits each page to a pixel width
+  (still clamped by the per-side bound); `grayscale` converts rasters
+  before encoding; `timeout_seconds` overrides the per-document deadline.
+  `tracked_changes` selects Writer redline display (as-is / final /
+  original / show markup). `skip_hidden` omits hidden sheets and slides
+  from page images; `paint_used_range` crops spreadsheet pages to the
+  used cell range; `include_notes_pages` appends each slide's notes page.
+  `form_values` writes named form fields before paint or export;
+  `redact_spans` blacks out annotation-space character ranges on rasters
+  and draws matching rectangles on PDF export.
   `DocumentInfo` and `RenderStatus` are always sent.
   `DocumentInfo` also carries the layout rectangle of every page in the
   same twips space the typed positions use, so a consumer can map any
@@ -120,10 +146,17 @@ at STANDARD plus COMMENTS):
 - `ConvertToPdf`: same upload contract; the response streams the PDF as
   ordered chunks instead of page images. The PDF flows straight from the
   export filter's output stream into the chunk events, so it never exists
-  as a service file or as one whole buffer in the worker.
+  as a service file or as one whole buffer in the worker. The request
+  carries the same timeout, tracked-change, form-fill, redact, skip-hidden,
+  and page-range knobs as `StreamOptions`.
+- `ToDocument`: same upload and `StreamOptions` as `StreamPages`; the
+  server folds the event stream into one `ai.pipestream.document.v1.Document`
+  and returns it with `DocumentInfo` and `RenderStatus`.
 - `GetServiceInfo`: versions, limits, and accepted source formats, for
   orchestrators and tool facades. It also advertises the diskless posture
-  (`diskless_documents`) and names the LibreOffice-internal temp artifacts
+  (`diskless_documents`), whether `ToDocument` is implemented
+  (`document_mapping`), whether `allow_package_repair` actually repairs
+  (`package_repair`), and names the LibreOffice-internal temp artifacts
   (`internal_temp_artifacts`) so callers can reason about their own threat
   model.
 
@@ -133,36 +166,35 @@ Accepted formats cover the Word, Excel, and PowerPoint families (modern and
 legacy), the OpenDocument families, RTF, CSV, HTML, and plain text.
 
 Errors are gRPC status codes: `INVALID_ARGUMENT` (no bytes, missing complete
-flag, unresolvable format, or the core cannot load the document),
-`RESOURCE_EXHAUSTED` (over the byte cap), `FAILED_PRECONDITION` (broken
-package needing repair without the `allow_package_repair` opt-in),
-`UNIMPLEMENTED` (`allow_package_repair` set, repair path not implemented in
-this version), `DEADLINE_EXCEEDED` (per-document timeout, worker killed),
-`INTERNAL` (worker crash). Health checking and reflection are registered.
+flag, unresolvable format, out-of-range options, or the core cannot load
+the document), `RESOURCE_EXHAUSTED` (over the byte cap),
+`FAILED_PRECONDITION` (broken package needing repair without the
+`allow_package_repair` opt-in), `DEADLINE_EXCEEDED` (per-document timeout,
+worker killed), `INTERNAL` (worker crash). Health checking and reflection
+are registered.
 
 A document whose zip package is broken but repairable is a special case:
 LibreOffice can only open it through its repair path, which rebuilds the
 package from what it can salvage and stages that copy through the core's
 own temp machinery. Accepting a rewritten document is gated behind the
-explicit `allow_package_repair` request field (default false). By default such
-a document fails with `FAILED_PRECONDITION` naming the field; the current
-version does not implement the repair interaction itself, so opting in
-turns the failure into `UNIMPLEMENTED` rather than repairing. A broken
+explicit `allow_package_repair` request field (default false). By default
+such a document fails with `FAILED_PRECONDITION` naming the field; with
+the opt-in the worker retries the load with `RepairPackage=true`. A
+package that still will not open fails as `INVALID_ARGUMENT`. A broken
 package is never repaired silently.
 
 Accepted formats also include PDF, which the core imports through Draw;
 PDF pages rasterize like any other document and, because the import
 produces a drawing model, emit `DrawingShape` typed content.
 
-The repo also carries `ai.pipestream.document.v1`, the typed document
-structure schema (tracking docling-core v2 for interoperability), and a
-consumer-side mapper (`src/docling_map.h`, built into the server library)
-that folds a `StreamPages` event stream into one such `Document`: items in
-typed arenas linked by JSON Pointer refs, groups per sheet, slide, frame,
-and drawing group, headers and footers as furniture, speaker notes on the
-notes layer, and per-line page-local bounding boxes with exact per-line
-charspans as provenance. The mapper never touches LibreOffice and builds a
-valid document from any part selection.
+The repo also carries `ai.pipestream.document.v1`, the pipestream document
+structure schema, and a consumer-side mapper (built into the server
+library) that folds a `StreamPages` event stream into one such `Document`:
+items in typed arenas linked by JSON Pointer refs, groups per sheet, slide,
+frame, and drawing group, headers and footers as furniture, speaker notes
+on the notes layer, and per-line page-local bounding boxes with exact
+per-line charspans as provenance. The mapper never touches LibreOffice and
+builds a valid document from any part selection.
 
 ## Process model
 
@@ -237,27 +269,36 @@ none of it is needed to build or run the service itself.
 live stats show time to first page, pages per second, and typed-content
 counts.](docs/frontend.png)
 
-- `fixtures/fetch.sh` downloads (or locally converts) a sample document set:
-  docx, doc, xlsx, xls, pptx, odt, rtf, pdf, including a 224-page docx for
-  stress runs.
-- `frontend/` is a demo web UI: a small Node BFF speaks gRPC to the server
-  and streams events to the browser, which shows page images popping in as
-  they arrive, live timing stats, typed-content counts, and one-click PDF
-  download. Render options (DPI, page range, and PNG/JPEG/WebP page format
-  with a quality knob) sit above the results. `npm install && npm start` in
-  `frontend/`, then open `http://localhost:8080`.
-- `clients/` holds example clients in Python, Node.js, and Java. Each is a
-  small CLI with the same three subcommands: `info`, `pages <file> [outdir]`,
-  `pdf <file> [out.pdf]`. `pages` exposes the `StreamOptions` knobs (`--dpi`,
-  `--first-page`/`--last-page`, `--format`/`--quality`, `--parts`). See
-  `clients/README.md`.
-- `bench/run.sh` is the speed test: per-document latency (time to first
-  page, total, pages/sec) in pages-only, full-extraction, and PDF modes,
-  plus a concurrency sweep for throughput. See `bench/README.md` for sample
-  numbers.
-- `scripts/e2e-smoke.sh` boots a private server on a free port, streams a
-  fixture through both RPCs, and fails loudly on any regression — the
-  quickest "is the tree healthy" check after a build.
-- `scripts/demo.sh` is the one-command demo: builds the server if needed,
-  boots it and the frontend (idempotently), verifies the wiring, and prints
-  the URL. `scripts/demo.sh --stop` tears both down.
+`fixtures/fetch.sh` downloads (or locally converts) a sample document set:
+docx, doc, xlsx, xls, pptx, odt, rtf, pdf, including a 224-page docx for
+stress runs.
+
+`frontend/` is a demo web UI: a small Node BFF speaks gRPC to the server
+and streams events to the browser, which shows page images popping in as
+they arrive, live timing stats, typed-content counts, and one-click PDF
+download. Render options (DPI, page range, PNG/JPEG/WebP/SVG page format
+with a quality knob, grayscale, fit-to-width, tracked-change display,
+skip-hidden / used-range / notes pages, and a per-request timeout) sit
+above the results. Run `npm install && npm start` in `frontend/`, then open
+`http://localhost:8080`.
+
+`clients/` holds example clients in Python, Node.js, and Java. Each is a
+small CLI with `info`, `pages <file> [outdir]`, `pdf <file> [out.pdf]`,
+and `todoc <file>`. `pages` exposes the `StreamOptions` knobs (`--dpi`,
+`--first-page`/`--last-page`, `--format`/`--quality`, `--parts`,
+`--max-width`, `--grayscale`, `--timeout`, `--tracked-changes`,
+`--skip-hidden`, `--used-range`, `--notes`, `--form`, `--redact`,
+`--repair`). See `clients/README.md`.
+
+`bench/run.sh` is the speed test: per-document latency (time to first
+page, total, pages/sec) in pages-only, full-extraction, and PDF modes,
+plus a concurrency sweep for throughput. See `bench/README.md` for sample
+numbers.
+
+`scripts/e2e-smoke.sh` boots a private server on a free port, streams a
+fixture through `StreamPages` and `ConvertToPdf`, and fails loudly on any
+regression; it is the quickest "is the tree healthy" check after a build.
+
+`scripts/demo.sh` is the one-command demo: it builds the server if needed,
+boots it and the frontend (idempotently), verifies the wiring, and prints
+the URL. `scripts/demo.sh --stop` tears both down.

@@ -63,9 +63,16 @@
 #include <com/sun/star/drawing/XShape.hpp>
 #include <com/sun/star/drawing/XShapes.hpp>
 #include <com/sun/star/embed/StorageFormats.hpp>
+#include <com/sun/star/drawing/FillStyle.hpp>
+#include <com/sun/star/drawing/LineStyle.hpp>
 #include <com/sun/star/frame/Desktop.hpp>
+#include <com/sun/star/frame/XController.hpp>
+#include <com/sun/star/frame/XDispatchHelper.hpp>
+#include <com/sun/star/frame/XDispatchProvider.hpp>
+#include <com/sun/star/frame/XFrame.hpp>
 #include <com/sun/star/frame/XStorable.hpp>
 #include <com/sun/star/io/IOException.hpp>
+#include <com/sun/star/lang/XComponent.hpp>
 #include <com/sun/star/lang/XMultiComponentFactory.hpp>
 #include <com/sun/star/packages/zip/ZipIOException.hpp>
 #include <com/sun/star/presentation/XPresentationPage.hpp>
@@ -103,7 +110,9 @@
 #include <com/sun/star/table/CellRangeAddress.hpp>
 #include <com/sun/star/table/XCell.hpp>
 #include <com/sun/star/table/XCellRange.hpp>
+#include <com/sun/star/table/XColumnRowRange.hpp>
 #include <com/sun/star/table/XTableChart.hpp>
+#include <com/sun/star/text/TextContentAnchorType.hpp>
 #include <com/sun/star/table/XTableCharts.hpp>
 #include <com/sun/star/table/XTableChartsSupplier.hpp>
 #include <com/sun/star/table/XTableColumns.hpp>
@@ -163,6 +172,11 @@ std::string utf8(const rtl::OUString& text) {
   return std::string(bytes.getStr(), static_cast<size_t>(bytes.getLength()));
 }
 
+rtl::OUString oustring(const std::string& text) {
+  return rtl::OUString(text.data(), static_cast<sal_Int32>(text.size()),
+                       RTL_TEXTENCODING_UTF8);
+}
+
 // Collects extraction problems. Every problem is kept for the stream's
 // RenderStatus.warnings and mirrored to stderr immediately, so a crash later
 // in the walk cannot erase the trail.
@@ -176,7 +190,7 @@ class Warner {
 
   void warn(const std::string& message) {
     std::fprintf(stderr, "grlibre-worker: typed content: %s\n", message.c_str());
-    sink_->push_back("typed content: " + message);
+    if (sink_ != nullptr) sink_->push_back("typed content: " + message);
   }
 
  private:
@@ -4038,7 +4052,8 @@ bool emit_typed_content(const PartSelection& parts, SelectionProbe* probe,
 
 bool export_pdf_stream(const std::string& filter_name, size_t chunk_limit,
                        const std::function<bool(std::string&&)>& emit_chunk,
-                       long* total_bytes, std::string* error) {
+                       long* total_bytes, std::string* error,
+                       const PdfExportOptions& pdf) {
   try {
     Reference<css::uno::XComponentContext> context = process_context();
     if (!context.is()) {
@@ -4057,9 +4072,18 @@ bool export_pdf_stream(const std::string& filter_name, size_t chunk_limit,
     // into the installation's configured defaults (tagged PDF among them)
     // and changes the output. Any future filter option must be merged into
     // this sequence, keeping it non-empty.
-    css::uno::Sequence<css::beans::PropertyValue> filter_data(1);
+    const bool ranged = pdf.first_page > 0 || pdf.last_page > 0;
+    css::uno::Sequence<css::beans::PropertyValue> filter_data(ranged ? 2 : 1);
     filter_data.getArray()[0].Name = "ExportBookmarks";
     filter_data.getArray()[0].Value <<= true;
+    if (ranged) {
+      const int first = pdf.first_page > 0 ? pdf.first_page : 1;
+      const int last = pdf.last_page > 0 ? pdf.last_page : 9999;
+      std::string range = std::to_string(first) + "-" + std::to_string(last);
+      filter_data.getArray()[1].Name = "PageRange";
+      filter_data.getArray()[1].Value <<=
+          rtl::OUString::createFromAscii(range.c_str());
+    }
     css::uno::Sequence<css::beans::PropertyValue> descriptor(3);
     css::beans::PropertyValue* props = descriptor.getArray();
     props[0].Name = "FilterName";
@@ -4137,6 +4161,531 @@ bool is_repairable_broken_package(const std::string& bytes) {
     // Anything the probe cannot classify is treated as a plain load
     // failure, never as repairable.
     return false;
+  }
+}
+
+namespace {
+
+void dispatch_uno(const Reference<css::frame::XModel>& model,
+                  const Reference<css::uno::XComponentContext>& context,
+                  const char* command, Warner& warner) {
+  try {
+    Reference<css::lang::XMultiComponentFactory> manager =
+        context->getServiceManager();
+    Reference<css::frame::XDispatchHelper> helper(
+        manager->createInstanceWithContext(
+            "com.sun.star.frame.DispatchHelper", context),
+        UNO_QUERY);
+    Reference<css::frame::XController> controller = model->getCurrentController();
+    if (!helper.is() || !controller.is()) return;
+    Reference<css::frame::XDispatchProvider> provider(
+        controller->getFrame(), UNO_QUERY);
+    if (!provider.is()) return;
+    helper->executeDispatch(provider, oustring(command), oustring("_self"), 0,
+                            css::uno::Sequence<css::beans::PropertyValue>());
+  } catch (const css::uno::Exception& error) {
+    warner.warn(std::string("dispatch ") + command, error);
+  }
+}
+
+void apply_tracked_changes(const Reference<css::frame::XModel>& model,
+                           const Reference<css::uno::XComponentContext>& context,
+                           int display, Warner& warner) {
+  if (display <= 0 ||
+      display == officev1::TRACKED_CHANGE_DISPLAY_AS_IS) {
+    return;
+  }
+  try {
+    Reference<css::frame::XController> controller = model->getCurrentController();
+    Reference<css::beans::XPropertySet> view(controller, UNO_QUERY);
+    if (display == officev1::TRACKED_CHANGE_DISPLAY_FINAL) {
+      dispatch_uno(model, context, ".uno:AcceptAllTrackedChanges", warner);
+      if (view.is()) {
+        view->setPropertyValue("ShowRedlineChanges", css::uno::Any(false));
+      }
+    } else if (display == officev1::TRACKED_CHANGE_DISPLAY_ORIGINAL) {
+      dispatch_uno(model, context, ".uno:RejectAllTrackedChanges", warner);
+    } else if (display == officev1::TRACKED_CHANGE_DISPLAY_SHOW_MARKUP) {
+      if (view.is()) {
+        view->setPropertyValue("ShowRedlineChanges", css::uno::Any(true));
+      }
+    }
+  } catch (const css::uno::Exception& error) {
+    warner.warn("tracked-change display", error);
+  }
+}
+
+bool parse_bool_value(const std::string& value) {
+  std::string lower = value;
+  for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return lower == "true" || lower == "1" || lower == "yes" || lower == "on";
+}
+
+void fill_one_fieldmark(const Reference<css::text::XFormField>& fieldmark,
+                        const std::string& value, Warner& warner) {
+  try {
+    Reference<css::container::XNameContainer> parameters =
+        fieldmark->getParameters();
+    if (parameters.is() && parameters->hasByName("Checkbox_Checked")) {
+      parameters->replaceByName("Checkbox_Checked",
+                                css::uno::Any(parse_bool_value(value)));
+      return;
+    }
+    if (parameters.is() && (parameters->hasByName("Dropdown_Selected") ||
+                            parameters->hasByName("Dropdown_ListEntry"))) {
+      sal_Int32 selected = -1;
+      try {
+        selected = static_cast<sal_Int32>(std::stol(value));
+      } catch (...) {
+        css::uno::Any entries;
+        try {
+          parameters->getByName("Dropdown_ListEntry") >>= entries;
+        } catch (const css::uno::Exception&) {
+        }
+        css::uno::Sequence<rtl::OUString> list;
+        if (entries >>= list) {
+          for (sal_Int32 i = 0; i < list.getLength(); i++) {
+            if (utf8(list[i]) == value) {
+              selected = i;
+              break;
+            }
+          }
+        }
+      }
+      if (selected >= 0) {
+        parameters->replaceByName("Dropdown_Selected", css::uno::Any(selected));
+      }
+      return;
+    }
+    Reference<css::text::XTextContent> content(fieldmark, UNO_QUERY);
+    if (content.is()) {
+      Reference<css::text::XTextRange> range = content->getAnchor();
+      if (range.is()) range->setString(oustring(value));
+    }
+  } catch (const css::uno::Exception& error) {
+    warner.warn("form fill fieldmark", error);
+  }
+}
+
+void apply_form_fills(const Reference<css::frame::XModel>& model,
+                      const std::vector<std::pair<std::string, std::string>>& values,
+                      Warner& warner) {
+  if (values.empty()) return;
+  std::map<std::string, std::string> by_name(values.begin(), values.end());
+  try {
+    Reference<css::drawing::XDrawPagesSupplier> pages(model, UNO_QUERY);
+    if (pages.is()) {
+      Reference<css::drawing::XDrawPages> list = pages->getDrawPages();
+      for (sal_Int32 i = 0; list.is() && i < list->getCount(); i++) {
+        Reference<css::drawing::XShapes> shapes(list->getByIndex(i), UNO_QUERY);
+        if (!shapes.is()) continue;
+        for (sal_Int32 s = 0; s < shapes->getCount(); s++) {
+          Reference<css::drawing::XControlShape> control(
+              shapes->getByIndex(s), UNO_QUERY);
+          if (!control.is()) continue;
+          Reference<css::beans::XPropertySet> props(control->getControl(),
+                                                    UNO_QUERY);
+          if (!props.is()) continue;
+          rtl::OUString name;
+          try {
+            props->getPropertyValue("Name") >>= name;
+          } catch (const css::uno::Exception&) {
+            continue;
+          }
+          auto found = by_name.find(utf8(name));
+          if (found == by_name.end()) continue;
+          try {
+            props->setPropertyValue("Text", css::uno::Any(oustring(found->second)));
+          } catch (const css::uno::Exception&) {
+          }
+          try {
+            props->setPropertyValue("State",
+                                    css::uno::Any(static_cast<sal_Int16>(
+                                        parse_bool_value(found->second) ? 1 : 0)));
+          } catch (const css::uno::Exception&) {
+          }
+        }
+      }
+    }
+  } catch (const css::uno::Exception& error) {
+    warner.warn("form fill controls", error);
+  }
+  try {
+    Reference<css::text::XTextDocument> text_doc(model, UNO_QUERY);
+    if (!text_doc.is()) return;
+    Reference<css::text::XTextFieldsSupplier> fields(text_doc, UNO_QUERY);
+    if (!fields.is()) return;
+    Reference<css::container::XEnumerationAccess> access = fields->getTextFields();
+    if (!access.is()) return;
+    Reference<css::container::XEnumeration> it = access->createEnumeration();
+    while (it->hasMoreElements()) {
+      Reference<css::text::XFormField> fieldmark(it->nextElement(), UNO_QUERY);
+      if (!fieldmark.is()) continue;
+      Reference<css::container::XNamed> named(fieldmark, UNO_QUERY);
+      if (!named.is()) continue;
+      auto found = by_name.find(utf8(named->getName()));
+      if (found == by_name.end()) continue;
+      fill_one_fieldmark(fieldmark, found->second, warner);
+    }
+  } catch (const css::uno::Exception& error) {
+    warner.warn("form fill fields", error);
+  }
+}
+
+void paint_redact_shapes(const Reference<css::frame::XModel>& model,
+                         const std::vector<RedactBox>& boxes,
+                         const std::vector<PageBox>& pages, Warner& warner) {
+  if (boxes.empty()) return;
+  try {
+    Reference<css::lang::XMultiServiceFactory> factory(model, UNO_QUERY);
+    Reference<css::drawing::XDrawPageSupplier> supplier(model, UNO_QUERY);
+    if (!factory.is() || !supplier.is()) return;
+    Reference<css::drawing::XDrawPage> page = supplier->getDrawPage();
+    if (!page.is()) return;
+    for (const RedactBox& box : boxes) {
+      Reference<css::drawing::XShape> shape(
+          factory->createInstance("com.sun.star.drawing.RectangleShape"),
+          UNO_QUERY);
+      if (!shape.is()) continue;
+      // Anchor to the box's page and position page-locally: Writer resolves
+      // an API-added shape's position relative to its anchor, so the default
+      // at-paragraph anchor would drift on every page after the first.
+      std::int64_t x_twips = box.x_twips;
+      std::int64_t y_twips = box.y_twips;
+      if (box.page_index >= 0
+          && static_cast<size_t>(box.page_index) < pages.size()) {
+        x_twips -= pages[static_cast<size_t>(box.page_index)].x;
+        y_twips -= pages[static_cast<size_t>(box.page_index)].y;
+      }
+      const sal_Int32 x = static_cast<sal_Int32>(x_twips * 127 / 72);
+      const sal_Int32 y = static_cast<sal_Int32>(y_twips * 127 / 72);
+      const sal_Int32 w = static_cast<sal_Int32>(box.width_twips * 127 / 72);
+      const sal_Int32 h = static_cast<sal_Int32>(box.height_twips * 127 / 72);
+      shape->setSize(css::awt::Size(w, h));
+      Reference<css::beans::XPropertySet> props(shape, UNO_QUERY);
+      if (props.is()) {
+        props->setPropertyValue("FillStyle",
+                                css::uno::Any(css::drawing::FillStyle_SOLID));
+        props->setPropertyValue("FillColor", css::uno::Any(sal_Int32(0)));
+        props->setPropertyValue("LineStyle",
+                                css::uno::Any(css::drawing::LineStyle_NONE));
+        try {
+          props->setPropertyValue(
+              "AnchorType",
+              css::uno::Any(css::text::TextContentAnchorType_AT_PAGE));
+          props->setPropertyValue(
+              "AnchorPageNo",
+              css::uno::Any(static_cast<sal_Int16>(box.page_index + 1)));
+        } catch (const css::uno::Exception&) {
+          // Not a Writer shape; absolute positioning below is already right.
+        }
+      }
+      page->add(shape);
+      shape->setPosition(css::awt::Point(x, y));
+    }
+  } catch (const css::uno::Exception& error) {
+    warner.warn("pdf redaction shapes", error);
+  }
+}
+
+bool span_overlaps(std::int64_t start, std::int64_t end,
+                   const std::vector<std::pair<std::int64_t, std::int64_t>>& spans) {
+  if (start < 0 || end < 0 || end <= start) return false;
+  for (const auto& span : spans) {
+    if (span.second <= span.first) continue;
+    if (start < span.second && end > span.first) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+void apply_document_options(const RenderOptions& options,
+                            std::vector<std::string>* warnings) {
+  Warner warner(warnings);
+  try {
+    Reference<css::uno::XComponentContext> context = process_context();
+    if (!context.is()) return;
+    Reference<css::frame::XModel> model = find_loaded_model(context);
+    if (!model.is()) return;
+    apply_tracked_changes(model, context, options.tracked_changes, warner);
+    apply_form_fills(model, options.form_values, warner);
+  } catch (const css::uno::Exception& error) {
+    warner.warn("apply document options", error);
+  }
+}
+
+void collect_redact_boxes(const RenderOptions& options, SelectionProbe* probe,
+                          const std::vector<PageBox>& pages,
+                          std::vector<RedactBox>* boxes,
+                          std::vector<std::string>* warnings) {
+  if (options.redact_spans.empty() || boxes == nullptr) return;
+  PartSelection parts;
+  parts.all = false;
+  parts.mask = (1u << officev1::DOCUMENT_PART_PARAGRAPHS) |
+               (1u << officev1::DOCUMENT_PART_LINE_RECTS);
+  // A caret line has no measured height; pad the fallback band below the
+  // end anchor by a generous line so descenders and the last line stay
+  // covered.
+  constexpr std::int64_t kFallbackLineTwips = 400;
+  bool warned_fallback = false;
+  emit_typed_content(
+      parts, probe,
+      [&](const google::protobuf::MessageLite& message) {
+        officev1::StreamPagesResponse event;
+        if (!event.ParseFromString(message.SerializeAsString())) return true;
+        if (!event.has_paragraph()) return true;
+        const officev1::Paragraph& paragraph = event.paragraph();
+        // TextSpan lives in the annotation text space; a paragraph outside
+        // the body flow (char_offset -1) cannot be addressed by it.
+        if (paragraph.char_offset() < 0) return true;
+        std::int64_t length = 0;
+        for (const officev1::TextRun& run : paragraph.runs()) {
+          length += run.char_length();
+        }
+        if (length <= 0) length = 1;
+        const bool paragraph_overlaps =
+            span_overlaps(paragraph.char_offset(),
+                          paragraph.char_offset() + length,
+                          options.redact_spans);
+        if (paragraph.line_rects_size() > 0) {
+          for (const officev1::LineBox& line : paragraph.line_rects()) {
+            // Line offsets are paragraph-local; shift them into the
+            // annotation space before testing. Unmeasured boundaries
+            // (-1) degrade to redacting every line of an overlapped
+            // paragraph rather than missing the span.
+            const bool covered =
+                line.char_start() >= 0 && line.char_end() >= 0
+                    ? span_overlaps(paragraph.char_offset() + line.char_start(),
+                                    paragraph.char_offset() + line.char_end(),
+                                    options.redact_spans)
+                    : paragraph_overlaps;
+            if (!covered) continue;
+            RedactBox box;
+            box.page_index = line.page_index();
+            box.x_twips = line.x_twips();
+            box.y_twips = line.y_twips();
+            box.width_twips = line.width_twips();
+            box.height_twips = line.height_twips();
+            boxes->push_back(box);
+          }
+          return true;
+        }
+        // No measured lines: cover the paragraph's start..end anchor
+        // extent with full-page-width bands. Over-covering is the only
+        // safe degradation for a redaction.
+        if (!paragraph_overlaps) return true;
+        if (!warned_fallback && warnings != nullptr) {
+          warned_fallback = true;
+          warnings->push_back(
+              "redaction: line rectangles unavailable; redacting full-width "
+              "paragraph bands instead of exact line boxes");
+        }
+        const std::int64_t y0 =
+            std::min<std::int64_t>(paragraph.start().y(), paragraph.end().y());
+        const std::int64_t y1 =
+            std::max<std::int64_t>(paragraph.start().y(), paragraph.end().y())
+            + kFallbackLineTwips;
+        bool on_a_page = false;
+        for (size_t index = 0; index < pages.size(); index++) {
+          const PageBox& page = pages[index];
+          const std::int64_t top = std::max<std::int64_t>(y0, page.y);
+          const std::int64_t bottom =
+              std::min<std::int64_t>(y1, page.y + page.height);
+          if (bottom <= top) continue;
+          on_a_page = true;
+          RedactBox box;
+          box.page_index = static_cast<int>(index);
+          box.x_twips = page.x;
+          box.y_twips = top;
+          box.width_twips = page.width;
+          box.height_twips = bottom - top;
+          boxes->push_back(box);
+        }
+        if (!on_a_page) {
+          // Page geometry unknown; band the anchors with a width far wider
+          // than any page so the raster clamp trims it.
+          RedactBox box;
+          box.page_index = paragraph.page_index();
+          box.x_twips = 0;
+          box.y_twips = y0;
+          box.width_twips = 200000;
+          box.height_twips = y1 - y0;
+          boxes->push_back(box);
+        }
+        return true;
+      },
+      warnings);
+}
+
+void apply_redact_shapes(const std::vector<RedactBox>& boxes,
+                         const std::vector<PageBox>& pages,
+                         std::vector<std::string>* warnings) {
+  Warner warner(warnings);
+  try {
+    Reference<css::uno::XComponentContext> context = process_context();
+    if (!context.is()) return;
+    paint_redact_shapes(find_loaded_model(context), boxes, pages, warner);
+  } catch (const css::uno::Exception& error) {
+    warner.warn("apply redact shapes", error);
+  }
+}
+
+std::string export_page_svg_uno(int page_number,
+                                std::vector<std::string>* warnings) {
+  Warner warner(warnings);
+  if (page_number < 1) return {};
+  try {
+    Reference<css::uno::XComponentContext> context = process_context();
+    if (!context.is()) return {};
+    Reference<css::frame::XModel> model = find_loaded_model(context);
+    if (!model.is()) return {};
+    Reference<css::frame::XStorable> storable(model, UNO_QUERY);
+    if (!storable.is()) return {};
+    std::string bytes;
+    rtl::Reference<PdfChunkSink> sink(new PdfChunkSink(
+        1 << 20, [&](std::string&& chunk) {
+          bytes += std::move(chunk);
+          return true;
+        }));
+    css::uno::Sequence<css::beans::PropertyValue> filter_data(1);
+    filter_data.getArray()[0].Name = "PageNumber";
+    filter_data.getArray()[0].Value <<= static_cast<sal_Int32>(page_number);
+    css::uno::Sequence<css::beans::PropertyValue> descriptor(3);
+    css::beans::PropertyValue* props = descriptor.getArray();
+    props[0].Name = "FilterName";
+    props[0].Value <<= oustring("draw_svg_Export");
+    props[1].Name = "OutputStream";
+    props[1].Value <<= Reference<css::io::XOutputStream>(sink.get());
+    props[2].Name = "FilterData";
+    props[2].Value <<= filter_data;
+    storable->storeToURL(oustring("private:stream"), descriptor);
+    if (bytes.find("<svg") != std::string::npos) return bytes;
+  } catch (const css::uno::Exception& error) {
+    warner.warn("svg export", error);
+    return {};
+  }
+  return {};
+}
+
+void describe_parts(std::vector<PartLayout>* parts,
+                    std::vector<std::string>* warnings) {
+  if (parts == nullptr) return;
+  parts->clear();
+  Warner warner(warnings);
+  try {
+    Reference<css::uno::XComponentContext> context = process_context();
+    if (!context.is()) return;
+    Reference<css::frame::XModel> model = find_loaded_model(context);
+    if (!model.is()) return;
+    Reference<css::sheet::XSpreadsheetDocument> calc(model, UNO_QUERY);
+    if (calc.is()) {
+      Reference<css::container::XIndexAccess> sheets(calc->getSheets(),
+                                                     UNO_QUERY);
+      if (!sheets.is()) return;
+      for (sal_Int32 i = 0; i < sheets->getCount(); i++) {
+        PartLayout layout;
+        Reference<css::sheet::XSpreadsheet> sheet(sheets->getByIndex(i),
+                                                  UNO_QUERY);
+        Reference<css::beans::XPropertySet> props(sheet, UNO_QUERY);
+        if (props.is()) {
+          try {
+            props->getPropertyValue("IsVisible") >>= layout.visible;
+          } catch (const css::uno::Exception&) {
+          }
+        }
+        try {
+          Reference<css::sheet::XSheetCellCursor> cursor =
+              sheet->createCursor();
+          Reference<css::sheet::XUsedAreaCursor> area(cursor, UNO_QUERY);
+          if (area.is()) {
+            area->gotoStartOfUsedArea(false);
+            area->gotoEndOfUsedArea(true);
+            Reference<css::sheet::XCellRangeAddressable> addressable(
+                cursor, UNO_QUERY);
+            css::table::CellRangeAddress used;
+            if (addressable.is()) used = addressable->getRangeAddress();
+            Reference<css::table::XColumnRowRange> col_rows(sheet, UNO_QUERY);
+            Reference<css::table::XTableColumns> columns =
+                col_rows.is() ? col_rows->getColumns()
+                              : Reference<css::table::XTableColumns>();
+            Reference<css::table::XTableRows> rows =
+                col_rows.is() ? col_rows->getRows()
+                              : Reference<css::table::XTableRows>();
+            // Tile coordinates give hidden columns and rows no space, so
+            // both the origin offset and the used size sum only the
+            // visible ones. The columns before the used range are the
+            // origin: a used range that starts away from A1 must shift the
+            // paint rectangle, not just shrink it.
+            long x = 0;
+            long width = 0;
+            for (sal_Int32 c = 0; columns.is() && c <= used.EndColumn; c++) {
+              Reference<css::beans::XPropertySet> col(columns->getByIndex(c),
+                                                      UNO_QUERY);
+              if (!col.is()) continue;
+              bool visible = true;
+              col->getPropertyValue("IsVisible") >>= visible;
+              if (!visible) continue;
+              sal_Int32 hmm = 0;
+              col->getPropertyValue("Width") >>= hmm;
+              if (c < used.StartColumn) {
+                x += hundredth_mm_to_twips(hmm);
+              } else {
+                width += hundredth_mm_to_twips(hmm);
+              }
+            }
+            long y = 0;
+            long height = 0;
+            for (sal_Int32 r = 0; rows.is() && r <= used.EndRow; r++) {
+              Reference<css::beans::XPropertySet> row(rows->getByIndex(r),
+                                                      UNO_QUERY);
+              if (!row.is()) continue;
+              bool visible = true;
+              row->getPropertyValue("IsVisible") >>= visible;
+              if (!visible) continue;
+              sal_Int32 hmm = 0;
+              row->getPropertyValue("Height") >>= hmm;
+              if (r < used.StartRow) {
+                y += hundredth_mm_to_twips(hmm);
+              } else {
+                height += hundredth_mm_to_twips(hmm);
+              }
+            }
+            layout.used_x = x;
+            layout.used_y = y;
+            layout.used_width = width;
+            layout.used_height = height;
+          }
+        } catch (const css::uno::Exception& error) {
+          warner.warn("used range for sheet " + std::to_string(i), error);
+        }
+        parts->push_back(layout);
+      }
+      return;
+    }
+    Reference<css::drawing::XDrawPagesSupplier> slides(model, UNO_QUERY);
+    if (!slides.is()) return;
+    Reference<css::drawing::XDrawPages> list = slides->getDrawPages();
+    if (!list.is()) return;
+    for (sal_Int32 i = 0; i < list->getCount(); i++) {
+      PartLayout layout;
+      Reference<css::beans::XPropertySet> props(list->getByIndex(i), UNO_QUERY);
+      if (props.is()) {
+        try {
+          props->getPropertyValue("Visible") >>= layout.visible;
+        } catch (const css::uno::Exception&) {
+          try {
+            bool hidden = false;
+            props->getPropertyValue("Hidden") >>= hidden;
+            layout.visible = !hidden;
+          } catch (const css::uno::Exception&) {
+          }
+        }
+      }
+      parts->push_back(layout);
+    }
+  } catch (const css::uno::Exception& error) {
+    warner.warn("describe parts", error);
   }
 }
 

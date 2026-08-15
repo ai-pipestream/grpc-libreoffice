@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "png_encode.h"
 
@@ -60,6 +62,24 @@ struct RenderOptions {
   // 1..100 and ignored for PNG.
   ImageFormat image_format = ImageFormat::kPng;
   int image_quality = 85;
+  // Fit-to-width in pixels; 0 means use dpi. Still clamped by max_side_px.
+  int max_width_px = 0;
+  // Convert page rasters to grayscale before encoding.
+  bool grayscale = false;
+  // TrackedChangeDisplay wire value; 0 means leave the document as stored.
+  int tracked_changes = 0;
+  // PageVectorFormat wire value; 0/1 means raster, 2 means SVG.
+  int vector_format = 0;
+  // Omit hidden sheets and hidden slides from page images.
+  bool skip_hidden = false;
+  // Crop spreadsheet page images to the used cell range.
+  bool paint_used_range = false;
+  // Append each slide's notes page as an extra page image.
+  bool include_notes_pages = false;
+  // Form field writes applied after load, before paint/export.
+  std::vector<std::pair<std::string, std::string>> form_values;
+  // Annotation-space spans to black out on rasters and on PDF export.
+  std::vector<std::pair<std::int64_t, std::int64_t>> redact_spans;
   // Uploaded byte count, echoed into RenderStatus.
   long input_bytes = 0;
   // Which parts to emit; defaults to every part.
@@ -77,8 +97,9 @@ inline constexpr int kExitRenderFailure = 5;
 // The package is broken but repairable, and the caller did not opt into the
 // rewriting repair path.
 inline constexpr int kExitRepairNeedsOptIn = 6;
-// The caller opted into repair, but this version does not implement the
-// repair interaction; the broken package stays unloadable.
+// Retained so an older worker binary that still exits 7 maps to
+// UNIMPLEMENTED. Current workers retry with RepairPackage=true and
+// report a load failure if the package still will not open.
 inline constexpr int kExitRepairUnimplemented = 7;
 // The work dir handed to the worker is not on tmpfs; the worker refuses to
 // stage the upload rather than write document bytes to disk.

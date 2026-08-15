@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <unordered_map>
 
+#include "docling_map.h"
 #include "worker_runner.h"
 
 namespace grlibre {
@@ -107,7 +109,74 @@ void capture_range(const officev1::StreamPagesRequest& request,
   }
 }
 
-void capture_range(const officev1::ConvertToPdfRequest&, PageRange*) {}
+void capture_range(const officev1::ConvertToPdfRequest& request,
+                   PageRange* range) {
+  if (range->first == 0 && range->last == 0) {
+    range->first = request.first_page();
+    range->last = request.last_page();
+  }
+}
+
+void merge_stream_options(const officev1::StreamOptions& incoming,
+                          officev1::StreamOptions* dest) {
+  if (dest->parts_size() == 0 && incoming.parts_size() > 0) {
+    dest->mutable_parts()->CopyFrom(incoming.parts());
+  }
+  if (dest->render_dpi() == 0) dest->set_render_dpi(incoming.render_dpi());
+  if (dest->first_page() == 0 && dest->last_page() == 0
+      && (incoming.first_page() != 0 || incoming.last_page() != 0)) {
+    dest->set_first_page(incoming.first_page());
+    dest->set_last_page(incoming.last_page());
+  }
+  if (dest->page_format() == 0 && dest->page_quality() == 0) {
+    dest->set_page_format(incoming.page_format());
+    dest->set_page_quality(incoming.page_quality());
+  }
+  if (dest->max_width_px() == 0) dest->set_max_width_px(incoming.max_width_px());
+  dest->set_grayscale(dest->grayscale() || incoming.grayscale());
+  if (dest->timeout_seconds() == 0) {
+    dest->set_timeout_seconds(incoming.timeout_seconds());
+  }
+  if (dest->tracked_changes() == 0) {
+    dest->set_tracked_changes(incoming.tracked_changes());
+  }
+  if (dest->vector_format() == 0) {
+    dest->set_vector_format(incoming.vector_format());
+  }
+  if (incoming.page_format() == officev1::PAGE_IMAGE_FORMAT_SVG
+      && dest->vector_format() == 0) {
+    dest->set_vector_format(officev1::PAGE_VECTOR_FORMAT_SVG);
+  }
+  dest->set_skip_hidden(dest->skip_hidden() || incoming.skip_hidden());
+  dest->set_paint_used_range(dest->paint_used_range()
+                             || incoming.paint_used_range());
+  dest->set_include_notes_pages(dest->include_notes_pages()
+                                || incoming.include_notes_pages());
+  if (dest->form_values_size() == 0 && incoming.form_values_size() > 0) {
+    dest->mutable_form_values()->CopyFrom(incoming.form_values());
+  }
+  if (dest->redact_spans_size() == 0 && incoming.redact_spans_size() > 0) {
+    dest->mutable_redact_spans()->CopyFrom(incoming.redact_spans());
+  }
+}
+
+void capture_extras(const officev1::StreamPagesRequest& request,
+                    officev1::StreamOptions* extras) {
+  merge_stream_options(request.options(), extras);
+}
+
+void capture_extras(const officev1::ConvertToPdfRequest& request,
+                    officev1::StreamOptions* extras) {
+  officev1::StreamOptions incoming;
+  incoming.set_timeout_seconds(request.timeout_seconds());
+  incoming.set_tracked_changes(request.tracked_changes());
+  incoming.set_skip_hidden(request.skip_hidden());
+  incoming.set_first_page(request.first_page());
+  incoming.set_last_page(request.last_page());
+  incoming.mutable_form_values()->CopyFrom(request.form_values());
+  incoming.mutable_redact_spans()->CopyFrom(request.redact_spans());
+  merge_stream_options(incoming, extras);
+}
 
 // The page image encoding rides StreamOptions and resolves as one pair with
 // its quality: the first request with either field nonzero wins. PDF mode
@@ -139,6 +208,9 @@ std::string encoding_token(const ImageEncoding& encoding) {
       return "jpeg:" + std::to_string(quality);
     case officev1::PAGE_IMAGE_FORMAT_WEBP:
       return "webp:" + std::to_string(quality);
+    case officev1::PAGE_IMAGE_FORMAT_SVG:
+      // Raster argv is unused; vector_format rides options.pb.
+      return "png";
     default:
       return "";
   }
@@ -204,9 +276,10 @@ class RenderServiceImpl::SlotGuard {
 RenderServiceImpl::RenderServiceImpl(ServiceConfig config)
     : config_(std::move(config)), supported_formats_(kExtensions) {}
 
-template <typename Response, typename Request>
+template <typename Response, typename Request, typename In>
 grpc::Status RenderServiceImpl::render(
-    const char* mode, grpc::ServerReaderWriter<Response, Request>* stream) {
+    const char* mode, In* in, const std::function<bool(Response&&)>& write,
+    const char* default_parts) {
   std::string bytes;
   std::string document_id;
   std::string filename;
@@ -215,11 +288,12 @@ grpc::Status RenderServiceImpl::render(
   int requested_dpi = 0;
   PageRange page_range;
   ImageEncoding encoding;
+  officev1::StreamOptions extras;
   bool allow_package_repair = false;
   bool saw_complete = false;
 
   Request request;
-  while (stream->Read(&request)) {
+  while (in->Read(&request)) {
     const officev1::DocumentChunk& chunk = request.chunk();
     if (document_id.empty()) document_id = chunk.document_id();
     if (filename.empty()) filename = chunk.filename();
@@ -228,6 +302,7 @@ grpc::Status RenderServiceImpl::render(
     capture_dpi(request, &requested_dpi);
     capture_range(request, &page_range);
     capture_encoding(request, &encoding);
+    capture_extras(request, &extras);
     capture_repair(request, &allow_package_repair);
     if (static_cast<long>(bytes.size() + chunk.data().size()) > config_.max_document_bytes) {
       rejected++;
@@ -274,6 +349,27 @@ grpc::Status RenderServiceImpl::render(
             "page_quality must be within [0, 100], got "
                 + std::to_string(encoding.quality)};
   }
+  if (extras.max_width_px() < 0 || extras.max_width_px() > kMaxWidthPx) {
+    rejected++;
+    return {grpc::StatusCode::INVALID_ARGUMENT,
+            "max_width_px must be within [0, " + std::to_string(kMaxWidthPx)
+                + "], got " + std::to_string(extras.max_width_px())};
+  }
+  if (extras.timeout_seconds() < 0
+      || extras.timeout_seconds() > kMaxTimeoutSeconds) {
+    rejected++;
+    return {grpc::StatusCode::INVALID_ARGUMENT,
+            "timeout_seconds must be within [0, "
+                + std::to_string(kMaxTimeoutSeconds) + "], got "
+                + std::to_string(extras.timeout_seconds())};
+  }
+  for (const auto& span : extras.redact_spans()) {
+    if (span.char_start() < 0 || span.char_end() < span.char_start()) {
+      rejected++;
+      return {grpc::StatusCode::INVALID_ARGUMENT,
+              "redact span char_end must be >= char_start"};
+    }
+  }
 
   SlotGuard slot(*this);
   ScopedWorkDir work_dir(config_.tmpfs_dir);
@@ -282,27 +378,38 @@ grpc::Status RenderServiceImpl::render(
     return {grpc::StatusCode::INTERNAL, "cannot create worker directory"};
   }
 
+  {
+    std::ofstream extras_out(work_dir.path() + "/options.pb", std::ios::binary);
+    if (!extras.SerializeToOstream(&extras_out)) {
+      failed++;
+      return {grpc::StatusCode::INTERNAL, "cannot write worker options"};
+    }
+  }
   int render_dpi = requested_dpi != 0
                        ? std::clamp(requested_dpi, kMinRenderDpi, kMaxRenderDpi)
                        : config_.render_dpi;
+  auto deadline = config_.task_deadline;
+  if (extras.timeout_seconds() > 0) {
+    deadline = std::chrono::milliseconds(extras.timeout_seconds() * 1000);
+  }
   std::vector<std::string> argv = {
       config_.worker_path, mode, extension,
       std::to_string(render_dpi), std::to_string(config_.max_side_px),
       work_dir.path(), config_.install_path,
-      parts_token.empty() ? "all" : parts_token,
+      parts_token.empty() ? default_parts : parts_token,
       allow_package_repair ? "repair" : "no-repair",
       std::to_string(page_range.first) + ":" + std::to_string(page_range.last),
       format_token};
   // Frames can carry a full page PNG; bound generously above the pixel cap.
   std::uint32_t max_frame = 256u * 1024 * 1024;
   WorkerOutcome outcome = run_worker(
-      argv, bytes, config_.task_deadline, max_frame, [&](std::string&& payload) {
+      argv, bytes, deadline, max_frame, [&](std::string&& payload) {
         Response response;
         if (!response.ParseFromString(payload)) return false;
         if (response.has_document_info()) {
           response.mutable_document_info()->set_document_id(document_id);
         }
-        return stream->Write(response);
+        return write(std::move(response));
       });
 
   switch (outcome.kind) {
@@ -339,21 +446,57 @@ grpc::Status RenderServiceImpl::StreamPages(
     grpc::ServerContext*,
     grpc::ServerReaderWriter<officev1::StreamPagesResponse,
                              officev1::StreamPagesRequest>* stream) {
-  return render("pages", stream);
+  return render<officev1::StreamPagesResponse, officev1::StreamPagesRequest>(
+      "pages", stream, [&](officev1::StreamPagesResponse&& response) {
+        return stream->Write(response);
+      });
 }
 
 grpc::Status RenderServiceImpl::ConvertToPdf(
     grpc::ServerContext*,
     grpc::ServerReaderWriter<officev1::ConvertToPdfResponse,
                              officev1::ConvertToPdfRequest>* stream) {
-  return render("pdf", stream);
+  return render<officev1::ConvertToPdfResponse, officev1::ConvertToPdfRequest>(
+      "pdf", stream, [&](officev1::ConvertToPdfResponse&& response) {
+        return stream->Write(response);
+      });
+}
+
+grpc::Status RenderServiceImpl::ToDocument(
+    grpc::ServerContext*,
+    grpc::ServerReader<officev1::StreamPagesRequest>* reader,
+    officev1::ToDocumentResponse* response) {
+  DoclingMapper mapper;
+  // Page images are omitted unless the caller explicitly selects
+  // DOCUMENT_PART_PAGES: the mapper inlines them as data URIs, which would
+  // blow the unary response far past typical client message limits.
+  grpc::Status status =
+      render<officev1::StreamPagesResponse, officev1::StreamPagesRequest>(
+          "pages", reader,
+          [&](officev1::StreamPagesResponse&& event) {
+            if (event.has_document_info()) {
+              *response->mutable_document_info() = event.document_info();
+            }
+            if (event.has_status()) {
+              *response->mutable_status() = event.status();
+            }
+            mapper.consume(event);
+            return true;
+          },
+          "all-but-pages");
+  if (status.ok()) {
+    *response->mutable_document() = mapper.take();
+  }
+  return status;
 }
 
 grpc::Status RenderServiceImpl::GetServiceInfo(
     grpc::ServerContext*, const officev1::GetServiceInfoRequest*,
     officev1::GetServiceInfoResponse* response) {
-  response->set_service_version("0.3.0");
+  response->set_service_version("0.4.0");
   response->set_typed_content(true);
+  response->set_document_mapping(true);
+  response->set_package_repair(true);
   response->set_libreoffice_version(config_.libreoffice_version);
   response->set_api_version("v1");
   for (const std::string& format : supported_formats_) {

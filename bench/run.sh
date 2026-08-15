@@ -13,8 +13,10 @@ fi
 mkdir -p gen
 ./.venv/bin/python -m grpc_tools.protoc -I ../proto \
   --python_out=gen --grpc_python_out=gen \
+  ../proto/ai/pipestream/document/v1/document.proto \
   ../proto/ai/pipestream/office/v1/office_service.proto
 touch gen/__init__.py gen/ai/__init__.py gen/ai/pipestream/__init__.py \
-  gen/ai/pipestream/office/__init__.py gen/ai/pipestream/office/v1/__init__.py
+  gen/ai/pipestream/office/__init__.py gen/ai/pipestream/office/v1/__init__.py \
+  gen/ai/pipestream/document/__init__.py gen/ai/pipestream/document/v1/__init__.py
 
 exec ./.venv/bin/python bench.py "$@"

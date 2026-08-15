@@ -93,9 +93,33 @@
         <button type="button" class="ro-seg-btn active" data-format="">PNG</button>
         <button type="button" class="ro-seg-btn" data-format="jpeg">JPEG</button>
         <button type="button" class="ro-seg-btn" data-format="webp">WebP</button>
+        <button type="button" class="ro-seg-btn" data-format="svg">SVG</button>
       </div>
       <input type="number" id="format-quality" class="ro-num" min="1" max="100"
              step="1" placeholder="q 85" aria-label="Lossy quality" disabled>
+    </div>
+    <div class="ro-group">
+      <label class="ro-check"><input type="checkbox" id="opt-grayscale"> Grayscale</label>
+      <span class="ro-name">Max width</span>
+      <input type="number" id="opt-max-width" class="ro-num" min="1" max="8192"
+             step="1" placeholder="px" aria-label="Fit to width in pixels">
+    </div>
+    <div class="ro-group">
+      <span class="ro-name">Tracked</span>
+      <div class="ro-seg" id="tracked-seg" role="group" aria-label="Tracked changes">
+        <button type="button" class="ro-seg-btn active" data-tracked="">As-is</button>
+        <button type="button" class="ro-seg-btn" data-tracked="final">Final</button>
+        <button type="button" class="ro-seg-btn" data-tracked="original">Original</button>
+        <button type="button" class="ro-seg-btn" data-tracked="markup">Markup</button>
+      </div>
+    </div>
+    <div class="ro-group">
+      <label class="ro-check"><input type="checkbox" id="opt-skip-hidden"> Skip hidden</label>
+      <label class="ro-check"><input type="checkbox" id="opt-used-range"> Used range</label>
+      <label class="ro-check"><input type="checkbox" id="opt-notes"> Notes pages</label>
+      <span class="ro-name">Timeout</span>
+      <input type="number" id="opt-timeout" class="ro-num" min="1" max="600"
+             step="1" placeholder="sec" aria-label="Request timeout in seconds">
     </div>
     <span class="ro-note" id="ro-note"></span>
   </section>

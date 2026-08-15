@@ -5,13 +5,24 @@ Subcommands:
   info                     print server versions, limits, accepted formats
   pages <file> [outdir]    render pages; StreamOptions flags below
   pdf <file> [out.pdf]     convert the document to a PDF
+  todoc <file>             fold StreamPages into one Document
 
 pages flags (all optional; omitted means the server default):
   --dpi N
   --first-page N / --last-page N   1-based inclusive page-image range
-  --format png|jpeg|webp           page image encoding
-  --quality N                      lossy quality 1-100 (ignored for PNG)
+  --format png|jpeg|webp|svg       page image encoding
+  --quality N                      lossy quality 1-100 (ignored for PNG/SVG)
   --parts PAGES,PARAGRAPHS,...     DocumentPart names (short or DOCUMENT_PART_*)
+  --max-width N                    fit-to-width in pixels
+  --grayscale                      convert page rasters to grayscale
+  --timeout N                      per-request deadline in seconds
+  --tracked-changes as-is|final|original|markup
+  --skip-hidden                    omit hidden sheets/slides from page images
+  --used-range                     crop spreadsheet pages to the used range
+  --notes                          append each slide's notes page
+  --form NAME=VALUE                write a form field (repeatable)
+  --redact START:END               redact an annotation-space span (repeatable)
+  --repair                         opt into broken-package repair
 
 The server address defaults to localhost:50053; override with --addr or the
 GRLIBRE_ADDR environment variable.
@@ -40,16 +51,27 @@ FORMATS = {
     "jpeg": pb.PAGE_IMAGE_FORMAT_JPEG,
     "jpg": pb.PAGE_IMAGE_FORMAT_JPEG,
     "webp": pb.PAGE_IMAGE_FORMAT_WEBP,
+    "svg": pb.PAGE_IMAGE_FORMAT_SVG,
+}
+
+TRACKED = {
+    "as-is": pb.TRACKED_CHANGE_DISPLAY_AS_IS,
+    "final": pb.TRACKED_CHANGE_DISPLAY_FINAL,
+    "original": pb.TRACKED_CHANGE_DISPLAY_ORIGINAL,
+    "markup": pb.TRACKED_CHANGE_DISPLAY_SHOW_MARKUP,
+    "show-markup": pb.TRACKED_CHANGE_DISPLAY_SHOW_MARKUP,
 }
 
 PAGE_EXT = {
     pb.PAGE_IMAGE_FORMAT_JPEG: "jpg",
     pb.PAGE_IMAGE_FORMAT_WEBP: "webp",
+    pb.PAGE_IMAGE_FORMAT_SVG: "svg",
 }
 
 PAGE_LABEL = {
     pb.PAGE_IMAGE_FORMAT_JPEG: "jpeg",
     pb.PAGE_IMAGE_FORMAT_WEBP: "webp",
+    pb.PAGE_IMAGE_FORMAT_SVG: "svg",
 }
 
 
@@ -81,12 +103,41 @@ def parse_parts(raw):
     return parts
 
 
+def parse_form(raw):
+    name, sep, value = raw.partition("=")
+    if not sep or not name:
+        raise SystemExit(f"--form needs NAME=VALUE, got {raw!r}")
+    return name, value
+
+
+def parse_redact(raw):
+    start_s, sep, end_s = raw.partition(":")
+    if not sep:
+        raise SystemExit(f"--redact needs START:END, got {raw!r}")
+    try:
+        start, end = int(start_s), int(end_s)
+    except ValueError:
+        raise SystemExit(f"--redact needs integer START:END, got {raw!r}")
+    return start, end
+
+
 def stream_options(args):
     """Build StreamOptions from pages flags, or None when every flag is default."""
-    parts = parse_parts(args.parts)
-    fmt = FORMATS[args.format or ""]
+    parts = parse_parts(getattr(args, "parts", "") or "")
+    fmt = FORMATS[getattr(args, "format", None) or ""]
+    forms = getattr(args, "form", None) or []
+    redacts = getattr(args, "redact", None) or []
+    tracked = getattr(args, "tracked_changes", None)
     if not (args.dpi or args.first_page or args.last_page or fmt
-            or args.quality or parts):
+            or args.quality or parts
+            or getattr(args, "max_width", 0)
+            or getattr(args, "grayscale", False)
+            or getattr(args, "timeout", 0)
+            or tracked
+            or getattr(args, "skip_hidden", False)
+            or getattr(args, "used_range", False)
+            or getattr(args, "notes", False)
+            or forms or redacts):
         return None
     opts = pb.StreamOptions()
     if args.dpi:
@@ -97,10 +148,32 @@ def stream_options(args):
         opts.last_page = args.last_page
     if fmt:
         opts.page_format = fmt
+        if fmt == pb.PAGE_IMAGE_FORMAT_SVG:
+            opts.vector_format = pb.PAGE_VECTOR_FORMAT_SVG
     if args.quality:
         opts.page_quality = args.quality
     if parts:
         opts.parts.extend(parts)
+    if getattr(args, "max_width", 0):
+        opts.max_width_px = args.max_width
+    if getattr(args, "grayscale", False):
+        opts.grayscale = True
+    if getattr(args, "timeout", 0):
+        opts.timeout_seconds = args.timeout
+    if tracked:
+        opts.tracked_changes = TRACKED[tracked]
+    if getattr(args, "skip_hidden", False):
+        opts.skip_hidden = True
+    if getattr(args, "used_range", False):
+        opts.paint_used_range = True
+    if getattr(args, "notes", False):
+        opts.include_notes_pages = True
+    for raw in forms:
+        name, value = parse_form(raw)
+        opts.form_values.add(name=name, value=value)
+    for raw in redacts:
+        start, end = parse_redact(raw)
+        opts.redact_spans.add(char_start=start, char_end=end)
     return opts
 
 
@@ -163,6 +236,8 @@ def cmd_info(stub, args):
     print(f"max concurrent docs : {resp.max_concurrent_documents}")
     print(f"render dpi          : {resp.render_dpi}")
     print(f"typed content       : {resp.typed_content}")
+    print(f"document mapping    : {resp.document_mapping}")
+    print(f"package repair      : {resp.package_repair}")
     print(f"diskless documents  : {resp.diskless_documents}")
     print(f"supported formats   : {', '.join(resp.supported_formats)}")
     if resp.internal_temp_artifacts:
@@ -184,6 +259,8 @@ def cmd_pages(stub, args):
         # upload stream, so they must ride the first chunk.
         if first and options is not None:
             req.options.CopyFrom(options)
+        if first and getattr(args, "repair", False):
+            req.allow_package_repair = True
         return req
 
     responses = stub.StreamPages(chunk_requests(args.file, wrap))
@@ -219,12 +296,59 @@ def cmd_pages(stub, args):
             counts[event] = counts.get(event, 0) + 1
 
 
+def cmd_todoc(stub, args):
+    t0 = time.monotonic()
+    options = stream_options(args)
+
+    def wrap(chunk, first):
+        req = pb.StreamPagesRequest(chunk=chunk)
+        if first and options is not None:
+            req.options.CopyFrom(options)
+        if first and getattr(args, "repair", False):
+            req.allow_package_repair = True
+        return req
+
+    resp = stub.ToDocument(chunk_requests(args.file, wrap))
+    total_s = time.monotonic() - t0
+    print_document_info(resp.document_info)
+    doc = resp.document
+    print(f"texts       : {len(doc.texts)}")
+    print(f"pictures    : {len(doc.pictures)}")
+    print(f"tables      : {len(doc.tables)}")
+    print(f"pages       : {len(doc.pages)}")
+    if resp.HasField("status"):
+        print()
+        print_render_status(resp.status, total_s)
+
+
 def cmd_pdf(stub, args):
     t0 = time.monotonic()
     total = 0
-    responses = stub.ConvertToPdf(
-        chunk_requests(args.file, lambda c, _first: pb.ConvertToPdfRequest(chunk=c))
-    )
+
+    def wrap(chunk, first):
+        req = pb.ConvertToPdfRequest(chunk=chunk)
+        if first:
+            if getattr(args, "repair", False):
+                req.allow_package_repair = True
+            if getattr(args, "timeout", 0):
+                req.timeout_seconds = args.timeout
+            if getattr(args, "tracked_changes", None):
+                req.tracked_changes = TRACKED[args.tracked_changes]
+            if getattr(args, "skip_hidden", False):
+                req.skip_hidden = True
+            if getattr(args, "first_page", 0):
+                req.first_page = args.first_page
+            if getattr(args, "last_page", 0):
+                req.last_page = args.last_page
+            for raw in getattr(args, "form", None) or []:
+                name, value = parse_form(raw)
+                req.form_values.add(name=name, value=value)
+            for raw in getattr(args, "redact", None) or []:
+                start, end = parse_redact(raw)
+                req.redact_spans.add(char_start=start, char_end=end)
+        return req
+
+    responses = stub.ConvertToPdf(chunk_requests(args.file, wrap))
     with open(args.out, "wb") as f:
         for resp in responses:
             event = resp.WhichOneof("event")
@@ -237,6 +361,31 @@ def cmd_pdf(stub, args):
                 total_s = time.monotonic() - t0
                 print_render_status(resp.status, total_s)
     print(f"wrote       : {total:,} bytes -> {args.out}")
+
+
+def add_shared_options(parser, pages_only=True):
+    parser.add_argument("--max-width", type=int, default=0, dest="max_width",
+                        help="fit-to-width in pixels (0 = use dpi)")
+    parser.add_argument("--grayscale", action="store_true",
+                        help="convert page rasters to grayscale")
+    parser.add_argument("--timeout", type=int, default=0,
+                        help="per-request deadline in seconds (0 = server default)")
+    parser.add_argument("--tracked-changes", default=None, dest="tracked_changes",
+                        choices=list(TRACKED),
+                        help="tracked-change display mode")
+    parser.add_argument("--skip-hidden", action="store_true", dest="skip_hidden",
+                        help="omit hidden sheets and slides")
+    if pages_only:
+        parser.add_argument("--used-range", action="store_true", dest="used_range",
+                            help="crop spreadsheet pages to the used cell range")
+        parser.add_argument("--notes", action="store_true",
+                            help="append each slide's notes page")
+    parser.add_argument("--form", action="append", default=[],
+                        help="form field NAME=VALUE (repeatable)")
+    parser.add_argument("--redact", action="append", default=[],
+                        help="redact annotation-space START:END (repeatable)")
+    parser.add_argument("--repair", action="store_true",
+                        help="opt into broken-package repair")
 
 
 def main():
@@ -256,21 +405,38 @@ def main():
                    help="first page to paint, 1-based inclusive (0 = from the start)")
     p.add_argument("--last-page", type=int, default=0, dest="last_page",
                    help="last page to paint, 1-based inclusive (0 = through the end)")
-    p.add_argument("--format", default=None, choices=["png", "jpeg", "jpg", "webp"],
+    p.add_argument("--format", default=None,
+                   choices=["png", "jpeg", "jpg", "webp", "svg"],
                    help="page image encoding (default PNG)")
     p.add_argument("--quality", type=int, default=0,
                    help="lossy quality 1-100 (0 = server default 85; ignored for PNG)")
     p.add_argument("--parts", default="",
                    help="comma list of DocumentPart names, e.g. PAGES,PARAGRAPHS "
                         "(short or DOCUMENT_PART_*); omitted = server default")
+    add_shared_options(p)
 
     p = sub.add_parser("pdf", help="convert to PDF")
     p.add_argument("file")
     p.add_argument("out", nargs="?", default="out.pdf")
+    p.add_argument("--first-page", type=int, default=0, dest="first_page")
+    p.add_argument("--last-page", type=int, default=0, dest="last_page")
+    add_shared_options(p, pages_only=False)
+
+    p = sub.add_parser("todoc", help="fold StreamPages into one Document")
+    p.add_argument("file")
+    p.add_argument("--dpi", type=int, default=0)
+    p.add_argument("--first-page", type=int, default=0, dest="first_page")
+    p.add_argument("--last-page", type=int, default=0, dest="last_page")
+    p.add_argument("--format", default=None,
+                   choices=["png", "jpeg", "jpg", "webp", "svg"])
+    p.add_argument("--quality", type=int, default=0)
+    p.add_argument("--parts", default="")
+    add_shared_options(p)
 
     args = parser.parse_args()
     stub = make_stub(args.addr)
-    handlers = {"info": cmd_info, "pages": cmd_pages, "pdf": cmd_pdf}
+    handlers = {"info": cmd_info, "pages": cmd_pages, "pdf": cmd_pdf,
+                "todoc": cmd_todoc}
     try:
         handlers[args.cmd](stub, args)
     except grpc.RpcError as e:

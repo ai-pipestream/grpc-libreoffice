@@ -16,17 +16,30 @@
 #include <iostream>
 #include <string>
 
+#include "ai/pipestream/office/v1/office_service.pb.h"
 #include "lok_engine.h"
 
 namespace {
 
-// Decodes the argv parts token: "all" selects every part, otherwise the
-// token is DocumentPart numeric values joined by commas (for example "2,3").
-// Values outside (0, 32) are ignored, matching the UNSPECIFIED rule.
+// Decodes the argv parts token: "all" selects every part, "all-but-pages"
+// selects the same wire default minus page images (every part except
+// DOCUMENT_PART_PAGES and the explicit-only DOCUMENT_PART_CELL_LINE_RECTS),
+// otherwise the token is DocumentPart numeric values joined by commas (for
+// example "2,3"). Values outside (0, 32) are ignored, matching the
+// UNSPECIFIED rule.
 grlibre::PartSelection parse_parts(const std::string& token) {
   grlibre::PartSelection parts;
   if (token == "all") return parts;
   parts.all = false;
+  if (token == "all-but-pages") {
+    // Mask every representable part so future DocumentPart values stay
+    // included, then drop the two exceptions.
+    parts.mask = ~0u & ~1u;
+    parts.mask &= ~(1u << ai::pipestream::office::v1::DOCUMENT_PART_PAGES);
+    parts.mask &=
+        ~(1u << ai::pipestream::office::v1::DOCUMENT_PART_CELL_LINE_RECTS);
+    return parts;
+  }
   size_t pos = 0;
   while (pos <= token.size()) {
     size_t comma = token.find(',', pos);
@@ -153,6 +166,50 @@ int main(int argc, char** argv) {
       std::cerr << "grlibre-worker: unknown image format token \"" << token
                 << "\"\n";
       return grlibre::kExitRenderFailure;
+    }
+  }
+
+  {
+    std::ifstream extras_in(options.work_dir + "/options.pb", std::ios::binary);
+    ai::pipestream::office::v1::StreamOptions extras;
+    if (extras_in && extras.ParseFromIstream(&extras_in)) {
+      if (extras.max_width_px() > 0) options.max_width_px = extras.max_width_px();
+      options.grayscale = options.grayscale || extras.grayscale();
+      if (extras.tracked_changes() != 0) {
+        options.tracked_changes = extras.tracked_changes();
+      }
+      if (extras.vector_format() != 0) {
+        options.vector_format = extras.vector_format();
+      }
+      if (options.vector_format == 0
+          && extras.page_format() ==
+                 ai::pipestream::office::v1::PAGE_IMAGE_FORMAT_SVG) {
+        // page_format=SVG implies vector pages, but never overrides an
+        // explicit PAGE_VECTOR_FORMAT_NONE.
+        options.vector_format =
+            ai::pipestream::office::v1::PAGE_VECTOR_FORMAT_SVG;
+      }
+      options.skip_hidden = options.skip_hidden || extras.skip_hidden();
+      options.paint_used_range =
+          options.paint_used_range || extras.paint_used_range();
+      options.include_notes_pages =
+          options.include_notes_pages || extras.include_notes_pages();
+      if (options.form_values.empty()) {
+        for (const auto& value : extras.form_values()) {
+          options.form_values.emplace_back(value.name(), value.value());
+        }
+      }
+      if (options.redact_spans.empty()) {
+        for (const auto& span : extras.redact_spans()) {
+          options.redact_spans.emplace_back(span.char_start(), span.char_end());
+        }
+      }
+      if (options.first_page == 0 && extras.first_page() != 0) {
+        options.first_page = extras.first_page();
+      }
+      if (options.last_page == 0 && extras.last_page() != 0) {
+        options.last_page = extras.last_page();
+      }
     }
   }
 

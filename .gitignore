@@ -1,4 +1,5 @@
 build/
+Testing/
 .idea/
 .cache/
 compile_commands.json

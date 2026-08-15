@@ -98,9 +98,18 @@ bool emit_typed_content(
 // named temp file (vcl's PDF writer is file-backed, structural) and copies
 // it to the output stream, unlinking it right after. It lives under the
 // worker's TMPDIR, which the worker pins inside the tmpfs work dir.
+// pdf.first_page / last_page become FilterData PageRange when set.
+struct PdfExportOptions {
+  // First page, 1-based inclusive; 0 means from the start.
+  int first_page = 0;
+  // Last page, 1-based inclusive; 0 means through the end.
+  int last_page = 0;
+};
+
 bool export_pdf_stream(const std::string& filter_name, size_t chunk_limit,
                        const std::function<bool(std::string&&)>& emit_chunk,
-                       long* total_bytes, std::string* error);
+                       long* total_bytes, std::string* error,
+                       const PdfExportOptions& pdf = {});
 
 // Whether these document bytes are a broken ZIP package the office core
 // could only open through its repair path. Runs the same ZipPackage probe
@@ -109,6 +118,74 @@ bool export_pdf_stream(const std::string& filter_name, size_t chunk_limit,
 // content proves repairability. False for healthy packages, for non-ZIP
 // bytes, and for damage beyond repair.
 bool is_repairable_broken_package(const std::string& bytes);
+
+// Applies tracked-change display, form fills, and PDF redaction shapes to
+// the document currently loaded in this process. Problems append to
+// warnings and never fail the render.
+void apply_document_options(const RenderOptions& options,
+                            std::vector<std::string>* warnings);
+
+// One line box in document-absolute twips, used to black out redacted
+// text on a painted page.
+struct RedactBox {
+  // Zero-based page index matching PageImage.index.
+  int page_index = -1;
+  // Left edge in document-absolute twips.
+  std::int64_t x_twips = 0;
+  // Top edge in document-absolute twips.
+  std::int64_t y_twips = 0;
+  // Width in twips.
+  std::int64_t width_twips = 0;
+  // Height in twips.
+  std::int64_t height_twips = 0;
+};
+
+// Collects line boxes that overlap the request's redact spans, by running
+// a paragraphs+line-rects extraction against the loaded document. probe
+// may be null, in which case each overlapped paragraph degrades to
+// full-page-width bands over its start..end anchor extent on every page
+// it touches (conservative over-coverage, with a warning), using the
+// laid-out page rectangles in pages.
+void collect_redact_boxes(const RenderOptions& options, SelectionProbe* probe,
+                          const std::vector<PageBox>& pages,
+                          std::vector<RedactBox>* boxes,
+                          std::vector<std::string>* warnings);
+
+// Draws opaque black rectangles on the loaded document for PDF export.
+// Boxes are document-absolute twips; pages are the laid-out page
+// rectangles, used to anchor each rectangle to its page.
+void apply_redact_shapes(const std::vector<RedactBox>& boxes,
+                         const std::vector<PageBox>& pages,
+                         std::vector<std::string>* warnings);
+
+// Per-part visibility and used-range size for spreadsheet/presentation
+// page filtering. Index matches LibreOfficeKit part ordinal.
+struct PartLayout {
+  // True when the sheet or slide is shown.
+  bool visible = true;
+  // Left edge of the used range in twips (visible columns before it);
+  // 0 when unknown or not a sheet.
+  long used_x = 0;
+  // Top edge of the used range in twips (visible rows above it); 0 when
+  // unknown or not a sheet.
+  long used_y = 0;
+  // Used-range width in twips, visible columns only; 0 when unknown or
+  // not a sheet.
+  long used_width = 0;
+  // Used-range height in twips, visible rows only; 0 when unknown or not
+  // a sheet.
+  long used_height = 0;
+};
+
+// Fills one PartLayout per sheet or slide of the loaded document. Writer
+// documents leave *parts empty. Problems append to warnings.
+void describe_parts(std::vector<PartLayout>* parts,
+                    std::vector<std::string>* warnings);
+
+// Exports one page of the loaded document as SVG through the UNO graphic
+// export filter. page_number is 1-based. Returns empty on failure.
+std::string export_page_svg_uno(int page_number,
+                                std::vector<std::string>* warnings);
 
 }  // namespace grlibre
 

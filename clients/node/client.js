@@ -3,9 +3,13 @@
 //
 //   node client.js info
 //   node client.js pages <file> [outdir] [--dpi N] [--first-page N]
-//        [--last-page N] [--format png|jpeg|webp] [--quality N]
-//        [--parts PAGES,PARAGRAPHS,...]
+//        [--last-page N] [--format png|jpeg|webp|svg] [--quality N]
+//        [--parts PAGES,PARAGRAPHS,...] [--max-width N] [--grayscale]
+//        [--timeout N] [--tracked-changes MODE] [--skip-hidden]
+//        [--used-range] [--notes] [--form NAME=VALUE] [--redact START:END]
+//        [--repair]
 //   node client.js pdf <file> [out.pdf]
+//   node client.js todoc <file>
 //
 // Server address defaults to localhost:50053; override with GRLIBRE_ADDR.
 
@@ -27,6 +31,15 @@ const FORMAT_ENUM = {
   jpeg: "PAGE_IMAGE_FORMAT_JPEG",
   jpg: "PAGE_IMAGE_FORMAT_JPEG",
   webp: "PAGE_IMAGE_FORMAT_WEBP",
+  svg: "PAGE_IMAGE_FORMAT_SVG",
+};
+
+const TRACKED_ENUM = {
+  "as-is": "TRACKED_CHANGE_DISPLAY_AS_IS",
+  final: "TRACKED_CHANGE_DISPLAY_FINAL",
+  original: "TRACKED_CHANGE_DISPLAY_ORIGINAL",
+  markup: "TRACKED_CHANGE_DISPLAY_SHOW_MARKUP",
+  "show-markup": "TRACKED_CHANGE_DISPLAY_SHOW_MARKUP",
 };
 
 const packageDefinition = protoLoader.loadSync(
@@ -92,11 +105,35 @@ function parseParts(raw) {
   return parts;
 }
 
+function parseForm(raw) {
+  const eq = raw.indexOf("=");
+  if (eq <= 0) {
+    console.error(`--form needs NAME=VALUE, got ${JSON.stringify(raw)}`);
+    process.exit(2);
+  }
+  return { name: raw.slice(0, eq), value: raw.slice(eq + 1) };
+}
+
+function parseRedact(raw) {
+  const sep = raw.indexOf(":");
+  if (sep < 0) {
+    console.error(`--redact needs START:END, got ${JSON.stringify(raw)}`);
+    process.exit(2);
+  }
+  const start = Number.parseInt(raw.slice(0, sep), 10);
+  const end = Number.parseInt(raw.slice(sep + 1), 10);
+  if (!Number.isInteger(start) || !Number.isInteger(end)) {
+    console.error(`--redact needs integer START:END, got ${JSON.stringify(raw)}`);
+    process.exit(2);
+  }
+  return { char_start: start, char_end: end };
+}
+
 function streamOptions(opts) {
   const parts = parseParts(opts.parts);
   const format = opts.format ? FORMAT_ENUM[opts.format] : null;
   if (!format && opts.format) {
-    console.error("--format must be png, jpeg, or webp");
+    console.error("--format must be png, jpeg, webp, or svg");
     process.exit(2);
   }
   if (
@@ -105,7 +142,16 @@ function streamOptions(opts) {
     !opts.lastPage &&
     !format &&
     !opts.quality &&
-    parts.length === 0
+    parts.length === 0 &&
+    !opts.maxWidth &&
+    !opts.grayscale &&
+    !opts.timeout &&
+    !opts.trackedChanges &&
+    !opts.skipHidden &&
+    !opts.usedRange &&
+    !opts.notes &&
+    opts.forms.length === 0 &&
+    opts.redacts.length === 0
   ) {
     return null;
   }
@@ -113,21 +159,37 @@ function streamOptions(opts) {
   if (opts.dpi) options.render_dpi = opts.dpi;
   if (opts.firstPage) options.first_page = opts.firstPage;
   if (opts.lastPage) options.last_page = opts.lastPage;
-  if (format) options.page_format = format;
+  if (format) {
+    options.page_format = format;
+    if (format === "PAGE_IMAGE_FORMAT_SVG") {
+      options.vector_format = "PAGE_VECTOR_FORMAT_SVG";
+    }
+  }
   if (opts.quality) options.page_quality = opts.quality;
   if (parts.length) options.parts = parts;
+  if (opts.maxWidth) options.max_width_px = opts.maxWidth;
+  if (opts.grayscale) options.grayscale = true;
+  if (opts.timeout) options.timeout_seconds = opts.timeout;
+  if (opts.trackedChanges) options.tracked_changes = TRACKED_ENUM[opts.trackedChanges];
+  if (opts.skipHidden) options.skip_hidden = true;
+  if (opts.usedRange) options.paint_used_range = true;
+  if (opts.notes) options.include_notes_pages = true;
+  if (opts.forms.length) options.form_values = opts.forms.map(parseForm);
+  if (opts.redacts.length) options.redact_spans = opts.redacts.map(parseRedact);
   return options;
 }
 
 function pageExt(format) {
   if (format === "PAGE_IMAGE_FORMAT_JPEG") return "jpg";
   if (format === "PAGE_IMAGE_FORMAT_WEBP") return "webp";
+  if (format === "PAGE_IMAGE_FORMAT_SVG") return "svg";
   return "png";
 }
 
 function pageLabel(format) {
   if (format === "PAGE_IMAGE_FORMAT_JPEG") return "jpeg";
   if (format === "PAGE_IMAGE_FORMAT_WEBP") return "webp";
+  if (format === "PAGE_IMAGE_FORMAT_SVG") return "svg";
   return "png";
 }
 
@@ -188,6 +250,8 @@ function cmdInfo() {
     console.log(`max concurrent docs : ${resp.max_concurrent_documents}`);
     console.log(`render dpi          : ${resp.render_dpi}`);
     console.log(`typed content       : ${resp.typed_content}`);
+    console.log(`document mapping    : ${resp.document_mapping}`);
+    console.log(`package repair      : ${resp.package_repair}`);
     console.log(`diskless documents  : ${resp.diskless_documents}`);
     console.log(`supported formats   : ${resp.supported_formats.join(", ")}`);
   });
@@ -242,7 +306,33 @@ function cmdPages(file, outdir, opts) {
     }
   });
   call.on("error", fail);
-  uploadFile(call, file, options ? { options } : {});
+  const extra = {};
+  if (options) extra.options = options;
+  if (opts.repair) extra.allow_package_repair = true;
+  uploadFile(call, file, extra);
+}
+
+function cmdTodoc(file, opts) {
+  const client = makeClient();
+  const t0 = performance.now();
+  const options = streamOptions(opts);
+  const extra = {};
+  if (options) extra.options = options;
+  if (opts.repair) extra.allow_package_repair = true;
+  const call = client.ToDocument((err, resp) => {
+    if (err) fail(err);
+    printDocumentInfo(resp.document_info);
+    const doc = resp.document || {};
+    console.log(`texts       : ${(doc.texts || []).length}`);
+    console.log(`pictures    : ${(doc.pictures || []).length}`);
+    console.log(`tables      : ${(doc.tables || []).length}`);
+    console.log(`pages       : ${Object.keys(doc.pages || {}).length}`);
+    if (resp.status) {
+      console.log();
+      printRenderStatus(resp.status, performance.now() - t0);
+    }
+  });
+  uploadFile(call, file, extra);
 }
 
 function cmdPdf(file, out = "out.pdf") {
@@ -279,8 +369,10 @@ function cmdPdf(file, out = "out.pdf") {
 
 const PAGES_USAGE =
   "usage: node client.js pages <file> [outdir] [--dpi <n>] " +
-  "[--first-page <n>] [--last-page <n>] [--format png|jpeg|webp] " +
-  "[--quality <n>] [--parts PAGES,PARAGRAPHS,...]";
+  "[--first-page <n>] [--last-page <n>] [--format png|jpeg|webp|svg] " +
+  "[--quality <n>] [--parts PAGES,PARAGRAPHS,...] [--max-width <n>] " +
+  "[--grayscale] [--timeout <n>] [--tracked-changes MODE] [--skip-hidden] " +
+  "[--used-range] [--notes] [--form NAME=VALUE] [--redact START:END] [--repair]";
 
 function parsePagesArgs(rest) {
   const opts = {
@@ -290,6 +382,16 @@ function parsePagesArgs(rest) {
     format: "",
     quality: 0,
     parts: "",
+    maxWidth: 0,
+    grayscale: false,
+    timeout: 0,
+    trackedChanges: "",
+    skipHidden: false,
+    usedRange: false,
+    notes: false,
+    forms: [],
+    redacts: [],
+    repair: false,
   };
   const positional = [];
   let i = 0;
@@ -315,7 +417,7 @@ function parsePagesArgs(rest) {
       case "--format":
         opts.format = need("--format").toLowerCase();
         if (!(opts.format in FORMAT_ENUM)) {
-          console.error("--format must be png, jpeg, or webp");
+          console.error("--format must be png, jpeg, webp, or svg");
           process.exit(2);
         }
         break;
@@ -324,6 +426,40 @@ function parsePagesArgs(rest) {
         break;
       case "--parts":
         opts.parts = need("--parts");
+        break;
+      case "--max-width":
+        opts.maxWidth = parsePositiveInt("--max-width", need("--max-width"));
+        break;
+      case "--grayscale":
+        opts.grayscale = true;
+        break;
+      case "--timeout":
+        opts.timeout = parsePositiveInt("--timeout", need("--timeout"));
+        break;
+      case "--tracked-changes":
+        opts.trackedChanges = need("--tracked-changes").toLowerCase();
+        if (!(opts.trackedChanges in TRACKED_ENUM)) {
+          console.error("--tracked-changes must be as-is, final, original, or markup");
+          process.exit(2);
+        }
+        break;
+      case "--skip-hidden":
+        opts.skipHidden = true;
+        break;
+      case "--used-range":
+        opts.usedRange = true;
+        break;
+      case "--notes":
+        opts.notes = true;
+        break;
+      case "--form":
+        opts.forms.push(need("--form"));
+        break;
+      case "--redact":
+        opts.redacts.push(need("--redact"));
+        break;
+      case "--repair":
+        opts.repair = true;
         break;
       default:
         if (a.startsWith("-")) {
@@ -357,9 +493,19 @@ switch (cmd) {
     }
     cmdPdf(rest[0], rest[1]);
     break;
+  case "todoc": {
+    const { positional, opts } = parsePagesArgs(rest);
+    if (!positional[0]) {
+      console.error("usage: node client.js todoc <file> [options]");
+      process.exit(2);
+    }
+    cmdTodoc(positional[0], opts);
+    break;
+  }
   default:
     console.error(
-      "usage: node client.js <info | pages <file> [outdir] [options] | pdf <file> [out.pdf]>",
+      "usage: node client.js <info | pages <file> [outdir] [options] | " +
+        "pdf <file> [out.pdf] | todoc <file> [options]>",
     );
     console.error(PAGES_USAGE);
     process.exit(2);

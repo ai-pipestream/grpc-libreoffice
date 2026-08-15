@@ -72,6 +72,21 @@ const std::uint8_t* as_rgba(const std::uint8_t* pixels, int width, int height,
 
 }  // namespace
 
+void grayscale_pixels(std::uint8_t* pixels, int width, int height, bool bgra) {
+  if (pixels == nullptr || width <= 0 || height <= 0) return;
+  const size_t count = static_cast<size_t>(width) * static_cast<size_t>(height);
+  for (size_t i = 0; i < count; i++) {
+    std::uint8_t* p = pixels + i * 4;
+    const int b = bgra ? p[0] : p[2];
+    const int g = p[1];
+    const int r = bgra ? p[2] : p[0];
+    const std::uint8_t y = static_cast<std::uint8_t>((77 * r + 150 * g + 29 * b) >> 8);
+    p[0] = y;
+    p[1] = y;
+    p[2] = y;
+  }
+}
+
 std::string encode_png(const std::uint8_t* pixels, int width, int height, bool bgra) {
   if (width <= 0 || height <= 0) return {};
   std::string png;

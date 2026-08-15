@@ -7,6 +7,12 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import grpc from "@grpc/grpc-js";
 import protoLoader from "@grpc/proto-loader";
+import {
+  parseRenderQuery,
+  buildStreamOptions,
+  buildPdfExtras,
+  slimEvent,
+} from "./lib/options.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROTO_ROOT = path.join(__dirname, "..", "proto");
@@ -47,37 +53,6 @@ const STATUS_NAMES = Object.fromEntries(
 // "DOCUMENT_PART_PAGES".
 const DOCUMENT_PART_NAMES = new Set(
   officePkg.DocumentPart.type.value.map((v) => v.name));
-
-// Parses ?parts=PAGES,METADATA into full enum names, or null when absent.
-// Throws on unknown names.
-function parsePartsParam(url) {
-  const raw = url.searchParams.get("parts");
-  if (raw == null || raw.trim() === "") return null;
-  const parts = [];
-  for (const token of raw.split(",")) {
-    const t = token.trim().toUpperCase();
-    if (!t) continue;
-    const full = t.startsWith("DOCUMENT_PART_") ? t : "DOCUMENT_PART_" + t;
-    if (!DOCUMENT_PART_NAMES.has(full)) {
-      throw new Error(`unknown document part "${token.trim()}"`);
-    }
-    parts.push(full);
-  }
-  return parts.length ? parts : null;
-}
-
-// Parses one optional non-negative integer query param, or null when
-// absent. Throws on anything that is not a plain base-10 non-negative
-// integer (fractions, negatives, exponents, garbage).
-function parseNonNegativeIntParam(url, name) {
-  const raw = url.searchParams.get(name);
-  if (raw == null || raw.trim() === "") return null;
-  const t = raw.trim();
-  if (!/^\d+$/.test(t)) {
-    throw new Error(`invalid ${name} "${raw}": must be a non-negative integer`);
-  }
-  return Number(t);
-}
 
 function grpcErrorPayload(err) {
   return {
@@ -139,34 +114,6 @@ function sendUpload(call, buffer, filename, contentType, firstExtra) {
   call.end();
 }
 
-// Approximate decoded byte size of a base64 string.
-function b64Size(s) {
-  if (!s) return 0;
-  let padding = 0;
-  if (s.endsWith("==")) padding = 2;
-  else if (s.endsWith("=")) padding = 1;
-  return Math.floor((s.length * 3) / 4) - padding;
-}
-
-// Replaces heavyweight byte payloads in typed-content events with their
-// sizes so the NDJSON stream stays light. Page PNGs are kept: the UI needs
-// them. Returns the number of payload bytes represented by this event.
-function slimEvent(kind, data) {
-  let bytes = 0;
-  if (kind === "pageImage") {
-    bytes = b64Size(data.png);
-  } else if (kind === "embeddedImage") {
-    bytes = b64Size(data.data);
-    data.dataBytes = bytes;
-    delete data.data;
-  } else if (kind === "embeddedObject") {
-    bytes = b64Size(data.replacementImage);
-    data.replacementImageBytes = bytes;
-    delete data.replacementImage;
-  }
-  return bytes;
-}
-
 async function handleInfo(res) {
   client.GetServiceInfo({}, (err, info) => {
     if (err) {
@@ -179,35 +126,12 @@ async function handleInfo(res) {
   });
 }
 
-// Maps the short ?format= names onto PageImageFormat enum names. Anything
-// else is a 400.
-const PAGE_FORMATS = {
-  png: "PAGE_IMAGE_FORMAT_PNG",
-  jpeg: "PAGE_IMAGE_FORMAT_JPEG",
-  webp: "PAGE_IMAGE_FORMAT_WEBP",
-};
-
-function parseFormatParam(url) {
-  const raw = url.searchParams.get("format");
-  if (raw == null || raw.trim() === "") return null;
-  const format = PAGE_FORMATS[raw.trim().toLowerCase()];
-  if (!format) {
-    throw new Error(`unknown format "${raw}": expected png, jpeg, or webp`);
-  }
-  return format;
-}
-
 async function handleRender(req, res, url) {
   const filename = resolveFilename(req, url);
   const contentType = req.headers["content-type"] || "";
-  let parts, dpi, firstPage, lastPage, format, quality;
+  let q;
   try {
-    parts = parsePartsParam(url);
-    dpi = parseNonNegativeIntParam(url, "dpi");
-    firstPage = parseNonNegativeIntParam(url, "firstPage");
-    lastPage = parseNonNegativeIntParam(url, "lastPage");
-    format = parseFormatParam(url);
-    quality = parseNonNegativeIntParam(url, "quality");
+    q = parseRenderQuery(url, DOCUMENT_PART_NAMES);
   } catch (err) {
     res.writeHead(400, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: { message: String(err.message) } }));
@@ -227,8 +151,12 @@ async function handleRender(req, res, url) {
     event: "start",
     tMs: 0,
     data: {
-      filename, bytes: body.length, parts: parts || [],
-      dpi, firstPage, lastPage, format, quality,
+      filename, bytes: body.length, parts: q.parts || [],
+      dpi: q.dpi, firstPage: q.firstPage, lastPage: q.lastPage,
+      format: q.format, quality: q.quality,
+      maxWidth: q.maxWidth, grayscale: q.grayscale, timeout: q.timeout,
+      trackedChanges: q.trackedChanges, skipHidden: q.skipHidden,
+      usedRange: q.usedRange, notes: q.notes,
     },
   });
 
@@ -258,20 +186,45 @@ async function handleRender(req, res, url) {
     if (!ended) call.cancel();
   });
 
-  // StreamOptions on the first chunk. A backwards page range is forwarded
-  // as-is: the server rejects it with INVALID_ARGUMENT, which surfaces as
-  // the NDJSON error event.
-  const options = {};
-  if (parts) options.parts = parts;
-  if (dpi != null) options.renderDpi = dpi;
-  if (firstPage != null) options.firstPage = firstPage;
-  if (lastPage != null) options.lastPage = lastPage;
-  if (format != null) options.pageFormat = format;
-  // An out-of-range quality is forwarded: the server's INVALID_ARGUMENT
-  // surfaces as the NDJSON error event, like a backwards page range.
-  if (quality != null) options.pageQuality = quality;
+  // StreamOptions on the first chunk. A backwards page range or an
+  // out-of-range quality is forwarded as-is: the server rejects it with
+  // INVALID_ARGUMENT, which surfaces as the NDJSON error event.
+  const options = buildStreamOptions(q);
   sendUpload(call, body, filename, contentType,
-    Object.keys(options).length ? { options } : null);
+    options ? { options } : null);
+}
+
+async function handleToDocument(req, res, url) {
+  const filename = resolveFilename(req, url);
+  const contentType = req.headers["content-type"] || "";
+  let q;
+  try {
+    q = parseRenderQuery(url, DOCUMENT_PART_NAMES);
+  } catch (err) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: { message: String(err.message) } }));
+    return;
+  }
+  const body = await readBody(req);
+  const options = buildStreamOptions(q);
+  const call = client.ToDocument((err, resp) => {
+    if (err) {
+      const payload = grpcErrorPayload(err);
+      const httpStatus =
+        payload.codeName === "INVALID_ARGUMENT" ? 400 :
+        payload.codeName === "RESOURCE_EXHAUSTED" ? 413 : 502;
+      res.writeHead(httpStatus, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: payload }));
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(resp));
+  });
+  req.on("close", () => {
+    if (!res.writableEnded) call.cancel();
+  });
+  sendUpload(call, body, filename, contentType,
+    options ? { options } : null);
 }
 
 // Lists the demo fixture files (regular files only) with their sizes.
@@ -321,6 +274,14 @@ function handleFixtureFile(res, name) {
 async function handlePdf(req, res, url) {
   const filename = resolveFilename(req, url);
   const contentType = req.headers["content-type"] || "";
+  let q;
+  try {
+    q = parseRenderQuery(url, DOCUMENT_PART_NAMES);
+  } catch (err) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: { message: String(err.message) } }));
+    return;
+  }
   const body = await readBody(req);
 
   const call = client.ConvertToPdf();
@@ -373,7 +334,7 @@ async function handlePdf(req, res, url) {
     if (!res.writableEnded) call.cancel();
   });
 
-  sendUpload(call, body, filename, contentType);
+  sendUpload(call, body, filename, contentType, buildPdfExtras(q));
 }
 
 const MIME = {
@@ -418,6 +379,8 @@ const server = http.createServer(async (req, res) => {
       await handleRender(req, res, url);
     } else if (req.method === "POST" && url.pathname === "/api/pdf") {
       await handlePdf(req, res, url);
+    } else if (req.method === "POST" && url.pathname === "/api/document") {
+      await handleToDocument(req, res, url);
     } else if (req.method === "GET" || req.method === "HEAD") {
       serveStatic(res, url.pathname);
     } else {

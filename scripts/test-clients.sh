@@ -14,6 +14,9 @@
 #   range   pages --first-page 2 --last-page 2 --parts PAGES: exactly one
 #           page-0002.png (document-absolute index)
 #   format  pages --format webp --parts PAGES: page-*.webp with RIFF/WEBP magic
+#   gray    pages --grayscale --parts PAGES: still PNG magic
+#   width   pages --max-width 200 --parts PAGES: first page width <= 200
+#   svg     pages --format svg --parts PAGES: page-*.svg containing <svg
 #
 # Prints a per-language PASS/FAIL table and exits nonzero on any failure.
 # Client setup (venv, stubs, node_modules, gradle installDist) happens lazily.
@@ -103,7 +106,7 @@ export GRLIBRE_ADDR="localhost:$PORT"
 # ---- checks -------------------------------------------------------------------
 
 LANGS=(python node java)
-TESTS=(info pages pdf error dpi range format)
+TESTS=(info pages pdf error dpi range format gray width svg)
 declare -A RESULT   # RESULT[lang/test] = PASS | FAIL(reason)
 declare -A PAGE_COUNT PDF_SIZE PAGE_WIDTH
 FAILED=0
@@ -123,6 +126,8 @@ is_webp() {
   [ -s "$1" ] && [ "$(head -c 4 "$1")" = "RIFF" ] \
     && [ "$(dd if="$1" bs=1 skip=8 count=4 2>/dev/null)" = "WEBP" ]
 }
+
+is_svg() { [ -s "$1" ] && grep -q "<svg" "$1"; }
 
 # IHDR pixel width: bytes 16..19 of the file, big-endian.
 png_width() {
@@ -233,6 +238,64 @@ for lang in "${LANGS[@]}"; do
     fi
   else
     fail "$lang" format "exit $?"
+  fi
+
+  # grayscale: still a PNG
+  graydir="$WORK/pages-$lang-gray"
+  mkdir -p "$graydir"
+  if run_client "$lang" pages "$FIXTURE" "$graydir" \
+      --grayscale --parts PAGES \
+      >"$WORK/logs/$lang-gray.log" 2>&1; then
+    if ! is_png "$graydir/page-0001.png"; then
+      fail "$lang" gray "no valid page-0001.png produced"
+    else
+      pass "$lang" gray
+    fi
+  else
+    fail "$lang" gray "exit $?"
+  fi
+
+  # max-width: first page at most 200 px wide
+  widthdir="$WORK/pages-$lang-width"
+  mkdir -p "$widthdir"
+  if run_client "$lang" pages "$FIXTURE" "$widthdir" \
+      --max-width 200 --parts PAGES \
+      >"$WORK/logs/$lang-width.log" 2>&1; then
+    if ! is_png "$widthdir/page-0001.png"; then
+      fail "$lang" width "no valid page-0001.png produced"
+    else
+      w=$(png_width "$widthdir/page-0001.png")
+      if [ "$w" -gt 0 ] && [ "$w" -le 200 ]; then
+        pass "$lang" width
+      else
+        fail "$lang" width "width $w, expected <= 200"
+      fi
+    fi
+  else
+    fail "$lang" width "exit $?"
+  fi
+
+  # svg: vector page files carry an <svg tag
+  svgdir="$WORK/pages-$lang-svg"
+  mkdir -p "$svgdir"
+  if run_client "$lang" pages "$FIXTURE" "$svgdir" \
+      --format svg --parts PAGES \
+      >"$WORK/logs/$lang-svg.log" 2>&1; then
+    count=0; bad=""
+    for f in "$svgdir"/page-*.svg; do
+      [ -e "$f" ] || continue
+      count=$((count + 1))
+      is_svg "$f" || bad="$bad $(basename "$f")"
+    done
+    if [ "$count" -eq 0 ]; then
+      fail "$lang" svg "no page-*.svg produced"
+    elif [ -n "$bad" ]; then
+      fail "$lang" svg "missing <svg tag:$bad"
+    else
+      pass "$lang" svg
+    fi
+  else
+    fail "$lang" svg "exit $?"
   fi
 
   # pdf

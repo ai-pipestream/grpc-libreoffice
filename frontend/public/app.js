@@ -25,6 +25,13 @@ const els = {
   formatQuality: $("format-quality"),
   rangeFrom: $("range-from"),
   rangeTo: $("range-to"),
+  optGrayscale: $("opt-grayscale"),
+  optMaxWidth: $("opt-max-width"),
+  trackedSeg: $("tracked-seg"),
+  optSkipHidden: $("opt-skip-hidden"),
+  optUsedRange: $("opt-used-range"),
+  optNotes: $("opt-notes"),
+  optTimeout: $("opt-timeout"),
   roNote: $("ro-note"),
   errorBanner: $("error-banner"),
   errorTitle: $("error-title"),
@@ -244,8 +251,9 @@ function effectiveRange() {
 }
 
 // Selected page image format ("" = PNG). The quality box only applies to
-// the lossy formats.
+// the lossy formats. Tracked-change display is empty = as-is (server default).
 let pageFormat = "";
+let trackedChanges = "";
 
 function effectiveQuality() {
   const raw = els.formatQuality.value.trim();
@@ -262,9 +270,20 @@ function updateOptionsNote() {
   if (from != null || to != null) {
     bits.push(`pages ${from ?? 1}-${to ?? "end"}` + (swapped ? " (swapped: from > to)" : ""));
   }
-  if (pageFormat) {
+  if (pageFormat === "svg") {
+    bits.push("svg");
+  } else if (pageFormat) {
     bits.push(pageFormat + " q" + (effectiveQuality() ?? 85));
   }
+  if (els.optGrayscale.checked) bits.push("grayscale");
+  const maxWidth = effectiveMaxWidth();
+  if (maxWidth != null) bits.push("max-width " + maxWidth);
+  if (trackedChanges) bits.push("tracked " + trackedChanges);
+  if (els.optSkipHidden.checked) bits.push("skip-hidden");
+  if (els.optUsedRange.checked) bits.push("used-range");
+  if (els.optNotes.checked) bits.push("notes");
+  const timeout = effectiveTimeout();
+  if (timeout != null) bits.push("timeout " + timeout + "s");
   els.roNote.textContent = bits.length ? bits.join(" \u00b7 ") : "";
   els.roNote.classList.toggle("ro-note-warn",
     els.roNote.textContent.includes("swapped") ||
@@ -299,7 +318,7 @@ els.formatSeg.addEventListener("click", (e) => {
   const btn = e.target.closest(".ro-seg-btn");
   if (!btn) return;
   pageFormat = btn.dataset.format;
-  els.formatQuality.disabled = !pageFormat;
+  els.formatQuality.disabled = !pageFormat || pageFormat === "svg";
   for (const b of els.formatSeg.children) {
     b.classList.toggle("active", b.dataset.format === pageFormat);
   }
@@ -307,6 +326,37 @@ els.formatSeg.addEventListener("click", (e) => {
 });
 
 els.formatQuality.addEventListener("input", updateOptionsNote);
+els.optGrayscale.addEventListener("change", updateOptionsNote);
+els.optMaxWidth.addEventListener("input", updateOptionsNote);
+
+els.trackedSeg.addEventListener("click", (e) => {
+  const btn = e.target.closest(".ro-seg-btn");
+  if (!btn) return;
+  trackedChanges = btn.dataset.tracked;
+  for (const b of els.trackedSeg.children) {
+    b.classList.toggle("active", b.dataset.tracked === trackedChanges);
+  }
+  updateOptionsNote();
+});
+
+els.optSkipHidden.addEventListener("change", updateOptionsNote);
+els.optUsedRange.addEventListener("change", updateOptionsNote);
+els.optNotes.addEventListener("change", updateOptionsNote);
+els.optTimeout.addEventListener("input", updateOptionsNote);
+
+function effectiveMaxWidth() {
+  const raw = els.optMaxWidth.value.trim();
+  if (!raw) return null;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+function effectiveTimeout() {
+  const raw = els.optTimeout.value.trim();
+  if (!raw) return null;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
 
 // Query-string fragment for the current DPI and page range. Also returns
 // the values so the render session can label stats honestly.
@@ -322,6 +372,15 @@ function renderOptionsQuery() {
     const quality = effectiveQuality();
     if (quality != null) q += `&quality=${quality}`;
   }
+  if (els.optGrayscale.checked) q += `&grayscale=1`;
+  const maxWidth = effectiveMaxWidth();
+  if (maxWidth != null) q += `&maxWidth=${maxWidth}`;
+  if (trackedChanges) q += `&trackedChanges=${trackedChanges}`;
+  if (els.optSkipHidden.checked) q += `&skipHidden=1`;
+  if (els.optUsedRange.checked) q += `&usedRange=1`;
+  if (els.optNotes.checked) q += `&notes=1`;
+  const timeout = effectiveTimeout();
+  if (timeout != null) q += `&timeout=${timeout}`;
   return { q, dpi, from, to };
 }
 
@@ -636,6 +695,7 @@ function onPageImage(page, tMs) {
   }
   const mime = page.format === "PAGE_IMAGE_FORMAT_JPEG" ? "image/jpeg"
       : page.format === "PAGE_IMAGE_FORMAT_WEBP" ? "image/webp"
+      : page.format === "PAGE_IMAGE_FORMAT_SVG" ? "image/svg+xml"
       : "image/png";
   const dataUrl = `data:${mime};base64,` + page.png;
   state.pages.push({

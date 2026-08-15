@@ -5,15 +5,20 @@ import ai.pipestream.office.v1.ConvertToPdfResponse;
 import ai.pipestream.office.v1.DocumentChunk;
 import ai.pipestream.office.v1.DocumentInfo;
 import ai.pipestream.office.v1.DocumentPart;
+import ai.pipestream.office.v1.FormFillValue;
 import ai.pipestream.office.v1.GetServiceInfoRequest;
 import ai.pipestream.office.v1.GetServiceInfoResponse;
 import ai.pipestream.office.v1.OfficeRenderServiceGrpc;
 import ai.pipestream.office.v1.PageImage;
 import ai.pipestream.office.v1.PageImageFormat;
+import ai.pipestream.office.v1.PageVectorFormat;
 import ai.pipestream.office.v1.RenderStatus;
 import ai.pipestream.office.v1.StreamOptions;
 import ai.pipestream.office.v1.StreamPagesRequest;
 import ai.pipestream.office.v1.StreamPagesResponse;
+import ai.pipestream.office.v1.TextSpan;
+import ai.pipestream.office.v1.ToDocumentResponse;
+import ai.pipestream.office.v1.TrackedChangeDisplay;
 import com.google.protobuf.ByteString;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
@@ -85,6 +90,10 @@ public final class OfficeClient {
                     pdf(channel, Path.of(args[1]),
                             Path.of(args.length > 2 ? args[2] : "out.pdf"));
                 }
+                case "todoc" -> {
+                    PagesFlags flags = parsePagesFlags(args);
+                    toDocument(channel, Path.of(flags.file), flags);
+                }
                 default -> usage();
             }
         } catch (StatusRuntimeException e) {
@@ -100,10 +109,15 @@ public final class OfficeClient {
 
     private static void usage() {
         System.err.println(
-                "usage: OfficeClient <info | pages <file> [outdir] [options] | pdf <file> [out.pdf]>");
+                "usage: OfficeClient <info | pages <file> [outdir] [options] | "
+                        + "pdf <file> [out.pdf] | todoc <file> [options]>");
         System.err.println(
                 "pages options: --dpi <n> --first-page <n> --last-page <n> "
-                        + "--format png|jpeg|webp --quality <n> --parts PAGES,PARAGRAPHS,...");
+                        + "--format png|jpeg|webp|svg --quality <n> --parts PAGES,PARAGRAPHS,... "
+                        + "--max-width <n> --grayscale --timeout <n> "
+                        + "--tracked-changes as-is|final|original|markup "
+                        + "--skip-hidden --used-range --notes --form NAME=VALUE "
+                        + "--redact START:END --repair");
         System.exit(2);
     }
 
@@ -117,6 +131,17 @@ public final class OfficeClient {
         PageImageFormat format = PageImageFormat.PAGE_IMAGE_FORMAT_UNSPECIFIED;
         int quality;
         final List<DocumentPart> parts = new ArrayList<>();
+        int maxWidth;
+        boolean grayscale;
+        int timeout;
+        TrackedChangeDisplay trackedChanges =
+                TrackedChangeDisplay.TRACKED_CHANGE_DISPLAY_UNSPECIFIED;
+        boolean skipHidden;
+        boolean usedRange;
+        boolean notes;
+        final List<FormFillValue> forms = new ArrayList<>();
+        final List<TextSpan> redacts = new ArrayList<>();
+        boolean repair;
     }
 
     private static int requirePositive(String flag, String raw) {
@@ -138,8 +163,9 @@ public final class OfficeClient {
             case "png" -> PageImageFormat.PAGE_IMAGE_FORMAT_PNG;
             case "jpeg", "jpg" -> PageImageFormat.PAGE_IMAGE_FORMAT_JPEG;
             case "webp" -> PageImageFormat.PAGE_IMAGE_FORMAT_WEBP;
+            case "svg" -> PageImageFormat.PAGE_IMAGE_FORMAT_SVG;
             default -> {
-                System.err.println("--format must be png, jpeg, or webp");
+                System.err.println("--format must be png, jpeg, webp, or svg");
                 System.exit(2);
                 yield PageImageFormat.PAGE_IMAGE_FORMAT_UNSPECIFIED;
             }
@@ -172,6 +198,52 @@ public final class OfficeClient {
         return parts;
     }
 
+    private static TrackedChangeDisplay parseTracked(String raw) {
+        return switch (raw.toLowerCase(Locale.ROOT)) {
+            case "as-is" -> TrackedChangeDisplay.TRACKED_CHANGE_DISPLAY_AS_IS;
+            case "final" -> TrackedChangeDisplay.TRACKED_CHANGE_DISPLAY_FINAL;
+            case "original" -> TrackedChangeDisplay.TRACKED_CHANGE_DISPLAY_ORIGINAL;
+            case "markup", "show-markup" ->
+                    TrackedChangeDisplay.TRACKED_CHANGE_DISPLAY_SHOW_MARKUP;
+            default -> {
+                System.err.println(
+                        "--tracked-changes must be as-is, final, original, or markup");
+                System.exit(2);
+                yield TrackedChangeDisplay.TRACKED_CHANGE_DISPLAY_UNSPECIFIED;
+            }
+        };
+    }
+
+    private static FormFillValue parseForm(String raw) {
+        int eq = raw.indexOf('=');
+        if (eq <= 0) {
+            System.err.println("--form needs NAME=VALUE");
+            System.exit(2);
+        }
+        return FormFillValue.newBuilder()
+                .setName(raw.substring(0, eq))
+                .setValue(raw.substring(eq + 1))
+                .build();
+    }
+
+    private static TextSpan parseRedact(String raw) {
+        int sep = raw.indexOf(':');
+        if (sep < 0) {
+            System.err.println("--redact needs START:END");
+            System.exit(2);
+        }
+        try {
+            return TextSpan.newBuilder()
+                    .setCharStart(Long.parseLong(raw.substring(0, sep)))
+                    .setCharEnd(Long.parseLong(raw.substring(sep + 1)))
+                    .build();
+        } catch (NumberFormatException e) {
+            System.err.println("--redact needs integer START:END");
+            System.exit(2);
+            return TextSpan.getDefaultInstance();
+        }
+    }
+
     private static PagesFlags parsePagesFlags(String[] args) {
         PagesFlags flags = new PagesFlags();
         List<String> positional = new ArrayList<>();
@@ -181,18 +253,32 @@ public final class OfficeClient {
                 positional.add(a);
                 continue;
             }
-            if (i + 1 >= args.length) {
-                usage();
-            }
-            String value = args[++i];
             switch (a) {
-                case "--dpi" -> flags.dpi = requirePositive(a, value);
-                case "--first-page" -> flags.firstPage = requirePositive(a, value);
-                case "--last-page" -> flags.lastPage = requirePositive(a, value);
-                case "--format" -> flags.format = parseFormat(value);
-                case "--quality" -> flags.quality = requirePositive(a, value);
-                case "--parts" -> flags.parts.addAll(parseParts(value));
-                default -> usage();
+                case "--grayscale" -> flags.grayscale = true;
+                case "--skip-hidden" -> flags.skipHidden = true;
+                case "--used-range" -> flags.usedRange = true;
+                case "--notes" -> flags.notes = true;
+                case "--repair" -> flags.repair = true;
+                default -> {
+                    if (i + 1 >= args.length) {
+                        usage();
+                    }
+                    String value = args[++i];
+                    switch (a) {
+                        case "--dpi" -> flags.dpi = requirePositive(a, value);
+                        case "--first-page" -> flags.firstPage = requirePositive(a, value);
+                        case "--last-page" -> flags.lastPage = requirePositive(a, value);
+                        case "--format" -> flags.format = parseFormat(value);
+                        case "--quality" -> flags.quality = requirePositive(a, value);
+                        case "--parts" -> flags.parts.addAll(parseParts(value));
+                        case "--max-width" -> flags.maxWidth = requirePositive(a, value);
+                        case "--timeout" -> flags.timeout = requirePositive(a, value);
+                        case "--tracked-changes" -> flags.trackedChanges = parseTracked(value);
+                        case "--form" -> flags.forms.add(parseForm(value));
+                        case "--redact" -> flags.redacts.add(parseRedact(value));
+                        default -> usage();
+                    }
+                }
             }
         }
         if (positional.isEmpty()) {
@@ -208,7 +294,12 @@ public final class OfficeClient {
     private static StreamOptions pagesOptions(PagesFlags flags) {
         if (flags.dpi <= 0 && flags.firstPage <= 0 && flags.lastPage <= 0
                 && flags.format == PageImageFormat.PAGE_IMAGE_FORMAT_UNSPECIFIED
-                && flags.quality <= 0 && flags.parts.isEmpty()) {
+                && flags.quality <= 0 && flags.parts.isEmpty()
+                && flags.maxWidth <= 0 && !flags.grayscale && flags.timeout <= 0
+                && flags.trackedChanges
+                    == TrackedChangeDisplay.TRACKED_CHANGE_DISPLAY_UNSPECIFIED
+                && !flags.skipHidden && !flags.usedRange && !flags.notes
+                && flags.forms.isEmpty() && flags.redacts.isEmpty()) {
             return null;
         }
         StreamOptions.Builder b = StreamOptions.newBuilder();
@@ -223,12 +314,43 @@ public final class OfficeClient {
         }
         if (flags.format != PageImageFormat.PAGE_IMAGE_FORMAT_UNSPECIFIED) {
             b.setPageFormat(flags.format);
+            if (flags.format == PageImageFormat.PAGE_IMAGE_FORMAT_SVG) {
+                b.setVectorFormat(PageVectorFormat.PAGE_VECTOR_FORMAT_SVG);
+            }
         }
         if (flags.quality > 0) {
             b.setPageQuality(flags.quality);
         }
         if (!flags.parts.isEmpty()) {
             b.addAllParts(flags.parts);
+        }
+        if (flags.maxWidth > 0) {
+            b.setMaxWidthPx(flags.maxWidth);
+        }
+        if (flags.grayscale) {
+            b.setGrayscale(true);
+        }
+        if (flags.timeout > 0) {
+            b.setTimeoutSeconds(flags.timeout);
+        }
+        if (flags.trackedChanges
+                != TrackedChangeDisplay.TRACKED_CHANGE_DISPLAY_UNSPECIFIED) {
+            b.setTrackedChanges(flags.trackedChanges);
+        }
+        if (flags.skipHidden) {
+            b.setSkipHidden(true);
+        }
+        if (flags.usedRange) {
+            b.setPaintUsedRange(true);
+        }
+        if (flags.notes) {
+            b.setIncludeNotesPages(true);
+        }
+        if (!flags.forms.isEmpty()) {
+            b.addAllFormValues(flags.forms);
+        }
+        if (!flags.redacts.isEmpty()) {
+            b.addAllRedactSpans(flags.redacts);
         }
         return b.build();
     }
@@ -237,6 +359,7 @@ public final class OfficeClient {
         return switch (format) {
             case PAGE_IMAGE_FORMAT_JPEG -> "jpg";
             case PAGE_IMAGE_FORMAT_WEBP -> "webp";
+            case PAGE_IMAGE_FORMAT_SVG -> "svg";
             default -> "png";
         };
     }
@@ -245,6 +368,7 @@ public final class OfficeClient {
         return switch (format) {
             case PAGE_IMAGE_FORMAT_JPEG -> "jpeg";
             case PAGE_IMAGE_FORMAT_WEBP -> "webp";
+            case PAGE_IMAGE_FORMAT_SVG -> "svg";
             default -> "png";
         };
     }
@@ -259,6 +383,8 @@ public final class OfficeClient {
         System.out.printf("max concurrent docs : %d%n", resp.getMaxConcurrentDocuments());
         System.out.printf("render dpi          : %d%n", resp.getRenderDpi());
         System.out.printf("typed content       : %b%n", resp.getTypedContent());
+        System.out.printf("document mapping    : %b%n", resp.getDocumentMapping());
+        System.out.printf("package repair      : %b%n", resp.getPackageRepair());
         System.out.printf("diskless documents  : %b%n", resp.getDisklessDocuments());
         System.out.printf("supported formats   : %s%n",
                 String.join(", ", resp.getSupportedFormatsList()));
@@ -326,6 +452,42 @@ public final class OfficeClient {
             // the upload stream, so they must ride the first chunk.
             if (first && options != null) {
                 req.setOptions(options);
+            }
+            if (first && flags.repair) {
+                req.setAllowPackageRepair(true);
+            }
+            return req.build();
+        });
+        state.awaitDone();
+    }
+
+    private static void toDocument(ManagedChannel channel, Path file, PagesFlags flags)
+            throws IOException, InterruptedException {
+        long t0 = System.nanoTime();
+        StreamOptions options = pagesOptions(flags);
+        CallState state = new CallState();
+        StreamObserver<StreamPagesRequest> upload =
+                OfficeRenderServiceGrpc.newStub(channel).toDocument(
+                        state.observer((ToDocumentResponse resp) -> {
+                            printDocumentInfo(resp.getDocumentInfo());
+                            var doc = resp.getDocument();
+                            System.out.printf("texts       : %d%n", doc.getTextsCount());
+                            System.out.printf("pictures    : %d%n", doc.getPicturesCount());
+                            System.out.printf("tables      : %d%n", doc.getTablesCount());
+                            System.out.printf("pages       : %d%n", doc.getPagesCount());
+                            if (resp.hasStatus()) {
+                                System.out.println();
+                                printRenderStatus(resp.getStatus(),
+                                        (System.nanoTime() - t0) / 1_000_000);
+                            }
+                        }));
+        streamDocument(file, upload, (chunk, first) -> {
+            StreamPagesRequest.Builder req = StreamPagesRequest.newBuilder().setChunk(chunk);
+            if (first && options != null) {
+                req.setOptions(options);
+            }
+            if (first && flags.repair) {
+                req.setAllowPackageRepair(true);
             }
             return req.build();
         });

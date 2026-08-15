@@ -8,5 +8,6 @@ mkdir -p gen
   -I "$PROTO_DIR" \
   --python_out=gen \
   --grpc_python_out=gen \
+  "$PROTO_DIR/ai/pipestream/document/v1/document.proto" \
   "$PROTO_DIR/ai/pipestream/office/v1/office_service.proto"
 echo "stubs written to $(pwd)/gen"

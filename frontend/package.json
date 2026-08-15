@@ -5,9 +5,19 @@
   "description": "Demo web frontend + Node BFF for the grlibre LibreOffice render service",
   "type": "module",
   "main": "server.mjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "server.mjs",
+    "lib",
+    "public"
+  ],
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test \"test/**/*.test.mjs\""
+    "check": "node --check server.mjs && node --check lib/options.mjs && node --check lib/overlay.mjs && node --check public/app.js && node --check test/bff.test.mjs && node --check test/options.test.mjs && node --check test/overlay.test.mjs",
+    "test": "node --test \"test/**/*.test.mjs\"",
+    "test:unit": "node --test test/options.test.mjs test/overlay.test.mjs"
   },
   "dependencies": {
     "@grpc/grpc-js": "^1.12.0",
