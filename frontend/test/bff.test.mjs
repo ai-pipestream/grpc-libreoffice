@@ -9,6 +9,7 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
+import { expectedPagePixels, boxInsidePage } from "../lib/overlay.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER = path.join(__dirname, "..", "server.mjs");
@@ -63,6 +64,23 @@ async function renderEvents(file, filename, query = "") {
   return text.trim().split("\n").map((l) => JSON.parse(l));
 }
 
+test("GET / serves the SPA and static assets with the right MIME", async () => {
+  const html = await fetch(`${base}/`);
+  assert.strictEqual(html.status, 200);
+  assert.match(html.headers.get("content-type"), /text\/html/);
+  const body = await html.text();
+  assert.match(body, /grlibre/);
+  assert.match(body, /opt-grayscale/);
+
+  const js = await fetch(`${base}/app.js`);
+  assert.strictEqual(js.status, 200);
+  assert.match(js.headers.get("content-type"), /javascript/);
+
+  const css = await fetch(`${base}/style.css`);
+  assert.strictEqual(css.status, 200);
+  assert.match(css.headers.get("content-type"), /text\/css/);
+});
+
 test("GET /api/info reports service capabilities", async () => {
   const resp = await fetch(`${base}/api/info`);
   assert.strictEqual(resp.status, 200);
@@ -73,6 +91,8 @@ test("GET /api/info reports service capabilities", async () => {
   assert.ok(info.supportedFormats.includes("docx"));
   assert.ok(Number(info.maxDocumentBytes) > 0);
   assert.strictEqual(typeof info.typedContent, "boolean");
+  assert.strictEqual(info.documentMapping, true);
+  assert.strictEqual(info.packageRepair, true);
 });
 
 test("POST /api/render streams ordered NDJSON for sample3.docx", async () => {
@@ -270,6 +290,140 @@ test("spreadsheet render emits sheet and sheetRow events", async () => {
   assert.ok(events.some((e) => e.event === "sheetRow"));
 });
 
+test("grayscale=1 still emits PNG page images", async () => {
+  const events = await renderEvents(
+    DOCX, "sample3.docx", "&parts=PAGES&grayscale=1");
+  const pages = events.filter((e) => e.event === "pageImage");
+  assert.ok(pages.length >= 1);
+  const png = Buffer.from(pages[0].data.png, "base64");
+  assert.strictEqual(png.subarray(0, 4).toString("binary"), "\x89PNG");
+});
+
+test("format=svg emits SVG page images", async () => {
+  const events = await renderEvents(
+    DOCX, "sample3.docx", "&parts=PAGES&format=svg");
+  const pages = events.filter((e) => e.event === "pageImage");
+  assert.ok(pages.length >= 1);
+  assert.strictEqual(pages[0].data.format, "PAGE_IMAGE_FORMAT_SVG");
+  const svg = Buffer.from(pages[0].data.png, "base64").toString("utf8");
+  assert.match(svg, /<svg/);
+});
+
+test("maxWidth=200 bounds the painted page width", async () => {
+  const events = await renderEvents(
+    DOCX, "sample3.docx", "&parts=PAGES&maxWidth=200");
+  const pages = events.filter((e) => e.event === "pageImage");
+  assert.ok(pages.length >= 1);
+  assert.ok(pages[0].data.widthPx > 0 && pages[0].data.widthPx <= 200,
+    `width ${pages[0].data.widthPx} must fit in 200px`);
+});
+
+test("start event echoes skipHidden, usedRange, notes, timeout, trackedChanges", async () => {
+  const events = await renderEvents(
+    DOCX, "sample3.docx",
+    "&parts=PAGES&skipHidden=1&usedRange=1&notes=1&timeout=45&trackedChanges=final");
+  const start = events[0];
+  assert.strictEqual(start.event, "start");
+  assert.strictEqual(start.data.skipHidden, true);
+  assert.strictEqual(start.data.usedRange, true);
+  assert.strictEqual(start.data.notes, true);
+  assert.strictEqual(start.data.timeout, 45);
+  assert.strictEqual(start.data.trackedChanges, "TRACKED_CHANGE_DISPLAY_FINAL");
+  assert.strictEqual(events[events.length - 2].event, "status");
+});
+
+test("pageRect twips scaled by dpi/1440 match painted pixels", async () => {
+  const events = await renderEvents(
+    DOCX, "sample3.docx", "&parts=PAGES,PARAGRAPHS,LINE_RECTS");
+  const info = events.find((e) => e.event === "documentInfo").data;
+  const pages = events.filter((e) => e.event === "pageImage");
+  assert.ok(pages.length >= 1);
+  for (const p of pages) {
+    const rect = info.pageRects[p.data.index];
+    assert.ok(rect, `page ${p.data.index} has a pageRect`);
+    const expect = expectedPagePixels(rect, p.data.dpi);
+    assert.ok(Math.abs(p.data.widthPx - expect.width) <= 1,
+      `page ${p.data.index} width ${p.data.widthPx} vs expected ${expect.width}`);
+    assert.ok(Math.abs(p.data.heightPx - expect.height) <= 1,
+      `page ${p.data.index} height ${p.data.heightPx} vs expected ${expect.height}`);
+  }
+  const withRects = events.filter(
+    (e) => e.event === "paragraph" && (e.data.lineRects || []).length > 0);
+  assert.ok(withRects.length > 0, "lineRects present for overlay check");
+  for (const e of withRects) {
+    for (const box of e.data.lineRects) {
+      const rect = info.pageRects[box.pageIndex];
+      if (!rect) continue;
+      assert.ok(boxInsidePage(box, rect),
+        `line box on page ${box.pageIndex} stays inside its pageRect`);
+    }
+  }
+});
+
+test("non-numeric timeout and maxWidth are rejected with HTTP 400", async () => {
+  for (const [qs, needle] of [
+    ["timeout=abc", /invalid timeout/],
+    ["maxWidth=-4", /invalid maxWidth/],
+  ]) {
+    const resp = await fetch(
+      `${base}/api/render?filename=sample3.docx&${qs}`,
+      { method: "POST", body: fs.readFileSync(DOCX) });
+    assert.strictEqual(resp.status, 400, qs);
+    const payload = await resp.json();
+    assert.match(payload.error.message, needle);
+  }
+});
+
+test("unknown trackedChanges value is rejected with HTTP 400", async () => {
+  const resp = await fetch(
+    `${base}/api/render?filename=sample3.docx&trackedChanges=bogus`,
+    { method: "POST", body: fs.readFileSync(DOCX) });
+  assert.strictEqual(resp.status, 400);
+  const payload = await resp.json();
+  assert.match(payload.error.message, /unknown trackedChanges/);
+});
+
+test("non-boolean grayscale is rejected with HTTP 400", async () => {
+  const resp = await fetch(
+    `${base}/api/render?filename=sample3.docx&grayscale=maybe`,
+    { method: "POST", body: fs.readFileSync(DOCX) });
+  assert.strictEqual(resp.status, 400);
+  const payload = await resp.json();
+  assert.match(payload.error.message, /invalid grayscale/);
+});
+
+test("POST /api/document returns a mapped Document", async () => {
+  const resp = await fetch(
+    `${base}/api/document?filename=sample3.docx&parts=PARAGRAPHS`,
+    { method: "POST", body: fs.readFileSync(DOCX) });
+  assert.strictEqual(resp.status, 200);
+  const body = await resp.json();
+  assert.ok(body.document);
+  assert.ok(body.documentInfo);
+  assert.strictEqual(body.documentInfo.sourceFormat, "docx");
+});
+
+test("POST /api/document with default parts embeds no page images", async () => {
+  const resp = await fetch(
+    `${base}/api/document?filename=sample3.docx`,
+    { method: "POST", body: fs.readFileSync(DOCX) });
+  assert.strictEqual(resp.status, 200);
+  const body = await resp.json();
+  assert.ok(body.document.texts?.length > 0, "typed content still mapped");
+  for (const page of Object.values(body.document.pages ?? {})) {
+    assert.ok(!page.image?.uri, "no page image data URIs by default");
+  }
+});
+
+test("POST /api/document unknown format is HTTP 400", async () => {
+  const resp = await fetch(
+    `${base}/api/document?filename=nope.zzz-not-a-format`,
+    { method: "POST", body: Buffer.from("garbage") });
+  assert.strictEqual(resp.status, 400);
+  const payload = await resp.json();
+  assert.strictEqual(payload.error.codeName, "INVALID_ARGUMENT");
+});
+
 test("POST /api/pdf returns a PDF (magic bytes)", async () => {
   const resp = await fetch(
     `${base}/api/pdf?filename=sample3.docx`,
@@ -279,6 +433,15 @@ test("POST /api/pdf returns a PDF (magic bytes)", async () => {
   const bytes = Buffer.from(await resp.arrayBuffer());
   assert.strictEqual(bytes.subarray(0, 4).toString(), "%PDF");
   assert.ok(bytes.length > 1000);
+});
+
+test("POST /api/pdf?firstPage=1&lastPage=1 still returns a PDF", async () => {
+  const resp = await fetch(
+    `${base}/api/pdf?filename=sample3.docx&firstPage=1&lastPage=1`,
+    { method: "POST", body: fs.readFileSync(DOCX) });
+  assert.strictEqual(resp.status, 200);
+  const bytes = Buffer.from(await resp.arrayBuffer());
+  assert.strictEqual(bytes.subarray(0, 4).toString(), "%PDF");
 });
 
 test("unknown extension: render yields NDJSON INVALID_ARGUMENT", async () => {

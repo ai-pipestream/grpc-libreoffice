@@ -4,10 +4,13 @@
 #include <linux/magic.h>
 #include <sys/vfs.h>
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <set>
@@ -78,6 +81,232 @@ grlibre::WorkerOutcome run(const std::string& mode, const std::string& extension
                            const std::string& document,
                            std::vector<std::string>* payloads) {
   return run_with_parts(mode, extension, document, "all", payloads);
+}
+
+// Runs the worker with per-request StreamOptions staged as options.pb in
+// the work dir, the way the service hands extras to the worker.
+grlibre::WorkerOutcome run_with_extras(const std::string& mode,
+                                       const std::string& extension,
+                                       const std::string& document,
+                                       const officev1::StreamOptions& extras,
+                                       std::vector<std::string>* payloads,
+                                       const std::string& parts_token = "all") {
+  std::string work_dir = make_work_dir();
+  {
+    std::ofstream out(work_dir + "/options.pb", std::ios::binary);
+    require(extras.SerializeToOstream(&out), "extras serialize");
+  }
+  std::vector<std::string> argv = {
+      worker_path(), mode, extension, "96", "2048",
+      work_dir, lo_install_path(), parts_token};
+  grlibre::WorkerOutcome outcome = grlibre::run_worker(
+      argv, document, std::chrono::milliseconds(120000), 256u * 1024 * 1024,
+      [&](std::string&& payload) {
+        payloads->push_back(std::move(payload));
+        return true;
+      });
+  std::error_code ignored;
+  std::filesystem::remove_all(work_dir, ignored);
+  return outcome;
+}
+
+// Folds a pages-mode payload list into its typed pieces.
+struct PagesRun {
+  officev1::DocumentInfo info;
+  std::vector<officev1::PageImage> pages;
+  std::vector<officev1::Paragraph> paragraphs;
+  officev1::RenderStatus status;
+  bool got_status = false;
+};
+
+PagesRun fold_pages(const std::vector<std::string>& payloads) {
+  PagesRun run;
+  for (const std::string& payload : payloads) {
+    officev1::StreamPagesResponse event;
+    require(event.ParseFromString(payload), "pages event parses");
+    if (event.has_document_info()) run.info = event.document_info();
+    if (event.has_page_image()) run.pages.push_back(event.page_image());
+    if (event.has_paragraph()) run.paragraphs.push_back(event.paragraph());
+    if (event.has_status()) {
+      run.status = event.status();
+      run.got_status = true;
+    }
+  }
+  return run;
+}
+
+// Concatenates a pdf-mode payload list into the PDF bytes.
+std::string fold_pdf(const std::vector<std::string>& payloads) {
+  std::string pdf;
+  for (const std::string& payload : payloads) {
+    officev1::ConvertToPdfResponse event;
+    require(event.ParseFromString(payload), "pdf event parses");
+    if (event.has_pdf_chunk()) pdf += event.pdf_chunk().data();
+  }
+  return pdf;
+}
+
+// Rasterizes a PDF with pdftoppm into a scratch dir and returns one P6
+// PPM byte buffer per page. Requires poppler-utils, present in CI and the
+// dev image alongside soffice.
+std::vector<std::string> rasterize_pdf(const std::string& pdf) {
+  std::string work_dir = make_work_dir();
+  {
+    std::ofstream out(work_dir + "/doc.pdf", std::ios::binary);
+    out.write(pdf.data(), static_cast<std::streamsize>(pdf.size()));
+  }
+  std::string command = "pdftoppm -r 100 '" + work_dir + "/doc.pdf' '"
+      + work_dir + "/page' >/dev/null 2>&1";
+  require(std::system(command.c_str()) == 0, "pdftoppm runs");
+  std::vector<std::string> names;
+  for (const auto& entry : std::filesystem::directory_iterator(work_dir)) {
+    if (entry.path().extension() == ".ppm") names.push_back(entry.path());
+  }
+  std::sort(names.begin(), names.end());
+  std::vector<std::string> pages;
+  for (const std::string& name : names) {
+    std::ifstream in(name, std::ios::binary);
+    pages.emplace_back(std::istreambuf_iterator<char>(in),
+                       std::istreambuf_iterator<char>());
+  }
+  std::error_code ignored;
+  std::filesystem::remove_all(work_dir, ignored);
+  return pages;
+}
+
+// The longest horizontal run of near-black pixels in a P6 PPM. Text
+// glyph strokes stay short; only a filled redaction box produces a long
+// run.
+int longest_black_run(const std::string& ppm) {
+  size_t pos = 0;
+  auto token = [&]() {
+    while (pos < ppm.size() && std::isspace(static_cast<unsigned char>(ppm[pos]))) pos++;
+    size_t start = pos;
+    while (pos < ppm.size() && !std::isspace(static_cast<unsigned char>(ppm[pos]))) pos++;
+    return ppm.substr(start, pos - start);
+  };
+  require(token() == "P6", "ppm magic");
+  const int width = std::atoi(token().c_str());
+  const int height = std::atoi(token().c_str());
+  require(token() == "255", "ppm depth");
+  pos++;  // The single whitespace byte after the header.
+  require(ppm.size() - pos >= static_cast<size_t>(width) * height * 3,
+          "ppm payload complete");
+  int longest = 0;
+  for (int y = 0; y < height; y++) {
+    int current = 0;
+    for (int x = 0; x < width; x++) {
+      const unsigned char* p = reinterpret_cast<const unsigned char*>(
+          ppm.data() + pos + (static_cast<size_t>(y) * width + x) * 3);
+      const bool black = p[0] < 40 && p[1] < 40 && p[2] < 40;
+      current = black ? current + 1 : 0;
+      if (current > longest) longest = current;
+    }
+  }
+  return longest;
+}
+
+// Flat-ODF fixtures: text-based stand-ins for real uploads, exercising
+// sheet visibility, used ranges, notes pages, and tracked changes without
+// binary blobs.
+constexpr char kTwoSheetFods[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+ office:version="1.2"
+ office:mimetype="application/vnd.oasis.opendocument.spreadsheet">
+ <office:automatic-styles>
+  <style:style style:name="taShown" style:family="table">
+   <style:table-properties table:display="true"/>
+  </style:style>
+  <style:style style:name="taHidden" style:family="table">
+   <style:table-properties table:display="false"/>
+  </style:style>
+ </office:automatic-styles>
+ <office:body>
+  <office:spreadsheet>
+   <table:table table:name="Shown" table:style-name="taShown">
+    <table:table-column table:number-columns-repeated="4"/>
+    <table:table-row table:number-rows-repeated="4">
+     <table:table-cell table:number-columns-repeated="4"/>
+    </table:table-row>
+    <table:table-row>
+     <table:table-cell table:number-columns-repeated="2"/>
+     <table:table-cell office:value-type="string"><text:p>offset data</text:p></table:table-cell>
+    </table:table-row>
+   </table:table>
+   <table:table table:name="Hidden" table:style-name="taHidden">
+    <table:table-row>
+     <table:table-cell office:value-type="string"><text:p>hidden data</text:p></table:table-cell>
+    </table:table-row>
+   </table:table>
+  </office:spreadsheet>
+ </office:body>
+</office:document>
+)";
+
+constexpr char kNotesFodp[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ office:version="1.2"
+ office:mimetype="application/vnd.oasis.opendocument.presentation">
+ <office:body>
+  <office:presentation>
+   <draw:page draw:name="page1">
+    <draw:frame draw:layer="layout" svg:width="10cm" svg:height="2cm"
+     svg:x="1cm" svg:y="1cm">
+     <draw:text-box><text:p>Slide one</text:p></draw:text-box>
+    </draw:frame>
+    <presentation:notes>
+     <draw:frame presentation:class="notes" svg:width="10cm" svg:height="5cm"
+      svg:x="1cm" svg:y="1cm">
+      <draw:text-box><text:p>Speaker notes here</text:p></draw:text-box>
+     </draw:frame>
+    </presentation:notes>
+   </draw:page>
+  </office:presentation>
+ </office:body>
+</office:document>
+)";
+
+constexpr char kTrackedChangeFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ office:version="1.2"
+ office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:body>
+  <office:text>
+   <text:tracked-changes>
+    <text:changed-region xml:id="ct1" text:id="ct1">
+     <text:insertion>
+      <office:change-info>
+       <dc:creator>Tester</dc:creator>
+       <dc:date>2024-01-01T00:00:00</dc:date>
+      </office:change-info>
+     </text:insertion>
+    </text:changed-region>
+   </text:tracked-changes>
+   <text:p>Alpha <text:change-start text:change-id="ct1"/>INSERTED <text:change-end text:change-id="ct1"/>omega.</text:p>
+  </office:text>
+ </office:body>
+</office:document>
+)";
+
+// The joined run text of every extracted paragraph.
+std::string all_paragraph_text(const PagesRun& run) {
+  std::string text;
+  for (const officev1::Paragraph& paragraph : run.paragraphs) {
+    for (const officev1::TextRun& text_run : paragraph.runs()) {
+      text += text_run.text();
+    }
+    text += "\n";
+  }
+  return text;
 }
 
 void verify_text_pages() {
@@ -1805,8 +2034,8 @@ void verify_broken_package_needs_repair_opt_in() {
     std::error_code ignored;
     std::filesystem::remove_all(work_dir, ignored);
   }
-  // Opted in: this version does not implement the repair interaction, so
-  // the load still fails, loudly, and never repairs silently.
+  // Opted in: the worker retries with RepairPackage=true. A package this
+  // truncated may still fail to load; it must never report unimplemented.
   {
     std::string work_dir = make_work_dir();
     std::vector<std::string> payloads;
@@ -1819,9 +2048,13 @@ void verify_broken_package_needs_repair_opt_in() {
           payloads.push_back(std::move(payload));
           return true;
         });
-    require(outcome.kind == grlibre::WorkerOutcome::Kind::kRepairUnimplemented,
-            "opted-in repair is reported unimplemented, got detail: " + outcome.detail);
-    require(payloads.empty(), "unimplemented repair emits no frames");
+    require(outcome.kind != grlibre::WorkerOutcome::Kind::kRepairUnimplemented,
+            "opted-in repair is no longer unimplemented, got detail: "
+                + outcome.detail);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk
+                || outcome.kind == grlibre::WorkerOutcome::Kind::kLoadFailure,
+            "opted-in repair either loads or fails as a load error, got detail: "
+                + outcome.detail);
     std::error_code ignored;
     std::filesystem::remove_all(work_dir, ignored);
   }
@@ -1939,6 +2172,286 @@ void verify_eof_without_exit_is_reaped() {
 
 }  // namespace
 
+// The per-request extras that ride options.pb: fit-to-width, grayscale,
+// and the SVG vector format, each against a plain text upload.
+void verify_stream_option_extras() {
+  const std::string doc = "Hello from the extras render.\n";
+  {
+    officev1::StreamOptions extras;
+    extras.set_max_width_px(200);
+    std::vector<std::string> payloads;
+    auto outcome = run_with_extras("pages", "txt", doc, extras, &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "max_width render ok: " + outcome.detail);
+    PagesRun run = fold_pages(payloads);
+    require(!run.pages.empty(), "max_width page painted");
+    require(run.pages[0].width_px() > 0 && run.pages[0].width_px() <= 200,
+            "max_width_px bounds the page width");
+    require(run.pages[0].dpi() >= 1 && run.pages[0].dpi() < 96,
+            "fit-to-width derives a smaller effective dpi");
+  }
+  {
+    officev1::StreamOptions extras;
+    extras.set_grayscale(true);
+    std::vector<std::string> payloads;
+    auto outcome = run_with_extras("pages", "txt", doc, extras, &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "grayscale render ok: " + outcome.detail);
+    PagesRun run = fold_pages(payloads);
+    require(!run.pages.empty(), "grayscale page painted");
+    require(run.pages[0].png().rfind("\x89PNG", 0) == 0,
+            "grayscale page still encodes PNG");
+  }
+  {
+    officev1::StreamOptions extras;
+    extras.set_vector_format(officev1::PAGE_VECTOR_FORMAT_SVG);
+    std::vector<std::string> payloads;
+    auto outcome = run_with_extras("pages", "txt", doc, extras, &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "svg render ok: " + outcome.detail);
+    PagesRun run = fold_pages(payloads);
+    require(!run.pages.empty(), "svg page emitted");
+    require(run.pages[0].format() == officev1::PAGE_IMAGE_FORMAT_SVG,
+            "svg page format named");
+    require(run.pages[0].png().find("<svg") != std::string::npos,
+            "svg payload carries an <svg tag");
+  }
+  {
+    // PAGE_VECTOR_FORMAT_NONE forces raster even when page_format names
+    // SVG; the implied-SVG mapping must not override the explicit NONE.
+    officev1::StreamOptions extras;
+    extras.set_vector_format(officev1::PAGE_VECTOR_FORMAT_NONE);
+    extras.set_page_format(officev1::PAGE_IMAGE_FORMAT_SVG);
+    std::vector<std::string> payloads;
+    auto outcome = run_with_extras("pages", "txt", doc, extras, &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "vector none render ok: " + outcome.detail);
+    PagesRun run = fold_pages(payloads);
+    require(!run.pages.empty(), "vector none page painted");
+    require(run.pages[0].format() != officev1::PAGE_IMAGE_FORMAT_SVG,
+            "explicit NONE keeps raster despite page_format SVG");
+    require(run.pages[0].png().rfind("\x89PNG", 0) == 0,
+            "vector none page is PNG");
+  }
+}
+
+// The all-but-pages parts token, ToDocument's default: typed content
+// streams, page images do not.
+void verify_all_but_pages_token() {
+  std::vector<std::string> payloads;
+  auto outcome = run_with_parts("pages", "txt", "Text without page images.\n",
+                                "all-but-pages", &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "all-but-pages renders ok: " + outcome.detail);
+  PagesRun run = fold_pages(payloads);
+  require(run.pages.empty(), "all-but-pages emits no page images");
+  require(!run.paragraphs.empty(), "all-but-pages still emits paragraphs");
+  require(run.info.page_count() >= 1, "page count still reported");
+  require(run.got_status && run.status.state() == officev1::RenderStatus::STATE_OK,
+          "all-but-pages status ok");
+}
+
+// Redaction on page images: a span in the middle of the text must change
+// the painted page. Guards the span-overlap fix; the old fallback only
+// looked at a paragraph's first character.
+void verify_redact_spans_change_pages() {
+  const std::string doc =
+      "First line of the document.\n"
+      "Second line holds the SECRET-VALUE to hide.\n"
+      "Third line stays visible.\n";
+  std::vector<std::string> baseline_payloads;
+  auto baseline_outcome =
+      run_with_parts("pages", "txt", doc, "1", &baseline_payloads);
+  require(baseline_outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "baseline render ok: " + baseline_outcome.detail);
+  PagesRun baseline = fold_pages(baseline_payloads);
+  require(!baseline.pages.empty(), "baseline page painted");
+
+  officev1::StreamOptions extras;
+  officev1::TextSpan* span = extras.add_redact_spans();
+  // Inside the second paragraph, nowhere near a paragraph start.
+  const std::string flat =
+      "First line of the document.Second line holds the SECRET-VALUE";
+  span->set_char_start(static_cast<int64_t>(flat.find("SECRET-VALUE")));
+  span->set_char_end(span->char_start() + 12);
+  std::vector<std::string> payloads;
+  auto outcome = run_with_extras("pages", "txt", doc, extras, &payloads, "1");
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "redacted render ok: " + outcome.detail);
+  PagesRun redacted = fold_pages(payloads);
+  require(!redacted.pages.empty(), "redacted page painted");
+  require(redacted.pages[0].png() != baseline.pages[0].png(),
+          "mid-paragraph redact span changes the painted page");
+}
+
+// Redaction on PDF export: the exported page must carry a filled black
+// box where the text was. Glyph strokes never produce a long horizontal
+// black run; a redaction rectangle does.
+void verify_pdf_redaction_paints_black_box() {
+  const std::string doc = "Hello over gRPC, this line gets redacted.\n";
+  std::vector<std::string> baseline_payloads;
+  auto baseline_outcome = run("pdf", "txt", doc, &baseline_payloads);
+  require(baseline_outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "baseline pdf ok: " + baseline_outcome.detail);
+  std::vector<std::string> baseline_pages =
+      rasterize_pdf(fold_pdf(baseline_payloads));
+  require(!baseline_pages.empty(), "baseline pdf rasterizes");
+  require(longest_black_run(baseline_pages[0]) < 50,
+          "un-redacted pdf has no long black run");
+
+  officev1::StreamOptions extras;
+  officev1::TextSpan* span = extras.add_redact_spans();
+  span->set_char_start(0);
+  span->set_char_end(5);
+  std::vector<std::string> payloads;
+  auto outcome = run_with_extras("pdf", "txt", doc, extras, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "redacted pdf ok: " + outcome.detail);
+  std::vector<std::string> pages = rasterize_pdf(fold_pdf(payloads));
+  require(!pages.empty(), "redacted pdf rasterizes");
+  require(longest_black_run(pages[0]) >= 50,
+          "redacted pdf carries a filled black box");
+}
+
+// The PDF page range: a multi-page document exported 1:1 yields exactly
+// one page.
+void verify_pdf_page_range() {
+  std::string doc;
+  for (int line = 0; line < 200; line++) {
+    doc += "Line " + std::to_string(line) + " pads the document out.\n";
+  }
+  std::vector<std::string> full_payloads;
+  auto full_outcome = run("pdf", "txt", doc, &full_payloads);
+  require(full_outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "full pdf ok: " + full_outcome.detail);
+  std::vector<std::string> full_pages = rasterize_pdf(fold_pdf(full_payloads));
+  require(full_pages.size() >= 2, "padded document spans multiple pages");
+
+  officev1::StreamOptions extras;
+  extras.set_first_page(1);
+  extras.set_last_page(1);
+  std::vector<std::string> payloads;
+  auto outcome = run_with_extras("pdf", "txt", doc, extras, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "ranged pdf ok: " + outcome.detail);
+  std::vector<std::string> pages = rasterize_pdf(fold_pdf(payloads));
+  require(pages.size() == 1, "1:1 range exports exactly one page, got "
+                                 + std::to_string(pages.size()));
+}
+
+// Sheet visibility and used-range cropping on a flat ODS with a hidden
+// second sheet and data away from A1.
+void verify_sheet_visibility_and_used_range() {
+  const std::string doc = kTwoSheetFods;
+  std::vector<std::string> default_payloads;
+  auto default_outcome = run("pages", "fods", doc, &default_payloads);
+  require(default_outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "fods renders ok: " + default_outcome.detail);
+  PagesRun everything = fold_pages(default_payloads);
+  require(everything.info.page_count() == 2, "both sheets are pages");
+
+  {
+    officev1::StreamOptions extras;
+    extras.set_skip_hidden(true);
+    std::vector<std::string> payloads;
+    auto outcome = run_with_extras("pages", "fods", doc, extras, &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "skip_hidden renders ok: " + outcome.detail);
+    PagesRun run = fold_pages(payloads);
+    require(run.info.page_count() == 1, "hidden sheet dropped from pages");
+    require(run.pages.size() == 1, "one page image painted");
+  }
+  {
+    officev1::StreamOptions extras;
+    extras.set_paint_used_range(true);
+    std::vector<std::string> payloads;
+    auto outcome = run_with_extras("pages", "fods", doc, extras, &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "used range renders ok: " + outcome.detail);
+    PagesRun run = fold_pages(payloads);
+    require(!run.info.page_rects().empty(), "used-range page rect present");
+    // Data sits at C5, so the crop's origin must shift right and down
+    // past the empty leading columns and rows.
+    require(run.info.page_rects(0).x_twips() > 0,
+            "used range shifts the crop origin right");
+    require(run.info.page_rects(0).y_twips() > 0,
+            "used range shifts the crop origin down");
+    require(run.info.page_rects(0).width_twips()
+                < everything.info.page_rects(0).width_twips(),
+            "used range narrows the painted sheet");
+  }
+}
+
+// Notes pages ride behind their slides as extra page images.
+void verify_notes_pages() {
+  const std::string doc = kNotesFodp;
+  std::vector<std::string> default_payloads;
+  auto default_outcome = run("pages", "fodp", doc, &default_payloads);
+  require(default_outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "fodp renders ok: " + default_outcome.detail);
+  PagesRun slides_only = fold_pages(default_payloads);
+  require(slides_only.info.page_count() == 1, "one slide by default");
+
+  officev1::StreamOptions extras;
+  extras.set_include_notes_pages(true);
+  std::vector<std::string> payloads;
+  auto outcome = run_with_extras("pages", "fodp", doc, extras, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "notes render ok: " + outcome.detail);
+  PagesRun run = fold_pages(payloads);
+  require(run.info.page_count() == 2, "slide plus its notes page");
+  require(run.pages.size() == 2, "both pages painted");
+  require(run.pages[0].png() != run.pages[1].png(),
+          "notes page differs from its slide");
+}
+
+// Tracked-change display resolves before extraction: FINAL keeps the
+// tracked insertion, ORIGINAL rejects it.
+void verify_tracked_change_display() {
+  const std::string doc = kTrackedChangeFodt;
+  {
+    officev1::StreamOptions extras;
+    extras.set_tracked_changes(officev1::TRACKED_CHANGE_DISPLAY_FINAL);
+    std::vector<std::string> payloads;
+    auto outcome = run_with_extras("pages", "fodt", doc, extras, &payloads, "3");
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "final display renders ok: " + outcome.detail);
+    std::string text = all_paragraph_text(fold_pages(payloads));
+    require(text.find("INSERTED") != std::string::npos,
+            "FINAL keeps the tracked insertion");
+  }
+  {
+    officev1::StreamOptions extras;
+    extras.set_tracked_changes(officev1::TRACKED_CHANGE_DISPLAY_ORIGINAL);
+    std::vector<std::string> payloads;
+    auto outcome = run_with_extras("pages", "fodt", doc, extras, &payloads, "3");
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "original display renders ok: " + outcome.detail);
+    std::string text = all_paragraph_text(fold_pages(payloads));
+    require(text.find("INSERTED") == std::string::npos,
+            "ORIGINAL rejects the tracked insertion");
+    require(text.find("Alpha") != std::string::npos,
+            "ORIGINAL keeps the stored text");
+  }
+}
+
+// Form values naming no existing field must degrade to nothing: same
+// render, no crash, status still OK.
+void verify_unknown_form_value_is_harmless() {
+  officev1::StreamOptions extras;
+  officev1::FormFillValue* value = extras.add_form_values();
+  value->set_name("no-such-field");
+  value->set_value("ignored");
+  std::vector<std::string> payloads;
+  auto outcome = run_with_extras("pages", "txt", "No form fields here.\n",
+                                 extras, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "unknown form value renders ok: " + outcome.detail);
+  PagesRun run = fold_pages(payloads);
+  require(run.got_status && run.status.state() == officev1::RenderStatus::STATE_OK,
+          "unknown form value keeps status ok");
+}
+
 int main() {
   if (!std::filesystem::exists(lo_install_path())) {
     std::cerr << "SKIP: no LibreOffice at " << lo_install_path() << "\n";
@@ -1963,6 +2476,15 @@ int main() {
   verify_corrupt_zip_is_load_failure();
   verify_broken_package_needs_repair_opt_in();
   verify_html_renders_and_exits_promptly();
+  verify_stream_option_extras();
+  verify_all_but_pages_token();
+  verify_redact_spans_change_pages();
+  verify_pdf_redaction_paints_black_box();
+  verify_pdf_page_range();
+  verify_sheet_visibility_and_used_range();
+  verify_notes_pages();
+  verify_tracked_change_display();
+  verify_unknown_form_value_is_harmless();
   verify_death_before_status_is_crash();
   verify_hung_worker_is_killed_at_deadline();
   verify_eof_without_exit_is_reaped();

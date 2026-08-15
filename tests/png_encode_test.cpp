@@ -1,5 +1,6 @@
 #include "png_encode.h"
 
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -298,6 +299,43 @@ int main() {
     require(grlibre::encode_image(photo.rgba.data(), 0, photo.height, false,
                                   grlibre::ImageFormat::kJpeg, 85).empty(),
             "zero width rejected for JPEG");
+  }
+
+  // Rec. 601 luma, alpha preserved, both channel orders.
+  {
+    std::uint8_t rgba[] = {255, 0, 0, 128, 0, 255, 0, 255};
+    grlibre::grayscale_pixels(rgba, 2, 1, /*bgra=*/false);
+    require(rgba[0] == rgba[1] && rgba[1] == rgba[2], "RGBA red becomes gray");
+    require(rgba[3] == 128, "RGBA alpha kept");
+    require(rgba[4] == rgba[5] && rgba[5] == rgba[6], "RGBA green becomes gray");
+    require(rgba[7] == 255, "second pixel alpha kept");
+    require(rgba[0] == static_cast<std::uint8_t>((77 * 255) >> 8),
+            "Rec. 601 red luma");
+
+    std::uint8_t bgra[] = {0, 0, 255, 64};
+    grlibre::grayscale_pixels(bgra, 1, 1, /*bgra=*/true);
+    require(bgra[0] == bgra[1] && bgra[1] == bgra[2], "BGRA red becomes gray");
+    require(bgra[3] == 64, "BGRA alpha kept");
+    require(bgra[0] == static_cast<std::uint8_t>((77 * 255) >> 8),
+            "Rec. 601 red luma in BGRA");
+  }
+
+  // Grayscale conversion is idempotent and its guards hold.
+  {
+    std::uint8_t pixels[] = {200, 100, 50, 255};
+    grlibre::grayscale_pixels(pixels, 1, 1, /*bgra=*/false);
+    std::uint8_t once[4];
+    std::memcpy(once, pixels, sizeof once);
+    grlibre::grayscale_pixels(pixels, 1, 1, /*bgra=*/false);
+    require(std::memcmp(once, pixels, sizeof once) == 0,
+            "grayscale of gray is unchanged");
+
+    grlibre::grayscale_pixels(nullptr, 4, 4, /*bgra=*/false);
+    std::uint8_t untouched[] = {1, 2, 3, 4};
+    grlibre::grayscale_pixels(untouched, 0, 1, /*bgra=*/false);
+    grlibre::grayscale_pixels(untouched, 1, -1, /*bgra=*/false);
+    require(untouched[0] == 1 && untouched[2] == 3,
+            "zero or negative dimensions leave pixels untouched");
   }
 
   std::cout << "png-encode-test passed\n";

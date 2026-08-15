@@ -1065,6 +1065,52 @@ void verify_marks_stream() {
 
 }  // namespace
 
+// A cell reported beyond the declared grid (merged/irregular office
+// tables do this) must keep its table_cells entry and simply have no grid
+// slot — indexing the grid with it used to crash the mapper.
+void verify_out_of_grid_table_cell() {
+  grlibre::DoclingMapper mapper;
+  {
+    officev1::StreamPagesResponse event;
+    officev1::DocumentInfo* info = event.mutable_document_info();
+    info->set_document_type("text");
+    info->set_page_count(1);
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::TableData* table = event.mutable_table();
+    table->set_rows(2);
+    table->set_columns(2);
+    officev1::TableCellData* inside = table->add_cells();
+    inside->set_row(0);
+    inside->set_column(0);
+    inside->set_name("A1");
+    inside->set_text("inside");
+    officev1::TableCellData* beyond = table->add_cells();
+    beyond->set_row(5);
+    beyond->set_column(7);
+    beyond->set_name("H6");
+    beyond->set_text("beyond the grid");
+    mapper.consume(event);
+  }
+  const docv1::Document& document = mapper.document();
+  require(document.tables_size() == 1, "out-of-grid: one table mapped");
+  const docv1::TableData& data = document.tables(0).data();
+  require(data.table_cells_size() == 2,
+          "out-of-grid: both cells stay in table_cells");
+  require(data.grid_size() == 2, "out-of-grid: grid keeps declared rows");
+  require(data.grid(0).cells_size() == 2,
+          "out-of-grid: grid keeps declared columns");
+  require(data.grid(0).cells(0).text() == "inside",
+          "out-of-grid: in-grid cell placed");
+  bool beyond_kept = false;
+  for (const docv1::TableCell& cell : data.table_cells()) {
+    if (cell.text() == "beyond the grid") beyond_kept = true;
+  }
+  require(beyond_kept, "out-of-grid: overflow cell text preserved");
+}
+
 int main() {
   verify_writer_stream();
   verify_calc_stream();
@@ -1072,6 +1118,7 @@ int main() {
   verify_draw_stream();
   verify_partial_stream();
   verify_marks_stream();
+  verify_out_of_grid_table_cell();
   std::cout << "docling_map_test passed\n";
   return 0;
 }

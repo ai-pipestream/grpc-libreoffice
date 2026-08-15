@@ -74,7 +74,8 @@ StreamResult stream_pages(const std::shared_ptr<grpc::Channel>& channel,
                           bool mark_complete, bool allow_package_repair = false,
                           int render_dpi = 0, int first_page = 0,
                           int last_page = 0, int page_format = 0,
-                          int page_quality = 0) {
+                          int page_quality = 0,
+                          const officev1::StreamOptions* extra = nullptr) {
   auto stub = officev1::OfficeRenderService::NewStub(channel);
   grpc::ClientContext context;
   auto stream = stub->StreamPages(&context);
@@ -93,6 +94,9 @@ StreamResult stream_pages(const std::shared_ptr<grpc::Channel>& channel,
       request.mutable_options()->set_page_format(
           static_cast<officev1::PageImageFormat>(page_format));
       request.mutable_options()->set_page_quality(page_quality);
+    }
+    if (offset == 0 && extra != nullptr) {
+      request.mutable_options()->MergeFrom(*extra);
     }
     officev1::DocumentChunk* chunk = request.mutable_chunk();
     chunk->set_document_id("test-doc");
@@ -125,6 +129,56 @@ StreamResult stream_pages(const std::shared_ptr<grpc::Channel>& channel,
   }
   result.status = stream->Finish();
   return result;
+}
+
+// Uploads one complete document to ConvertToPdf and returns the finish
+// status; pdf_out collects the chunk bytes when non-null.
+grpc::Status convert_to_pdf(const std::shared_ptr<grpc::Channel>& channel,
+                            const std::string& bytes,
+                            const std::string& filename, int first_page,
+                            int last_page, std::string* pdf_out = nullptr,
+                            int timeout_seconds = 0) {
+  auto stub = officev1::OfficeRenderService::NewStub(channel);
+  grpc::ClientContext context;
+  auto stream = stub->ConvertToPdf(&context);
+  officev1::ConvertToPdfRequest request;
+  request.set_first_page(first_page);
+  request.set_last_page(last_page);
+  request.set_timeout_seconds(timeout_seconds);
+  officev1::DocumentChunk* chunk = request.mutable_chunk();
+  chunk->set_document_id("pdf-doc");
+  chunk->set_filename(filename);
+  chunk->set_data(bytes);
+  chunk->set_complete(true);
+  stream->Write(request);
+  stream->WritesDone();
+  officev1::ConvertToPdfResponse response;
+  while (stream->Read(&response)) {
+    if (pdf_out != nullptr && response.has_pdf_chunk()) {
+      *pdf_out += response.pdf_chunk().data();
+    }
+  }
+  return stream->Finish();
+}
+
+// Uploads one complete document to ToDocument with the given options.
+grpc::Status to_document(const std::shared_ptr<grpc::Channel>& channel,
+                         const std::string& bytes, const std::string& filename,
+                         const officev1::StreamOptions* options,
+                         officev1::ToDocumentResponse* mapped) {
+  auto stub = officev1::OfficeRenderService::NewStub(channel);
+  grpc::ClientContext context;
+  auto writer = stub->ToDocument(&context, mapped);
+  officev1::StreamPagesRequest request;
+  if (options != nullptr) *request.mutable_options() = *options;
+  officev1::DocumentChunk* chunk = request.mutable_chunk();
+  chunk->set_document_id("to-doc");
+  chunk->set_filename(filename);
+  chunk->set_data(bytes);
+  chunk->set_complete(true);
+  writer->Write(request);
+  writer->WritesDone();
+  return writer->Finish();
 }
 
 }  // namespace
@@ -172,6 +226,9 @@ int main() {
             "embedded media residual named");
     require(info.internal_temp_artifacts(3).find("pdf-export") != std::string::npos,
             "PDF export residual named");
+    require(info.document_mapping(), "ToDocument advertised");
+    require(info.package_repair(), "package repair advertised");
+    require(info.service_version() == "0.4.0", "service version");
   }
 
   // Protocol error paths, no office core involved.
@@ -195,6 +252,62 @@ int main() {
     auto result = stream_pages(channel, oversize, "big.txt", true);
     require(result.status.error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED,
             "oversize is RESOURCE_EXHAUSTED");
+  }
+  {
+    officev1::StreamOptions extra;
+    extra.set_timeout_seconds(601);
+    auto result = stream_pages(channel, "data", "a.txt", true, false, 0, 0, 0,
+                               0, 0, &extra);
+    require(result.status.error_code() == grpc::StatusCode::INVALID_ARGUMENT,
+            "timeout_seconds over 600 is INVALID_ARGUMENT");
+  }
+  {
+    officev1::StreamOptions extra;
+    extra.set_max_width_px(9000);
+    auto result = stream_pages(channel, "data", "a.txt", true, false, 0, 0, 0,
+                               0, 0, &extra);
+    require(result.status.error_code() == grpc::StatusCode::INVALID_ARGUMENT,
+            "max_width_px over 8192 is INVALID_ARGUMENT");
+  }
+  {
+    officev1::StreamOptions extra;
+    officev1::TextSpan* span = extra.add_redact_spans();
+    span->set_char_start(10);
+    span->set_char_end(5);
+    auto result = stream_pages(channel, "data", "a.txt", true, false, 0, 0, 0,
+                               0, 0, &extra);
+    require(result.status.error_code() == grpc::StatusCode::INVALID_ARGUMENT,
+            "backwards redact span is INVALID_ARGUMENT");
+  }
+  {
+    officev1::StreamOptions extra;
+    officev1::TextSpan* span = extra.add_redact_spans();
+    span->set_char_start(-1);
+    span->set_char_end(5);
+    auto result = stream_pages(channel, "data", "a.txt", true, false, 0, 0, 0,
+                               0, 0, &extra);
+    require(result.status.error_code() == grpc::StatusCode::INVALID_ARGUMENT,
+            "negative redact span start is INVALID_ARGUMENT");
+  }
+  {
+    // The PDF page range shares the StreamPages validation.
+    auto status = convert_to_pdf(channel, "data", "a.txt", 3, 1);
+    require(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT,
+            "backwards pdf page range is INVALID_ARGUMENT");
+  }
+  {
+    // ToDocument shares the option validation too.
+    officev1::StreamOptions options;
+    options.set_timeout_seconds(601);
+    officev1::ToDocumentResponse mapped;
+    auto status = to_document(channel, "data", "a.txt", &options, &mapped);
+    require(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT,
+            "ToDocument rejects timeout_seconds over 600");
+  }
+  {
+    auto status = convert_to_pdf(channel, "data", "a.txt", 0, 0, nullptr, 601);
+    require(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT,
+            "ConvertToPdf timeout_seconds over 600 is INVALID_ARGUMENT");
   }
 
   if (!std::filesystem::exists(config.install_path)) {
@@ -348,9 +461,149 @@ int main() {
     require(result.got_status, "html final status emitted");
   }
 
+  // Fit-to-width, grayscale, and SVG vector pages. max_width_px scales the
+  // page to that many pixels (still PNG), grayscale keeps PNG magic, and
+  // PAGE_IMAGE_FORMAT_SVG puts an SVG document in the png field.
+  {
+    officev1::StreamOptions width;
+    width.set_max_width_px(200);
+    auto fitted = stream_pages(channel, "Hello over gRPC.\n", "hello.txt", true,
+                               false, 0, 0, 0, 0, 0, &width);
+    require(fitted.status.ok(),
+            "fit-to-width renders: " + fitted.status.error_message());
+    require(fitted.first_page_width_px > 0
+                && fitted.first_page_width_px <= 200,
+            "max_width_px 200 paints at most 200 px wide");
+
+    officev1::StreamOptions gray;
+    gray.set_grayscale(true);
+    auto grey = stream_pages(channel, "Hello over gRPC.\n", "hello.txt", true,
+                             false, 0, 0, 0, 0, 0, &gray);
+    require(grey.status.ok(),
+            "grayscale renders: " + grey.status.error_message());
+    require(grey.first_page_bytes.rfind("\x89PNG", 0) == 0,
+            "grayscale still encodes PNG");
+
+    officev1::StreamOptions svg;
+    svg.set_vector_format(officev1::PAGE_VECTOR_FORMAT_SVG);
+    auto vector = stream_pages(channel, "Hello over gRPC.\n", "hello.txt", true,
+                               false, 0, 0, 0, 0, 0, &svg);
+    require(vector.status.ok(),
+            "svg renders: " + vector.status.error_message());
+    require(vector.first_page_format == officev1::PAGE_IMAGE_FORMAT_SVG,
+            "svg format named");
+    require(vector.first_page_bytes.find("<svg") != std::string::npos,
+            "svg payload contains an <svg tag");
+
+    // The page_format enum door (what clients send) must take the same
+    // SVG path as the dedicated vector_format field.
+    auto svg_fmt = stream_pages(channel, "Hello over gRPC.\n", "hello.txt",
+                                true, false, 0, 0, 0,
+                                officev1::PAGE_IMAGE_FORMAT_SVG);
+    require(svg_fmt.status.ok(),
+            "page_format SVG renders: " + svg_fmt.status.error_message());
+    require(svg_fmt.first_page_format == officev1::PAGE_IMAGE_FORMAT_SVG,
+            "page_format SVG names itself");
+    require(svg_fmt.first_page_bytes.find("<svg") != std::string::npos,
+            "page_format SVG payload is an SVG document");
+  }
+
+  // Grayscale of a colored page must change the painted bytes. Black text
+  // on white is already gray, so this uses a red HTML paragraph.
+  {
+    const char* html =
+        "<html><body><p style='color:#ff0000;font-size:36pt'>RED</p>"
+        "</body></html>\n";
+    auto color = stream_pages(channel, html, "red.html", true);
+    require(color.status.ok(),
+            "color html renders: " + color.status.error_message());
+    officev1::StreamOptions gray;
+    gray.set_grayscale(true);
+    auto grey = stream_pages(channel, html, "red.html", true, false, 0, 0, 0,
+                             0, 0, &gray);
+    require(grey.status.ok(),
+            "grayscale html renders: " + grey.status.error_message());
+    require(grey.first_page_bytes.rfind("\x89PNG", 0) == 0,
+            "grayscale html still encodes PNG");
+    require(grey.first_page_bytes != color.first_page_bytes,
+            "grayscale changes the painted pixels of a colored page");
+  }
+
+  // ToDocument folds the same StreamPages event stream into one Document.
+  // By default page images stay out of the mapped document; explicitly
+  // selecting DOCUMENT_PART_PAGES embeds them as data URIs.
+  {
+    officev1::ToDocumentResponse mapped;
+    grpc::Status status = to_document(channel, "Hello over ToDocument.\n",
+                                      "hello.txt", nullptr, &mapped);
+    require(status.ok(), "ToDocument ok: " + status.error_message());
+    require(mapped.document_info().document_id() == "to-doc",
+            "ToDocument echoes document id");
+    require(mapped.document().has_body() || mapped.document().pages_size() > 0
+                || mapped.document().texts_size() > 0,
+            "ToDocument returns a mapped document");
+    require(mapped.document().texts_size() > 0,
+            "ToDocument maps typed content by default");
+    require(mapped.status().state() == officev1::RenderStatus::STATE_OK,
+            "ToDocument status is OK");
+    for (const auto& entry : mapped.document().pages()) {
+      require(entry.second.image().uri().empty(),
+              "default ToDocument embeds no page images");
+    }
+
+    officev1::StreamOptions with_pages;
+    with_pages.add_parts(officev1::DOCUMENT_PART_PAGES);
+    officev1::ToDocumentResponse mapped_pages;
+    status = to_document(channel, "Hello over ToDocument.\n", "hello.txt",
+                         &with_pages, &mapped_pages);
+    require(status.ok(),
+            "ToDocument with pages ok: " + status.error_message());
+    bool embedded = false;
+    for (const auto& entry : mapped_pages.document().pages()) {
+      if (entry.second.image().uri().rfind("data:image/png", 0) == 0) {
+        embedded = true;
+      }
+    }
+    require(embedded, "explicit DOCUMENT_PART_PAGES embeds page images");
+  }
+
+  // Options merge across the upload stream: extras sent on a later chunk
+  // still apply (first nonzero / first true wins).
+  {
+    auto stub = officev1::OfficeRenderService::NewStub(channel);
+    grpc::ClientContext context;
+    auto stream = stub->StreamPages(&context);
+    const std::string text = "Options on the second chunk.\n";
+    officev1::StreamPagesRequest first;
+    officev1::DocumentChunk* chunk = first.mutable_chunk();
+    chunk->set_document_id("late-options");
+    chunk->set_filename("late.txt");
+    chunk->set_data(text.substr(0, 10));
+    require(stream->Write(first), "first chunk writes");
+    officev1::StreamPagesRequest second;
+    second.mutable_options()->set_max_width_px(200);
+    second.mutable_options()->set_grayscale(true);
+    chunk = second.mutable_chunk();
+    chunk->set_data(text.substr(10));
+    chunk->set_complete(true);
+    require(stream->Write(second), "second chunk writes");
+    stream->WritesDone();
+    int first_width = 0;
+    officev1::StreamPagesResponse response;
+    while (stream->Read(&response)) {
+      if (response.has_page_image() && first_width == 0) {
+        first_width = response.page_image().width_px();
+      }
+    }
+    grpc::Status status = stream->Finish();
+    require(status.ok(), "late options render ok: " + status.error_message());
+    require(first_width > 0 && first_width <= 200,
+            "max_width_px from a later chunk still applies");
+  }
+
   // A repairable broken package (a stored-entry OOXML zip truncated before
   // its central directory) maps to the repair statuses: refusal naming the
-  // opt-in by default, UNIMPLEMENTED when opted in, never a silent repair.
+  // opt-in by default; opted-in repair is attempted and never UNIMPLEMENTED.
   {
     std::string broken(kRepairableDocx, sizeof kRepairableDocx - 1);
     auto refused = stream_pages(channel, broken, "broken.docx", true);
@@ -359,8 +612,11 @@ int main() {
     require(refused.status.error_message().find("allow_package_repair") != std::string::npos,
             "refusal names the opt-in field");
     auto opted = stream_pages(channel, broken, "broken.docx", true, true);
-    require(opted.status.error_code() == grpc::StatusCode::UNIMPLEMENTED,
-            "opted-in repair is UNIMPLEMENTED in this version");
+    require(opted.status.error_code() != grpc::StatusCode::UNIMPLEMENTED,
+            "opted-in repair is no longer UNIMPLEMENTED");
+    require(opted.status.ok()
+                || opted.status.error_code() == grpc::StatusCode::INVALID_ARGUMENT,
+            "opted-in repair either loads or fails as a load error");
   }
 
   server->Shutdown();
