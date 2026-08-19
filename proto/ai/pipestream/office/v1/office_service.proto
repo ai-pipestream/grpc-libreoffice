@@ -1673,4 +1673,17 @@ message GetServiceInfoResponse {
   // True when allow_package_repair actually repairs a broken package
   // instead of returning UNIMPLEMENTED.
   bool package_repair = 14;
+  // Frontend advertisement for the shared demo shell.
+  UiInfo ui = 15;
+}
+
+// Frontend advertisement. Same shape in every ai-pipestream grpc service:
+// the demo shell reads it to build its tab bar.
+message UiInfo {
+  // Tab title, e.g. "LibreOffice".
+  string title = 1;
+  // Shell mount path, e.g. "/ui/libreoffice".
+  string path = 2;
+  // One line, used as the tab tooltip.
+  string description = 3;
 }

@@ -521,6 +521,12 @@ grpc::Status RenderServiceImpl::GetServiceInfo(
   response->add_internal_temp_artifacts(
       "pdf-export: LibreOffice renders through one internal temp file in "
       "the tmpfs work dir, unlinked right after the store");
+  // Frontend advertisement for the shared demo shell.
+  auto* ui = response->mutable_ui();
+  ui->set_title("LibreOffice");
+  ui->set_path("/ui/libreoffice");
+  ui->set_description(
+      "Renders office documents via LibreOfficeKit; pages out as PNG");
   return grpc::Status::OK;
 }
 

@@ -229,6 +229,11 @@ int main() {
     require(info.document_mapping(), "ToDocument advertised");
     require(info.package_repair(), "package repair advertised");
     require(info.service_version() == "0.4.0", "service version");
+    require(info.ui().title() == "LibreOffice", "ui title advertised");
+    require(info.ui().path() == "/ui/libreoffice", "ui path advertised");
+    require(info.ui().description() ==
+                "Renders office documents via LibreOfficeKit; pages out as PNG",
+            "ui description advertised");
   }
 
   // Protocol error paths, no office core involved.

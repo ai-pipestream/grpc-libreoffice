@@ -158,7 +158,8 @@ at STANDARD plus COMMENTS):
   (`document_mapping`), whether `allow_package_repair` actually repairs
   (`package_repair`), and names the LibreOffice-internal temp artifacts
   (`internal_temp_artifacts`) so callers can reason about their own threat
-  model.
+  model. The `ui` field carries the shared demo-shell tab advertisement
+  (title, mount path, tooltip).
 
 The source format resolves from the filename extension first and the content
 type second; unresolvable documents are rejected with `INVALID_ARGUMENT`.
