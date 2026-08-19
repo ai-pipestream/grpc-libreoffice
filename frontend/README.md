@@ -55,6 +55,14 @@ Environment variables:
 - `PORT`: HTTP port of the BFF (default `8080`; `0` picks an ephemeral port,
   reported on stdout).
 - `GRLIBRE_ADDR`: gRPC target (default `localhost:50053`).
+- `UI_BASE`: optional mount prefix for the whole UI (default empty = serve
+  at the root). Set it to serve behind a reverse proxy that forwards a path
+  prefix unchanged, e.g. `UI_BASE=/ui/libreoffice npm start` puts the SPA at
+  `/ui/libreoffice/`, its static assets under `/ui/libreoffice/*`, and every
+  endpoint in the table above under `/ui/libreoffice/api/*`. The BFF injects
+  a `<base>` tag and `window.__UI_BASE__` into the served `index.html` and
+  `app.js` prefixes all of its fetches with it; requests outside the prefix
+  get a 404. With `UI_BASE` unset nothing changes.
 
 ## Testing
 
@@ -91,6 +99,12 @@ bytes plus a 1:1 page-range PDF; unknown-extension errors on both endpoints
 (NDJSON `INVALID_ARGUMENT` / HTTP 400) including repeated PDF failures not
 crashing the BFF; the fixtures listing and byte serving with traversal
 rejection; `GET /` and static asset MIME types.
+
+`test/ui-base.test.mjs` boots the BFF with `UI_BASE=/ui/libreoffice` and
+checks the SPA, assets, and API routes under the mount prefix (no gRPC
+needed): the served HTML carries the injected `<base>` tag and
+`window.__UI_BASE__`, `app.js` fetches go through the prefix, and requests
+outside the prefix get a 404.
 
 `test/check-overlay-math.mjs` is a manual sanity script for the lightbox
 overlay: it prints page-rect-to-pixel scaling and line-box bounds for a

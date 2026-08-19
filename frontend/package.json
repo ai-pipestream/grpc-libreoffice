@@ -15,7 +15,7 @@
   ],
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs && node --check lib/options.mjs && node --check lib/overlay.mjs && node --check public/app.js && node --check test/bff.test.mjs && node --check test/options.test.mjs && node --check test/overlay.test.mjs",
+    "check": "node --check server.mjs && node --check lib/options.mjs && node --check lib/overlay.mjs && node --check public/app.js && node --check test/bff.test.mjs && node --check test/options.test.mjs && node --check test/overlay.test.mjs && node --check test/ui-base.test.mjs",
     "test": "node --test \"test/**/*.test.mjs\"",
     "test:unit": "node --test test/options.test.mjs test/overlay.test.mjs"
   },

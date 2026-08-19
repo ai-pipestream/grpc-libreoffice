@@ -1,5 +1,12 @@
 "use strict";
 
+/* ---------- API base path ---------- */
+
+// Mount prefix the BFF serves this UI under (injected into index.html as
+// window.__UI_BASE__ when the BFF runs with UI_BASE). Empty at the root.
+const UI_BASE = window.__UI_BASE__ || "";
+const apiUrl = (p) => UI_BASE + p;
+
 /* ---------- element handles ---------- */
 
 const $ = (id) => document.getElementById(id);
@@ -439,7 +446,7 @@ const state = {
 
 async function loadServiceInfo() {
   try {
-    const resp = await fetch("/api/info");
+    const resp = await fetch(apiUrl("/api/info"));
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const info = await resp.json();
     const formats = info.supportedFormats || [];
@@ -574,8 +581,8 @@ async function startRender(file) {
 
   try {
     const resp = await fetch(
-      "/api/render?filename=" + encodeURIComponent(file.name) +
-        partsQuery() + opts.q,
+      apiUrl("/api/render?filename=" + encodeURIComponent(file.name) +
+        partsQuery() + opts.q),
       {
         method: "POST",
         headers: {
@@ -1261,7 +1268,7 @@ els.pdfButton.addEventListener("click", async () => {
   }, 100);
   try {
     const resp = await fetch(
-      "/api/pdf?filename=" + encodeURIComponent(file.name),
+      apiUrl("/api/pdf?filename=" + encodeURIComponent(file.name)),
       {
         method: "POST",
         headers: {
@@ -1387,7 +1394,7 @@ const speed = {
 async function loadFixtures() {
   if (speed.fixtures) return;
   try {
-    const resp = await fetch("/api/fixtures");
+    const resp = await fetch(apiUrl("/api/fixtures"));
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const { files } = await resp.json();
     speed.fixtures = files;
@@ -1421,7 +1428,7 @@ async function loadFixtures() {
 async function fixtureBytes(name) {
   let bytes = speed.bytesCache.get(name);
   if (!bytes) {
-    const resp = await fetch("/api/fixtures/" + encodeURIComponent(name));
+    const resp = await fetch(apiUrl("/api/fixtures/") + encodeURIComponent(name));
     if (!resp.ok) throw new Error(`fixture fetch HTTP ${resp.status}`);
     bytes = await resp.arrayBuffer();
     speed.bytesCache.set(name, bytes);
@@ -1443,7 +1450,7 @@ const SPEED_MODES = [
 async function speedRun(name, body, mode) {
   const t0 = performance.now();
   const resp = await fetch(
-    `/api/${mode.endpoint}?filename=${encodeURIComponent(name)}${mode.query}`,
+    `${apiUrl("/api/")}${mode.endpoint}?filename=${encodeURIComponent(name)}${mode.query}`,
     { method: "POST", body });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
 

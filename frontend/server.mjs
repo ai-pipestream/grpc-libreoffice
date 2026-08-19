@@ -25,6 +25,18 @@ const PORT = Number(process.env.PORT || 8080);
 const GRLIBRE_ADDR = process.env.GRLIBRE_ADDR || "localhost:50053";
 const UPLOAD_CHUNK = 256 * 1024;
 
+// UI_BASE mounts the SPA and its API under a path prefix (e.g.
+// "/ui/libreoffice") so a shell app can reverse-proxy "/ui/<name>/*"
+// straight through. Empty (default) serves at the root, byte-for-byte
+// unchanged.
+const UI_BASE = (() => {
+  const raw = (process.env.UI_BASE || "").replace(/\/+$/, "");
+  if (raw && !raw.startsWith("/")) {
+    throw new Error(`UI_BASE must start with "/": ${raw}`);
+  }
+  return raw;
+})();
+
 const packageDefinition = protoLoader.loadSync(PROTO_FILE, {
   keepCase: false,
   longs: Number,
@@ -361,6 +373,17 @@ function serveStatic(res, urlPath) {
       return;
     }
     const ext = path.extname(filePath).toLowerCase();
+    if (UI_BASE && ext === ".html") {
+      // Rewire the entry page to the mount prefix: <base> makes the
+      // relative asset refs resolve under it, and window.__UI_BASE__
+      // tells app.js where to send its fetches.
+      const tag =
+        `<base href="${UI_BASE}/">\n` +
+        `<script>window.__UI_BASE__ = ${JSON.stringify(UI_BASE)};</script>`;
+      contents = Buffer.from(
+        contents.toString("utf8")
+          .replace('<meta charset="utf-8">', `<meta charset="utf-8">\n${tag}`));
+    }
     res.writeHead(200, { "Content-Type": MIME[ext] || "application/octet-stream" });
     res.end(contents);
   });
@@ -369,20 +392,32 @@ function serveStatic(res, urlPath) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   try {
-    if (req.method === "GET" && url.pathname === "/api/info") {
+    // With UI_BASE set, only requests under the prefix are handled; the
+    // remainder of the path is routed exactly as the root-mounted server
+    // routes it.
+    let pathname = url.pathname;
+    if (UI_BASE) {
+      if (pathname !== UI_BASE && !pathname.startsWith(UI_BASE + "/")) {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("not found");
+        return;
+      }
+      pathname = pathname.slice(UI_BASE.length) || "/";
+    }
+    if (req.method === "GET" && pathname === "/api/info") {
       await handleInfo(res);
-    } else if (req.method === "GET" && url.pathname === "/api/fixtures") {
+    } else if (req.method === "GET" && pathname === "/api/fixtures") {
       handleFixtures(res);
-    } else if (req.method === "GET" && url.pathname.startsWith("/api/fixtures/")) {
-      handleFixtureFile(res, url.pathname.slice("/api/fixtures/".length));
-    } else if (req.method === "POST" && url.pathname === "/api/render") {
+    } else if (req.method === "GET" && pathname.startsWith("/api/fixtures/")) {
+      handleFixtureFile(res, pathname.slice("/api/fixtures/".length));
+    } else if (req.method === "POST" && pathname === "/api/render") {
       await handleRender(req, res, url);
-    } else if (req.method === "POST" && url.pathname === "/api/pdf") {
+    } else if (req.method === "POST" && pathname === "/api/pdf") {
       await handlePdf(req, res, url);
-    } else if (req.method === "POST" && url.pathname === "/api/document") {
+    } else if (req.method === "POST" && pathname === "/api/document") {
       await handleToDocument(req, res, url);
     } else if (req.method === "GET" || req.method === "HEAD") {
-      serveStatic(res, url.pathname);
+      serveStatic(res, pathname);
     } else {
       res.writeHead(405);
       res.end();
