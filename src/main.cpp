@@ -90,7 +90,7 @@ int main() {
   try {
     port = int_from_env("GRLIBRE_PORT", 50053, 1, 65535);
     config.max_document_bytes =
-        static_cast<long>(int_from_env("GRLIBRE_MAX_DOCUMENT_MIB", 100, 1, 2048)) << 20;
+        static_cast<long>(int_from_env("GRLIBRE_MAX_DOCUMENT_MIB", 500, 1, 2048)) << 20;
     config.max_concurrent_documents = int_from_env("GRLIBRE_MAX_CONCURRENT_DOCUMENTS", 2, 1, 64);
     config.task_deadline = std::chrono::milliseconds(
         1000L * int_from_env("GRLIBRE_TASK_TIMEOUT_SECONDS", 120, 5, 3600));

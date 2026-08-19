@@ -1,6 +1,6 @@
 plugins {
     id 'application'
-    id 'com.google.protobuf' version '0.9.6'
+    id 'com.google.protobuf' version '0.10.0'
 }
 
 def grpcVersion = '1.83.1'
