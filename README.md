@@ -230,7 +230,7 @@ anywhere.
 | Variable | Default | Meaning |
 |---|---|---|
 | `GRLIBRE_PORT` | `50053` | Listen port |
-| `GRLIBRE_MAX_DOCUMENT_MIB` | `100` | Per-document byte cap |
+| `GRLIBRE_MAX_DOCUMENT_MIB` | `500` | Per-document byte cap |
 | `GRLIBRE_MAX_CONCURRENT_DOCUMENTS` | `2` | Worker processes in flight |
 | `GRLIBRE_TASK_TIMEOUT_SECONDS` | `120` | Per-document deadline |
 | `GRLIBRE_RENDER_DPI` | `144` | Default page render DPI; a request may override it via `StreamOptions.render_dpi` |
