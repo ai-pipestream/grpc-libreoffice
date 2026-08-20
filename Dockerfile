@@ -3,6 +3,7 @@
 FROM ubuntu:26.04 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
       g++ cmake ninja-build git ca-certificates libgoogle-perftools-dev \
+      poppler-utils \
       libreofficekit-dev libreoffice-dev \
       libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-draw \
       libreoffice-math \
