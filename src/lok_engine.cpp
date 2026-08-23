@@ -263,7 +263,7 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
       if (svg.empty()) {
         svg = export_page_svg_uno(page_number);
       }
-      if (svg.empty() || svg.find("<svg") == std::string::npos) {
+      if (svg.empty() || !svg.contains("<svg")) {
         // Writer (and some other classes) have no SVG store filter.
         // Paint the page and wrap the PNG in an SVG so the wire format
         // stays PAGE_IMAGE_FORMAT_SVG. The caller asked for vector output
@@ -290,7 +290,7 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
         std::string png = encode_png(pixels.data(), width_px, height_px, bgra);
         svg = svg_from_png(png, width_px, height_px);
       }
-      if (svg.empty() || svg.find("<svg") == std::string::npos) {
+      if (svg.empty() || !svg.contains("<svg")) {
         encoder_ok = false;
         *error = "SVG export failed";
         break;
@@ -323,11 +323,11 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
     }
     int width_px = std::max(1, static_cast<int>(std::lround(page.width * scale)));
     int height_px = std::max(1, static_cast<int>(std::lround(page.height * scale)));
-    RawPage raw;
-    raw.index = static_cast<int>(index);
-    raw.width_px = width_px;
-    raw.height_px = height_px;
-    raw.dpi = effective_dpi;
+    RawPage raw{.index = static_cast<int>(index),
+                .width_px = width_px,
+                .height_px = height_px,
+                .dpi = effective_dpi,
+                .pixels = {}};
     raw.pixels.resize(static_cast<size_t>(width_px) * height_px * 4);
     document->paintTile(raw.pixels.data(), width_px, height_px,
                         static_cast<int>(page.x), static_cast<int>(page.y),
@@ -506,9 +506,7 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     for (size_t i = 0; i < slide_count; i++) {
       document->setPartMode(LOK_PARTMODE_NOTES);
       document->setPart(pages[i].part);
-      PageRect notes;
-      notes.part = pages[i].part;
-      notes.notes = true;
+      PageRect notes{.part = pages[i].part, .notes = true};
       document->getDocumentSize(&notes.width, &notes.height);
       if (notes.width > 0 && notes.height > 0) pages.push_back(notes);
     }
@@ -539,12 +537,10 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
   // rectangles or the event flush is unresolvable.
   std::vector<PageBox> page_boxes;
   for (const PageRect& page : pages) {
-    PageBox box;
-    box.x = page.x;
-    box.y = page.y;
-    box.width = page.width;
-    box.height = page.height;
-    page_boxes.push_back(box);
+    page_boxes.push_back({.x = page.x,
+                          .y = page.y,
+                          .width = page.width,
+                          .height = page.height});
   }
   SelectionProbe probe;
   SelectionProbe* probe_ptr = nullptr;
@@ -656,10 +652,9 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
       document->registerCallback(nullptr, nullptr);
       probe_ptr = nullptr;
     }
-    PdfExportOptions pdf;
-    pdf.first_page = options.first_page;
-    pdf.last_page = options.last_page;
-    pdf.skip_hidden = options.skip_hidden;
+    PdfExportOptions pdf{.first_page = options.first_page,
+                         .last_page = options.last_page,
+                         .skip_hidden = options.skip_hidden};
     if (ok && !export_pdf_stream(
                   pdf_filter, kPdfChunkBytes,
                   [&](std::string&& chunk) {

@@ -13,7 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
+#include <print>
 #include <string>
 
 #include "ai/pipestream/office/v1/office_service.pb.h"
@@ -89,9 +89,10 @@ constexpr char kProfileSeed[] =
 
 int main(int argc, char** argv) {
   if (argc < 7 || argc > 11) {
-    std::cerr << "usage: grlibre-worker <pages|pdf> <extension> <dpi> "
+    std::println(stderr,
+                 "usage: grlibre-worker <pages|pdf> <extension> <dpi> "
                  "<max_side_px> <work_dir> <install_path> "
-                 "[parts [repair|no-repair [first:last [format[:quality]]]]]\n";
+                 "[parts [repair|no-repair [first:last [format[:quality]]]]]");
     return grlibre::kExitRenderFailure;
   }
   grlibre::RenderOptions options;
@@ -110,8 +111,10 @@ int main(int argc, char** argv) {
     if (repair == "repair") {
       options.allow_package_repair = true;
     } else if (repair != "no-repair") {
-      std::cerr << "grlibre-worker: unknown repair token \"" << repair
-                << "\" (expected repair or no-repair)\n";
+      std::println(stderr,
+                   "grlibre-worker: unknown repair token \"{}\" (expected "
+                   "repair or no-repair)",
+                   repair);
       return grlibre::kExitRenderFailure;
     }
   }
@@ -132,8 +135,10 @@ int main(int argc, char** argv) {
     if (colon == std::string::npos || first_end != range.c_str() + colon
         || *last_end != '\0' || options.first_page < 0
         || options.last_page < 0) {
-      std::cerr << "grlibre-worker: malformed page range token \"" << range
-                << "\" (expected first:last)\n";
+      std::println(stderr,
+                   "grlibre-worker: malformed page range token \"{}\" "
+                   "(expected first:last)",
+                   range);
       return grlibre::kExitRenderFailure;
     }
   }
@@ -151,8 +156,8 @@ int main(int argc, char** argv) {
           std::strtol(token.c_str() + colon + 1, &end, 10));
       if (*end != '\0' || options.image_quality < 1
           || options.image_quality > 100) {
-        std::cerr << "grlibre-worker: malformed image quality in \"" << token
-                  << "\"\n";
+        std::println(stderr, "grlibre-worker: malformed image quality in \"{}\"",
+                     token);
         return grlibre::kExitRenderFailure;
       }
     }
@@ -163,8 +168,8 @@ int main(int argc, char** argv) {
     } else if (format == "webp") {
       options.image_format = grlibre::ImageFormat::kWebp;
     } else {
-      std::cerr << "grlibre-worker: unknown image format token \"" << token
-                << "\"\n";
+      std::println(stderr, "grlibre-worker: unknown image format token \"{}\"",
+                   token);
       return grlibre::kExitRenderFailure;
     }
   }
@@ -215,14 +220,15 @@ int main(int argc, char** argv) {
 
   std::string document = read_all_stdin();
   if (document.empty()) {
-    std::cerr << "grlibre-worker: no document bytes on stdin\n";
+    std::println(stderr, "grlibre-worker: no document bytes on stdin");
     return grlibre::kExitLoadFailure;
   }
   options.input_bytes = static_cast<long>(document.size());
   if (!on_tmpfs(options.work_dir)) {
-    std::cerr << "grlibre-worker: work dir " << options.work_dir
-              << " is not on tmpfs; refusing to write the uploaded document "
-                 "to disk\n";
+    std::println(stderr,
+                 "grlibre-worker: work dir {} is not on tmpfs; refusing to "
+                 "write the uploaded document to disk",
+                 options.work_dir);
     return grlibre::kExitWorkDirNotTmpfs;
   }
   // The extension in the filename is load-bearing: delimiter formats (csv,
@@ -253,17 +259,18 @@ int main(int argc, char** argv) {
       saved_errno = errno;
     }
     if (!ok) {
-      std::cerr << "grlibre-worker: cannot write " << options.doc_path << ": "
-                << std::strerror(saved_errno)
-                << " (is the tmpfs sized for the document?)\n";
+      std::println(stderr,
+                   "grlibre-worker: cannot write {}: {} (is the tmpfs sized "
+                   "for the document?)",
+                   options.doc_path, std::strerror(saved_errno));
       return grlibre::kExitRenderFailure;
     }
   }
   std::error_code fs_error;
   std::filesystem::create_directories(options.work_dir + "/profile/user", fs_error);
   if (fs_error) {
-    std::cerr << "grlibre-worker: cannot create the profile: "
-              << fs_error.message() << "\n";
+    std::println(stderr, "grlibre-worker: cannot create the profile: {}",
+                 fs_error.message());
     return grlibre::kExitRenderFailure;
   }
   {
@@ -272,7 +279,7 @@ int main(int argc, char** argv) {
     seed << kProfileSeed;
     seed.close();
     if (!seed) {
-      std::cerr << "grlibre-worker: cannot write " << seed_path << "\n";
+      std::println(stderr, "grlibre-worker: cannot write {}", seed_path);
       return grlibre::kExitRenderFailure;
     }
   }
@@ -285,14 +292,14 @@ int main(int argc, char** argv) {
   std::string core_tmp = options.work_dir + "/tmp";
   std::filesystem::create_directories(core_tmp, fs_error);
   if (fs_error || ::setenv("TMPDIR", core_tmp.c_str(), 1) != 0) {
-    std::cerr << "grlibre-worker: cannot point TMPDIR at " << core_tmp << "\n";
+    std::println(stderr, "grlibre-worker: cannot point TMPDIR at {}", core_tmp);
     return grlibre::kExitRenderFailure;
   }
 
   std::string error;
   int code = grlibre::run_render(options, STDOUT_FILENO, &error);
   if (code != grlibre::kExitOk) {
-    std::cerr << "grlibre-worker: " << error << "\n";
+    std::println(stderr, "grlibre-worker: {}", error);
   }
   // End the process here, skipping exit-time teardown. This worker never
   // runs DeInitVCL, and letting exit() walk LibreOffice's atexit handlers

@@ -11,7 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
+#include <print>
 #include <map>
 #include <set>
 #include <string>
@@ -27,7 +27,7 @@ namespace officev1 = ai::pipestream::office::v1;
 
 void require(bool condition, const std::string& what) {
   if (!condition) {
-    std::cerr << "FAIL: " << what << "\n";
+    std::println(stderr, "FAIL: {}", what);
     std::exit(1);
   }
 }
@@ -173,7 +173,7 @@ std::vector<std::string> rasterize_pdf(const std::string& pdf) {
   for (const auto& entry : std::filesystem::directory_iterator(work_dir)) {
     if (entry.path().extension() == ".ppm") names.push_back(entry.path());
   }
-  std::sort(names.begin(), names.end());
+  std::ranges::sort(names);
   std::vector<std::string> pages;
   for (const std::string& name : names) {
     std::ifstream in(name, std::ios::binary);
@@ -393,7 +393,7 @@ void verify_pdf_mode() {
     }
   }
   require(pdf.size() > 500, "PDF has substance");
-  require(pdf.compare(0, 5, "%PDF-") == 0, "PDF magic");
+  require(pdf.starts_with("%PDF-"), "PDF magic");
   require(pdf.rfind("%%EOF") != std::string::npos &&
               pdf.rfind("%%EOF") + 10 > pdf.size(),
           "PDF ends with its EOF marker");
@@ -430,8 +430,7 @@ void verify_pdf_chunk_streaming() {
   for (size_t i = 0; i + 1 < chunk_sizes.size(); i++) {
     require(chunk_sizes[i] == 256 * 1024, "every full chunk is the frame bound");
   }
-  require(pdf.compare(0, 5, "%PDF-") == 0 &&
-              pdf.rfind("%%EOF") != std::string::npos,
+  require(pdf.starts_with("%PDF-") && pdf.contains("%%EOF"),
           "chunk concatenation is one PDF");
 }
 
@@ -534,8 +533,8 @@ void verify_typed_content() {
         }
         // Frame and shape text is out of the body flow and must not leak
         // into body paragraphs.
-        if (para_text.find("frame body") != std::string::npos ||
-            para_text.find("shape text") != std::string::npos) {
+        if (para_text.contains("frame body") ||
+            para_text.contains("shape text")) {
           out_of_body_text_in_paragraphs = true;
         }
         break;
@@ -1365,7 +1364,7 @@ void verify_line_rects() {
                      para.line_rects(0).char_start() == 0 &&
                      para.line_rects(0).char_end() == 4;
       }
-      if (text.compare(0, 4, "wrap") == 0) {
+      if (text.starts_with("wrap")) {
         wrap_ok = para.line_rects_size() > 3;
         // Within one page, line boxes descend in reading order, and the
         // measured character boundaries tile the paragraph: the first line
@@ -1573,7 +1572,7 @@ void verify_embedded_objects() {
   bool sheet_ok = false;
   for (const officev1::EmbeddedObject& object : objects) {
     if (object.kind() == officev1::EMBEDDED_OBJECT_KIND_FORMULA) {
-      formula_ok = object.formula().find("a^2") != std::string::npos &&
+      formula_ok = object.formula().contains("a^2") &&
                    object.page_index() == 0 && object.width_twips() > 0;
     }
     if (object.kind() == officev1::EMBEDDED_OBJECT_KIND_CHART) {
@@ -1655,7 +1654,7 @@ void verify_docling_mapping() {
   const auto& document = mapper.document();
   std::vector<std::string> errors = grlibre::docling_integrity_errors(document);
   for (const std::string& error : errors) {
-    std::cerr << "integrity: " << error << "\n";
+    std::println(stderr, "integrity: {}", error);
   }
   require(errors.empty(), "mapped document ref tree is well formed");
   require(document.pages_size() == info.page_count(),
@@ -1695,7 +1694,7 @@ void verify_docling_mapping() {
           "mapped table keeps its grid dimensions");
   require(document.pictures_size() >= 1
               && document.pictures(0).image().uri()
-                     .rfind("data:image/", 0) == 0,
+                     .starts_with("data:image/"),
           "mapped picture carries a data URI");
   bool frame_group = false;
   std::string wpg_ref;
@@ -1852,7 +1851,7 @@ void verify_marks_content() {
         if (change.kind() == officev1::TRACKED_CHANGE_KIND_DELETE) {
           delete_change_ok =
               change.author() == "Cara" &&
-              change.changed_text().find("gone words") != std::string::npos;
+              change.changed_text().contains("gone words");
         }
         break;
       }
@@ -1886,7 +1885,7 @@ void verify_marks_content() {
     }
   }
   for (const std::string& warning : warnings) {
-    std::cerr << "marked warning: " << warning << "\n";
+    std::println(stderr, "marked warning: {}", warning);
   }
   require(hyperlink_ok, "hyperlink url, target, and span on the linked run");
   require(point_comment_ok, "point comment with author, date, and anchor");
@@ -1917,7 +1916,7 @@ void verify_work_dir_stays_documentless() {
       std::vector<std::string> found;
       for (const auto& entry : std::filesystem::directory_iterator(work_dir)) {
         std::string name = entry.path().filename().string();
-        if (name.rfind("doc.", 0) == 0 || name == "out.pdf") found.push_back(name);
+        if (name.starts_with("doc.") || name == "out.pdf") found.push_back(name);
       }
       return found;
     };
@@ -2039,7 +2038,7 @@ void verify_broken_package_needs_repair_opt_in() {
         });
     require(outcome.kind == grlibre::WorkerOutcome::Kind::kRepairNeedsOptIn,
             "broken package needs the repair opt-in, got detail: " + outcome.detail);
-    require(outcome.detail.find("allow_package_repair") != std::string::npos,
+    require(outcome.detail.contains("allow_package_repair"),
             "refusal names the opt-in field");
     require(payloads.empty(), "refusal happens before any frame");
     std::error_code ignored;
@@ -2135,7 +2134,7 @@ void verify_death_before_status_is_crash() {
   require(frames == 1, "the stub's one frame arrived before it died");
   require(outcome.kind == grlibre::WorkerOutcome::Kind::kCrash,
           "death before the terminal frame is a crash, got: " + outcome.detail);
-  require(outcome.detail.find("signal") != std::string::npos,
+  require(outcome.detail.contains("signal"),
           "the crash names the killing signal");
 }
 
@@ -2174,7 +2173,7 @@ void verify_eof_without_exit_is_reaped() {
       std::chrono::steady_clock::now() - begin);
   require(outcome.kind == grlibre::WorkerOutcome::Kind::kCrash,
           "eof-without-exit surfaces as a crash, got: " + outcome.detail);
-  require(outcome.detail.find("did not exit") != std::string::npos,
+  require(outcome.detail.contains("did not exit"),
           "the reap detail names the condition, got: " + outcome.detail);
   require(elapsed.count() >= 1900 && elapsed.count() < 8000,
           "reap happens at the grace bound, took "
@@ -2210,7 +2209,7 @@ void verify_stream_option_extras() {
             "grayscale render ok: " + outcome.detail);
     PagesRun run = fold_pages(payloads);
     require(!run.pages.empty(), "grayscale page painted");
-    require(run.pages[0].png().rfind("\x89PNG", 0) == 0,
+    require(run.pages[0].png().starts_with("\x89PNG"),
             "grayscale page still encodes PNG");
   }
   {
@@ -2224,16 +2223,16 @@ void verify_stream_option_extras() {
     require(!run.pages.empty(), "svg page emitted");
     require(run.pages[0].format() == officev1::PAGE_IMAGE_FORMAT_SVG,
             "svg page format named");
-    require(run.pages[0].png().find("<svg") != std::string::npos,
+    require(run.pages[0].png().contains("<svg"),
             "svg payload carries an <svg tag");
     // The raster fallback (PNG wrapped in an SVG) must announce itself in
     // the status warnings, exactly once; a true vector page must not.
     const bool wrapped =
-        run.pages[0].png().find("data:image/png;base64,") != std::string::npos;
+        run.pages[0].png().contains("data:image/png;base64,");
     int downgrade_warnings = 0;
     require(run.got_status, "svg render carries a final status");
     for (const std::string& warning : run.status.warnings()) {
-      if (warning.find("vector SVG unavailable") != std::string::npos) {
+      if (warning.contains("vector SVG unavailable")) {
         downgrade_warnings++;
       }
     }
@@ -2254,7 +2253,7 @@ void verify_stream_option_extras() {
     require(!run.pages.empty(), "vector none page painted");
     require(run.pages[0].format() != officev1::PAGE_IMAGE_FORMAT_SVG,
             "explicit NONE keeps raster despite page_format SVG");
-    require(run.pages[0].png().rfind("\x89PNG", 0) == 0,
+    require(run.pages[0].png().starts_with("\x89PNG"),
             "vector none page is PNG");
   }
 }
@@ -2471,7 +2470,7 @@ void verify_tracked_change_display() {
     require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
             "final display renders ok: " + outcome.detail);
     std::string text = all_paragraph_text(fold_pages(payloads));
-    require(text.find("INSERTED") != std::string::npos,
+    require(text.contains("INSERTED"),
             "FINAL keeps the tracked insertion");
   }
   {
@@ -2482,9 +2481,9 @@ void verify_tracked_change_display() {
     require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
             "original display renders ok: " + outcome.detail);
     std::string text = all_paragraph_text(fold_pages(payloads));
-    require(text.find("INSERTED") == std::string::npos,
+    require(!text.contains("INSERTED"),
             "ORIGINAL rejects the tracked insertion");
-    require(text.find("Alpha") != std::string::npos,
+    require(text.contains("Alpha"),
             "ORIGINAL keeps the stored text");
   }
 }
@@ -2508,7 +2507,7 @@ void verify_unknown_form_value_is_harmless() {
 
 int main() {
   if (!std::filesystem::exists(lo_install_path())) {
-    std::cerr << "SKIP: no LibreOffice at " << lo_install_path() << "\n";
+    std::println(stderr, "SKIP: no LibreOffice at {}", lo_install_path());
     return 77;
   }
   verify_text_pages();
@@ -2543,6 +2542,6 @@ int main() {
   verify_death_before_status_is_crash();
   verify_hung_worker_is_killed_at_deadline();
   verify_eof_without_exit_is_reaped();
-  std::cout << "worker-render-test passed\n";
+  std::println("worker-render-test passed");
   return 0;
 }

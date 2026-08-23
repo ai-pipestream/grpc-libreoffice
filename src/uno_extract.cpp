@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <print>
 #include <ctime>
 #include <map>
 #include <optional>
@@ -189,7 +190,7 @@ class Warner {
   }
 
   void warn(const std::string& message) {
-    std::fprintf(stderr, "grlibre-worker: typed content: %s\n", message.c_str());
+    std::println(stderr, "grlibre-worker: typed content: {}", message);
     if (sink_ != nullptr) sink_->push_back("typed content: " + message);
   }
 
@@ -461,8 +462,8 @@ class CaretSpace {
       if (props.is()) {
         rtl::OUString style;
         props->getPropertyValue("PageStyleName") >>= style;
-        auto found = margins_.find(utf8(style));
-        if (found != margins_.end()) {
+        if (auto found = margins_.find(utf8(style));
+            found != margins_.end()) {
           return {found->second.first + kDocumentBorder,
                   found->second.second + kDocumentBorder};
         }
@@ -556,7 +557,7 @@ void collect_line_rects(
   }
   // The office core's region compression reorders the rectangles; restore
   // reading order.
-  std::sort(boxes.begin(), boxes.end(), [](const Box& a, const Box& b) {
+  std::ranges::sort(boxes, [](const Box& a, const Box& b) {
     return a.y != b.y ? a.y < b.y : a.x < b.x;
   });
   for (const Box& parsed : boxes) {
@@ -642,17 +643,14 @@ officev1::TrackedChangeKind tracked_change_kind(const std::string& type) {
 // controls. Unmatched types stay UNSPECIFIED with the verbatim type on the
 // wire.
 officev1::FormFieldKind form_field_kind(const std::string& type) {
-  if (type.find("FORMTEXT") != std::string::npos ||
-      type.find("component.TextField") != std::string::npos) {
+  if (type.contains("FORMTEXT") || type.contains("component.TextField")) {
     return officev1::FORM_FIELD_KIND_TEXT;
   }
-  if (type.find("FORMCHECKBOX") != std::string::npos ||
-      type.find("component.CheckBox") != std::string::npos) {
+  if (type.contains("FORMCHECKBOX") || type.contains("component.CheckBox")) {
     return officev1::FORM_FIELD_KIND_CHECKBOX;
   }
-  if (type.find("FORMDROPDOWN") != std::string::npos ||
-      type.find("component.ListBox") != std::string::npos ||
-      type.find("component.ComboBox") != std::string::npos) {
+  if (type.contains("FORMDROPDOWN") || type.contains("component.ListBox") ||
+      type.contains("component.ComboBox")) {
     return officev1::FORM_FIELD_KIND_DROPDOWN;
   }
   return officev1::FORM_FIELD_KIND_UNSPECIFIED;
@@ -840,7 +838,7 @@ class MarkerCollector {
     officev1::Comment event;
     bool had_anonymous = false;
     for (auto it = open_comments_.begin(); it != open_comments_.end(); ++it) {
-      if (it->first.rfind("\nanon", 0) == 0) {
+      if (it->first.starts_with("\nanon")) {
         event = std::move(it->second.event);
         // The covered text accumulated between the two boundary portions.
         event.set_anchored_text(it->second.covered);
@@ -1871,7 +1869,7 @@ void emit_form_control(const Reference<css::beans::XPropertySet>& shape_props,
     if (services.is()) {
       for (const rtl::OUString& service : services->getSupportedServiceNames()) {
         std::string name = utf8(service);
-        if (name.rfind("com.sun.star.form.component.", 0) == 0) {
+        if (name.starts_with("com.sun.star.form.component.")) {
           field.set_field_type(name);
           break;
         }
@@ -2427,25 +2425,20 @@ bool emit_drawing_content(
   return true;
 }
 
-bool ends_with(const std::string& value, const std::string& suffix) {
-  return value.size() >= suffix.size() &&
-         value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
-
 // Maps the office core's shape type string to the placeholder role. The
 // type string is the reliable discriminator: SdXShape does not advertise
 // SubtitleShape or NotesShape through supportsService.
 officev1::PlaceholderRole placeholder_role_for(const std::string& shape_type) {
-  if (ends_with(shape_type, ".TitleTextShape")) {
+  if (shape_type.ends_with(".TitleTextShape")) {
     return officev1::PLACEHOLDER_ROLE_TITLE;
   }
-  if (ends_with(shape_type, ".OutlinerShape")) {
+  if (shape_type.ends_with(".OutlinerShape")) {
     return officev1::PLACEHOLDER_ROLE_OUTLINE;
   }
-  if (ends_with(shape_type, ".SubtitleShape")) {
+  if (shape_type.ends_with(".SubtitleShape")) {
     return officev1::PLACEHOLDER_ROLE_SUBTITLE;
   }
-  if (ends_with(shape_type, ".NotesShape")) {
+  if (shape_type.ends_with(".NotesShape")) {
     return officev1::PLACEHOLDER_ROLE_NOTES;
   }
   return officev1::PLACEHOLDER_ROLE_NONE;
@@ -2531,7 +2524,7 @@ bool emit_slide_shape(const Reference<css::drawing::XShape>& shape,
   }
   if (!emit_fn(event)) return false;
   Reference<css::drawing::XShapes> children;
-  if (ends_with(shape_type, ".GroupShape")) {
+  if (shape_type.ends_with(".GroupShape")) {
     children = Reference<css::drawing::XShapes>(shape, UNO_QUERY);
   }
   if (children.is()) {
@@ -2699,7 +2692,7 @@ bool emit_presentation_content(
             Reference<css::drawing::XShape> shape(notes_shapes->getByIndex(z),
                                                   UNO_QUERY);
             if (!shape.is()) continue;
-            if (!ends_with(utf8(shape->getShapeType()), ".NotesShape")) {
+            if (!utf8(shape->getShapeType()).ends_with(".NotesShape")) {
               continue;
             }
             Reference<css::beans::XPropertySet> note_props(shape, UNO_QUERY);
@@ -2767,8 +2760,9 @@ bool emit_calc_content(
   std::map<sal_Int32, std::string> format_cache;
   auto format_code = [&](sal_Int32 key) -> std::string {
     if (key == 0 || !formats.is()) return std::string();
-    auto found = format_cache.find(key);
-    if (found != format_cache.end()) return found->second;
+    if (auto found = format_cache.find(key); found != format_cache.end()) {
+      return found->second;
+    }
     std::string code;
     try {
       Reference<css::beans::XPropertySet> props = formats->getByKey(key);
@@ -3198,21 +3192,21 @@ std::string chart_title_text(const Reference<css::chart2::XTitled>& titled) {
 
 // Maps the raw chart2 chart-type service name to the coarse wire kind.
 officev1::EmbeddedChartKind chart_kind_for(const std::string& service) {
-  if (ends_with(service, ".BarChartType")) return officev1::EMBEDDED_CHART_KIND_BAR;
-  if (ends_with(service, ".ColumnChartType")) {
+  if (service.ends_with(".BarChartType")) return officev1::EMBEDDED_CHART_KIND_BAR;
+  if (service.ends_with(".ColumnChartType")) {
     return officev1::EMBEDDED_CHART_KIND_COLUMN;
   }
-  if (ends_with(service, ".LineChartType")) return officev1::EMBEDDED_CHART_KIND_LINE;
-  if (ends_with(service, ".AreaChartType")) return officev1::EMBEDDED_CHART_KIND_AREA;
-  if (ends_with(service, ".PieChartType")) return officev1::EMBEDDED_CHART_KIND_PIE;
-  if (ends_with(service, ".ScatterChartType")) {
+  if (service.ends_with(".LineChartType")) return officev1::EMBEDDED_CHART_KIND_LINE;
+  if (service.ends_with(".AreaChartType")) return officev1::EMBEDDED_CHART_KIND_AREA;
+  if (service.ends_with(".PieChartType")) return officev1::EMBEDDED_CHART_KIND_PIE;
+  if (service.ends_with(".ScatterChartType")) {
     return officev1::EMBEDDED_CHART_KIND_SCATTER;
   }
-  if (ends_with(service, ".BubbleChartType")) {
+  if (service.ends_with(".BubbleChartType")) {
     return officev1::EMBEDDED_CHART_KIND_BUBBLE;
   }
-  if (ends_with(service, ".NetChartType")) return officev1::EMBEDDED_CHART_KIND_NET;
-  if (ends_with(service, ".CandleStickChartType")) {
+  if (service.ends_with(".NetChartType")) return officev1::EMBEDDED_CHART_KIND_NET;
+  if (service.ends_with(".CandleStickChartType")) {
     return officev1::EMBEDDED_CHART_KIND_CANDLESTICK;
   }
   return officev1::EMBEDDED_CHART_KIND_OTHER;
@@ -4568,7 +4562,7 @@ std::string export_page_svg_uno(int page_number) {
     props[2].Name = "FilterData";
     props[2].Value <<= filter_data;
     storable->storeToURL(oustring("private:stream"), descriptor);
-    if (bytes.find("<svg") != std::string::npos) return bytes;
+    if (bytes.contains("<svg")) return bytes;
   } catch (const css::uno::Exception&) {
     // Document classes without an SVG store filter (Writer among them)
     // throw here on every page; the caller's raster fallback handles it

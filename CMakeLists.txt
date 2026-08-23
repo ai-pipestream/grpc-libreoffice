@@ -3,7 +3,8 @@ project(grpc-libreoffice VERSION 0.2.0 LANGUAGES CXX)
 
 include(CTest)
 
-set(CMAKE_CXX_STANDARD 17)
+# C++23: served by GCC 15 on the ubuntu:26.04 build/runtime toolchain.
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 

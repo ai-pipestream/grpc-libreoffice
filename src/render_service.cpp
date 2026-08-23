@@ -49,12 +49,10 @@ std::string lowercase(std::string value) {
 
 // Resolves the canonical source extension; empty when unresolvable.
 std::string resolve_extension(const std::string& filename, const std::string& content_type) {
-  size_t dot = filename.rfind('.');
-  if (dot != std::string::npos && dot + 1 < filename.size()) {
+  if (size_t dot = filename.rfind('.');
+      dot != std::string::npos && dot + 1 < filename.size()) {
     std::string extension = lowercase(filename.substr(dot + 1));
-    for (const std::string& known : kExtensions) {
-      if (known == extension) return extension;
-    }
+    if (std::ranges::contains(kExtensions, extension)) return extension;
   }
   std::string bare = lowercase(content_type.substr(0, content_type.find(';')));
   while (!bare.empty() && bare.back() == ' ') bare.pop_back();

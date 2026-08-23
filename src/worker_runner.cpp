@@ -153,7 +153,7 @@ WorkerOutcome run_worker(const std::vector<std::string>& argv,
         ::close(from_child[0]);
         return finish(pid, true, WorkerOutcome::Kind::kTimeout, "worker deadline elapsed");
       }
-      struct pollfd waiter = {from_child[0], POLLIN, 0};
+      struct pollfd waiter{.fd = from_child[0], .events = POLLIN, .revents = 0};
       int ready = ::poll(&waiter, 1, static_cast<int>(remaining.count()));
       if (ready < 0) {
         if (errno == EINTR) continue;

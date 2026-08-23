@@ -4,7 +4,7 @@
 // worker_render_test.cpp.
 
 #include <cstdlib>
-#include <iostream>
+#include <print>
 #include <string>
 #include <vector>
 
@@ -17,7 +17,7 @@ namespace docv1 = ai::pipestream::document::v1;
 
 void require(bool condition, const std::string& what) {
   if (!condition) {
-    std::cerr << "FAIL: " << what << "\n";
+    std::println(stderr, "FAIL: {}", what);
     std::exit(1);
   }
 }
@@ -27,7 +27,7 @@ void require_integrity(const grlibre::DoclingMapper& mapper,
   std::vector<std::string> errors =
       grlibre::docling_integrity_errors(mapper.document());
   for (const std::string& error : errors) {
-    std::cerr << "integrity: " << error << "\n";
+    std::println(stderr, "integrity: {}", error);
   }
   require(errors.empty(), what + ": ref tree is well formed");
 }
@@ -432,7 +432,7 @@ void verify_writer_stream() {
           "writer: images and chart become pictures");
   const docv1::PictureItem& image = document.pictures(0);
   require(image.label() == docv1::DOC_ITEM_LABEL_PICTURE
-              && image.image().uri().rfind("data:image/png;base64,", 0) == 0,
+              && image.image().uri().starts_with("data:image/png;base64,"),
           "writer: embedded image data URI");
   require(image.prov_size() == 1
               && image.prov(0).bbox().l() == 2000.0 - 284.0,
@@ -1119,6 +1119,6 @@ int main() {
   verify_partial_stream();
   verify_marks_stream();
   verify_out_of_grid_table_cell();
-  std::cout << "docling_map_test passed\n";
+  std::println("docling_map_test passed");
   return 0;
 }

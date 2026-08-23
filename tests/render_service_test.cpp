@@ -10,7 +10,7 @@
 
 #include <cstdlib>
 #include <filesystem>
-#include <iostream>
+#include <print>
 #include <string>
 #include <thread>
 #include <vector>
@@ -24,7 +24,7 @@ namespace officev1 = ai::pipestream::office::v1;
 
 void require(bool condition, const std::string& what) {
   if (!condition) {
-    std::cerr << "FAIL: " << what << "\n";
+    std::println(stderr, "FAIL: {}", what);
     std::exit(1);
   }
 }
@@ -218,13 +218,13 @@ int main() {
     require(info.diskless_documents(), "diskless posture advertised");
     require(info.internal_temp_artifacts_size() == 4,
             "every LibreOffice-internal temp artifact class named");
-    require(info.internal_temp_artifacts(0).find("odf-load") != std::string::npos,
+    require(info.internal_temp_artifacts(0).contains("odf-load"),
             "ODF load residual named");
-    require(info.internal_temp_artifacts(1).find("pdf-import") != std::string::npos,
+    require(info.internal_temp_artifacts(1).contains("pdf-import"),
             "PDF import residual named");
-    require(info.internal_temp_artifacts(2).find("embedded-media") != std::string::npos,
+    require(info.internal_temp_artifacts(2).contains("embedded-media"),
             "embedded media residual named");
-    require(info.internal_temp_artifacts(3).find("pdf-export") != std::string::npos,
+    require(info.internal_temp_artifacts(3).contains("pdf-export"),
             "PDF export residual named");
     require(info.document_mapping(), "ToDocument advertised");
     require(info.package_repair(), "package repair advertised");
@@ -316,7 +316,8 @@ int main() {
   }
 
   if (!std::filesystem::exists(config.install_path)) {
-    std::cerr << "SKIP remainder: no LibreOffice at " << config.install_path << "\n";
+    std::println(stderr, "SKIP remainder: no LibreOffice at {}",
+                 config.install_path);
     server->Shutdown();
     return 77;
   }
@@ -413,7 +414,7 @@ int main() {
     auto png = stream_pages(channel, "Hello over gRPC.\n", "hello.txt", true);
     require(png.first_page_format == officev1::PAGE_IMAGE_FORMAT_PNG,
             "default format names itself PNG");
-    require(png.first_page_bytes.rfind("\x89PNG", 0) == 0, "PNG magic");
+    require(png.first_page_bytes.starts_with("\x89PNG"), "PNG magic");
 
     auto jpeg = stream_pages(channel, "Hello over gRPC.\n", "hello.txt", true,
                              false, 0, 0, 0, officev1::PAGE_IMAGE_FORMAT_JPEG);
@@ -432,7 +433,7 @@ int main() {
     require(webp.first_page_format == officev1::PAGE_IMAGE_FORMAT_WEBP,
             "webp format named");
     require(webp.first_page_bytes.size() > 12
-                && webp.first_page_bytes.compare(0, 4, "RIFF") == 0
+                && webp.first_page_bytes.starts_with("RIFF")
                 && webp.first_page_bytes.compare(8, 4, "WEBP") == 0,
             "WebP magic");
     require(webp.first_page_bytes.size() < png.first_page_bytes.size(),
@@ -486,7 +487,7 @@ int main() {
                              false, 0, 0, 0, 0, 0, &gray);
     require(grey.status.ok(),
             "grayscale renders: " + grey.status.error_message());
-    require(grey.first_page_bytes.rfind("\x89PNG", 0) == 0,
+    require(grey.first_page_bytes.starts_with("\x89PNG"),
             "grayscale still encodes PNG");
 
     officev1::StreamOptions svg;
@@ -497,7 +498,7 @@ int main() {
             "svg renders: " + vector.status.error_message());
     require(vector.first_page_format == officev1::PAGE_IMAGE_FORMAT_SVG,
             "svg format named");
-    require(vector.first_page_bytes.find("<svg") != std::string::npos,
+    require(vector.first_page_bytes.contains("<svg"),
             "svg payload contains an <svg tag");
 
     // The page_format enum door (what clients send) must take the same
@@ -509,7 +510,7 @@ int main() {
             "page_format SVG renders: " + svg_fmt.status.error_message());
     require(svg_fmt.first_page_format == officev1::PAGE_IMAGE_FORMAT_SVG,
             "page_format SVG names itself");
-    require(svg_fmt.first_page_bytes.find("<svg") != std::string::npos,
+    require(svg_fmt.first_page_bytes.contains("<svg"),
             "page_format SVG payload is an SVG document");
   }
 
@@ -528,7 +529,7 @@ int main() {
                              0, 0, &gray);
     require(grey.status.ok(),
             "grayscale html renders: " + grey.status.error_message());
-    require(grey.first_page_bytes.rfind("\x89PNG", 0) == 0,
+    require(grey.first_page_bytes.starts_with("\x89PNG"),
             "grayscale html still encodes PNG");
     require(grey.first_page_bytes != color.first_page_bytes,
             "grayscale changes the painted pixels of a colored page");
@@ -565,7 +566,7 @@ int main() {
             "ToDocument with pages ok: " + status.error_message());
     bool embedded = false;
     for (const auto& entry : mapped_pages.document().pages()) {
-      if (entry.second.image().uri().rfind("data:image/png", 0) == 0) {
+      if (entry.second.image().uri().starts_with("data:image/png")) {
         embedded = true;
       }
     }
@@ -614,7 +615,7 @@ int main() {
     auto refused = stream_pages(channel, broken, "broken.docx", true);
     require(refused.status.error_code() == grpc::StatusCode::FAILED_PRECONDITION,
             "broken package without the opt-in is FAILED_PRECONDITION");
-    require(refused.status.error_message().find("allow_package_repair") != std::string::npos,
+    require(refused.status.error_message().contains("allow_package_repair"),
             "refusal names the opt-in field");
     auto opted = stream_pages(channel, broken, "broken.docx", true, true);
     require(opted.status.error_code() != grpc::StatusCode::UNIMPLEMENTED,
@@ -681,6 +682,6 @@ int main() {
             "SIGTERM exit is an orderly code 0");
   }
 
-  std::cout << "render-service-test passed\n";
+  std::println("render-service-test passed");
   return 0;
 }

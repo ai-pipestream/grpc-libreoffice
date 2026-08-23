@@ -16,7 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <iostream>
+#include <print>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -82,6 +82,10 @@ void handle_shutdown(int) {
 }  // namespace
 
 int main() {
+  // Container stdout is a pipe, so it is fully buffered by default and
+  // std::println does not flush the way std::endl did; line buffering keeps
+  // startup and metrics lines visible as they happen.
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);
   ::signal(SIGPIPE, SIG_IGN);
 
   grlibre::ServiceConfig config;
@@ -100,7 +104,7 @@ int main() {
     config.max_side_px = int_from_env("GRLIBRE_MAX_PAGE_PIXELS", 4096, 256, 16384);
     metrics_interval = int_from_env("GRLIBRE_METRICS_INTERVAL_SECONDS", 60, 0, 86400);
   } catch (const std::exception& bad_config) {
-    std::cerr << "Startup failed: " << bad_config.what() << "\n";
+    std::println(stderr, "Startup failed: {}", bad_config.what());
     return 1;
   }
   const char* lo_path = std::getenv("GRLIBRE_LO_PATH");
@@ -110,9 +114,11 @@ int main() {
   struct statfs tmpfs_stat;
   if (::statfs(config.tmpfs_dir.c_str(), &tmpfs_stat) != 0
       || tmpfs_stat.f_type != TMPFS_MAGIC) {
-    std::cerr << "Startup failed: " << config.tmpfs_dir
-              << " is not a tmpfs. Uploaded documents must stay in RAM; "
-                 "mount a tmpfs there or point GRLIBRE_TMPFS_DIR at one.\n";
+    std::println(stderr,
+                 "Startup failed: {} is not a tmpfs. Uploaded documents must "
+                 "stay in RAM; mount a tmpfs there or point GRLIBRE_TMPFS_DIR "
+                 "at one.",
+                 config.tmpfs_dir);
     return 1;
   }
   const char* worker = std::getenv("GRLIBRE_WORKER");
@@ -131,19 +137,18 @@ int main() {
   builder.RegisterService(&service);
   g_server = builder.BuildAndStart();
   if (g_server == nullptr) {
-    std::cerr << "Startup failed: cannot listen on port " << port << "\n";
+    std::println(stderr, "Startup failed: cannot listen on port {}", port);
     return 1;
   }
-  std::cout << "grpc-libreoffice listening on " << port
-            << " workers=" << config.max_concurrent_documents
-            << " dpi=" << config.render_dpi
-            << " cap=" << config.max_document_bytes << "B"
-            << " tmpfs=" << config.tmpfs_dir
-            << " core=\"" << config.libreoffice_version << "\"" << std::endl;
+  std::println("grpc-libreoffice listening on {} workers={} dpi={} cap={}B "
+               "tmpfs={} core=\"{}\"",
+               port, config.max_concurrent_documents, config.render_dpi,
+               config.max_document_bytes, config.tmpfs_dir,
+               config.libreoffice_version);
 
   g_shutdown_fd = ::eventfd(0, EFD_CLOEXEC);
   if (g_shutdown_fd < 0) {
-    std::cerr << "Startup failed: cannot create the shutdown eventfd\n";
+    std::println(stderr, "Startup failed: cannot create the shutdown eventfd");
     return 1;
   }
   std::thread shutdown_thread([] {
@@ -159,9 +164,9 @@ int main() {
     metrics = std::thread([&service, metrics_interval] {
       for (;;) {
         std::this_thread::sleep_for(std::chrono::seconds(metrics_interval));
-        std::cout << "grlibre metrics: docs{rendered=" << service.rendered.load()
-                  << ",rejected=" << service.rejected.load()
-                  << ",failed=" << service.failed.load() << "}" << std::endl;
+        std::println("grlibre metrics: docs{{rendered={},rejected={},failed={}}}",
+                     service.rendered.load(), service.rejected.load(),
+                     service.failed.load());
       }
     });
     metrics.detach();

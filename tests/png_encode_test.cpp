@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <iostream>
+#include <print>
 #include <string>
 #include <vector>
 
@@ -26,7 +26,7 @@ namespace {
 
 void require(bool condition, const char* what) {
   if (!condition) {
-    std::cerr << "FAIL: " << what << "\n";
+    std::println(stderr, "FAIL: {}", what);
     std::exit(1);
   }
 }
@@ -248,13 +248,14 @@ int main() {
     require(!encoded.empty(), "fixture encode succeeds");
     std::vector<std::uint8_t> decoded = decode_pixels(encoded, fixture.width, fixture.height);
     if (decoded != fixture.rgba) {
-      std::cerr << "FAIL: pixels differ after round-trip on " << fixture.name << "\n";
+      std::println(stderr, "FAIL: pixels differ after round-trip on {}",
+                   fixture.name);
       return 1;
     }
     std::string reference = encode_reference(fixture.rgba, fixture.width, fixture.height);
     if (encoded.size() > reference.size()) {
-      std::cerr << "FAIL: " << fixture.name << " grew vs stb level 8: "
-                << encoded.size() << " > " << reference.size() << "\n";
+      std::println(stderr, "FAIL: {} grew vs stb level 8: {} > {}",
+                   fixture.name, encoded.size(), reference.size());
       return 1;
     }
   }
@@ -338,6 +339,6 @@ int main() {
             "zero or negative dimensions leave pixels untouched");
   }
 
-  std::cout << "png-encode-test passed\n";
+  std::println("png-encode-test passed");
   return 0;
 }

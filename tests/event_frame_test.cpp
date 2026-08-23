@@ -3,7 +3,7 @@
 #include <unistd.h>
 
 #include <cstring>
-#include <iostream>
+#include <print>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -12,7 +12,7 @@ namespace {
 
 void require(bool condition, const char* what) {
   if (!condition) {
-    std::cerr << "FAIL: " << what << "\n";
+    std::println(stderr, "FAIL: {}", what);
     std::exit(1);
   }
 }
@@ -81,6 +81,6 @@ int main() {
   verify_roundtrip();
   verify_torn_frame_throws();
   verify_oversized_frame_throws();
-  std::cout << "event-frame-test passed\n";
+  std::println("event-frame-test passed");
   return 0;
 }
