@@ -193,10 +193,14 @@ if(GRLIBRE_TCMALLOC)
 endif()
 
 if(BUILD_TESTING)
-  set(GRLIBRE_TESTS event-frame-test png-encode-test worker-render-test render-service-test docling-map-test)
+  set(GRLIBRE_TESTS event-frame-test png-encode-test worker-runner-test
+      worker-render-test render-service-test docling-map-test)
   add_executable(event-frame-test tests/event_frame_test.cpp src/event_frame.cpp)
   target_include_directories(event-frame-test PRIVATE src)
   target_link_libraries(event-frame-test PRIVATE Threads::Threads grlibre_flags)
+
+  add_executable(worker-runner-test tests/worker_runner_test.cpp)
+  target_link_libraries(worker-runner-test PRIVATE grlibre_core grlibre_flags)
 
   add_executable(png-encode-test tests/png_encode_test.cpp src/png_encode.cpp)
   target_include_directories(png-encode-test PRIVATE src third_party/stb

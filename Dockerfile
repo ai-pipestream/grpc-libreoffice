@@ -14,7 +14,7 @@ COPY . .
 RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGRLIBRE_WERROR=ON \
     && cmake --build build \
     && ctest --test-dir build --output-on-failure \
-         -R 'event-frame-test|png-encode-test|worker-render-test|render-service-test|docling-map-test'
+         -R 'event-frame-test|png-encode-test|worker-runner-test|worker-render-test|render-service-test|docling-map-test'
 
 # Runtime: LibreOffice, fonts, and the two binaries. All writable paths live
 # under /tmp, so the container runs read-only with a tmpfs at /tmp; the
