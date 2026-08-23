@@ -62,7 +62,7 @@ set(protobuf_INSTALL OFF CACHE BOOL "" FORCE)
 set(ABSL_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(grpc
   GIT_REPOSITORY https://github.com/grpc/grpc.git
-  GIT_TAG v1.82.1
+  GIT_TAG v1.83.0
   GIT_SHALLOW TRUE
   GIT_SUBMODULES_RECURSE TRUE)
 FetchContent_MakeAvailable(grpc)
@@ -81,7 +81,7 @@ set(WEBP_BUILD_WEBPMUX OFF CACHE BOOL "" FORCE)
 set(WEBP_BUILD_EXTRAS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(libwebp
   GIT_REPOSITORY https://chromium.googlesource.com/webm/libwebp
-  GIT_TAG v1.5.0
+  GIT_TAG v1.6.0
   GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(libwebp)
 
