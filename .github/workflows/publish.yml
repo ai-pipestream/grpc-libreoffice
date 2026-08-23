@@ -2,10 +2,10 @@ name: Publish Image
 
 # Builds the image (the build stage runs the full test suite, real LibreOffice
 # renders included, so the push is gated on green) and pushes it to
-# docker.io/pipestreamai and our Forgejo container registry. Dispatch this
-# from Forgejo (git.rokkon.com), where the DOCKER_USER/DOCKER_TOKEN and
-# CICD_TOKEN org secrets live; on the GitHub mirror the secrets are absent
-# and a stray dispatch fails at login, pushing nothing.
+# docker.io/pipestreamai and our Forgejo container registry. The CICD_TOKEN
+# org secret only exists on Forgejo (git.rokkon.com); on the GitHub mirror it
+# is absent, so the Forgejo login and its tags are skipped there and the run
+# pushes to docker.io only.
 #
 # amd64 only for now; LibreOffice exists on arm64 and a matrix build on the
 # arm64 runners can follow if a consumer needs it.
@@ -22,26 +22,39 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    env:
+      # Empty on the GitHub mirror; set on Forgejo.
+      CICD_TOKEN: ${{ secrets.CICD_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - name: Compute image tags
         id: tags
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
           {
             echo "service-tags<<EOF"
             echo "docker.io/pipestreamai/grpc-libreoffice:latest"
-            echo "git.rokkon.com/ai-pipestream/grpc-libreoffice:latest"
-            if [ -n "${{ inputs.version }}" ]; then
-              echo "docker.io/pipestreamai/grpc-libreoffice:${{ inputs.version }}"
-              echo "git.rokkon.com/ai-pipestream/grpc-libreoffice:${{ inputs.version }}"
+            if [ -n "$CICD_TOKEN" ]; then
+              echo "git.rokkon.com/ai-pipestream/grpc-libreoffice:latest"
+            fi
+            if [ -n "$VERSION" ]; then
+              echo "docker.io/pipestreamai/grpc-libreoffice:$VERSION"
+              if [ -n "$CICD_TOKEN" ]; then
+                echo "git.rokkon.com/ai-pipestream/grpc-libreoffice:$VERSION"
+              fi
             fi
             echo "EOF"
             echo "ui-tags<<EOF"
             echo "docker.io/pipestreamai/grpc-libreoffice-ui:latest"
-            echo "git.rokkon.com/ai-pipestream/grpc-libreoffice-ui:latest"
-            if [ -n "${{ inputs.version }}" ]; then
-              echo "docker.io/pipestreamai/grpc-libreoffice-ui:${{ inputs.version }}"
-              echo "git.rokkon.com/ai-pipestream/grpc-libreoffice-ui:${{ inputs.version }}"
+            if [ -n "$CICD_TOKEN" ]; then
+              echo "git.rokkon.com/ai-pipestream/grpc-libreoffice-ui:latest"
+            fi
+            if [ -n "$VERSION" ]; then
+              echo "docker.io/pipestreamai/grpc-libreoffice-ui:$VERSION"
+              if [ -n "$CICD_TOKEN" ]; then
+                echo "git.rokkon.com/ai-pipestream/grpc-libreoffice-ui:$VERSION"
+              fi
             fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
@@ -54,6 +67,7 @@ jobs:
           username: ${{ secrets.DOCKER_USER }}
           password: ${{ secrets.DOCKER_TOKEN }}
       - name: Log in to Forgejo container registry
+        if: ${{ env.CICD_TOKEN != '' }}
         uses: docker/login-action@v3
         with:
           registry: git.rokkon.com
