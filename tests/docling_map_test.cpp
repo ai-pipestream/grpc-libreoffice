@@ -388,11 +388,11 @@ void verify_writer_stream() {
               && body->source(0).collector().collector() == "libreoffice"
               && body->source(0).collector().model() == "lok",
           "writer: text items carry the libreoffice collector source");
-  require(body->prov(0).charspan().start() == 33
-              && body->prov(0).charspan().end() == 42,
-          "writer: measured line narrows its charspan in annotation space");
-  require(body->prov(1).charspan().start() == 33
-              && body->prov(1).charspan().end() == 54,
+  require(body->prov(0).charspan().start() == 0
+              && body->prov(0).charspan().end() == 9,
+          "writer: measured line narrows its item-relative charspan");
+  require(body->prov(1).charspan().start() == 0
+              && body->prov(1).charspan().end() == 21,
           "writer: unmeasured line keeps the full item charspan");
 
   // Table folding.
