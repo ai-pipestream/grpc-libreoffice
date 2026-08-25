@@ -194,8 +194,12 @@ library) that folds a `StreamPages` event stream into one such `Document`:
 items in typed arenas linked by JSON Pointer refs, groups per sheet, slide,
 frame, and drawing group, headers and footers as furniture, speaker notes
 on the notes layer, and per-line page-local bounding boxes with exact
-per-line charspans as provenance. The mapper never touches LibreOffice and
-builds a valid document from any part selection.
+per-line charspans as provenance. Character formatting arrives as per-run
+inline spans, spreadsheet cells as typed values, and comments, tracked
+changes and bookmarks as references into the items they anchor in. The
+mapper never touches LibreOffice and builds a valid document from any part
+selection. `docs/document-mapping.md` is the ledger of what the fold
+captures, what still rides untyped, and what is not captured yet.
 
 ## Process model
 
