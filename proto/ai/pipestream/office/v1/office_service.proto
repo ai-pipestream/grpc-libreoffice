@@ -688,6 +688,14 @@ message TextRun {
   bool monospace = 18;
   // True when the run's case mapping renders it in small capitals.
   bool small_caps = 19;
+  // True when the run is overlined.
+  bool overline = 20;
+  // The run's named character style, for example "Emphasis"; empty when the
+  // run uses the paragraph's own character formatting.
+  string char_style = 21;
+  // Highlight (character background) color as 0xRRGGBB; -1 when the run has
+  // no highlight, which is the office core's own transparent value.
+  int32 highlight_rgb = 22;
 }
 
 // Paragraph is one body paragraph of a text document, in reading order, with
@@ -1376,6 +1384,11 @@ message SheetNamedRange {
   string content = 2;
   // NamedRangeFlag bits from the office core.
   int32 type_flags = 3;
+  // The cells the name resolves to, when it names a range rather than an
+  // expression; absent when the office core cannot resolve it.
+  SheetRangeRef range = 4;
+  // Zero-based ordinal of the sheet the range sits on; -1 when unresolved.
+  int32 sheet_index = 5;
 }
 
 // SheetDatabaseRange is one database range defined on the workbook: a named

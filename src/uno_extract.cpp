@@ -93,6 +93,7 @@
 #include <com/sun/star/lang/XMultiServiceFactory.hpp>
 #include <com/sun/star/lang/XServiceInfo.hpp>
 #include <com/sun/star/sheet/XCellRangeAddressable.hpp>
+#include <com/sun/star/sheet/XCellRangeReferrer.hpp>
 #include <com/sun/star/sheet/XDataPilotDescriptor.hpp>
 #include <com/sun/star/sheet/XDataPilotTable.hpp>
 #include <com/sun/star/sheet/XDataPilotTables.hpp>
@@ -1539,6 +1540,31 @@ void fill_run_char_props(const Reference<css::beans::XPropertySet>& props,
     run->set_small_caps(case_map == css::style::CaseMap::SMALLCAPS);
   } catch (const css::beans::UnknownPropertyException&) {
     // Expected probe result: case mapping is an optional character property.
+  }
+  try {
+    sal_Int16 overline = 0;
+    props->getPropertyValue("CharOverline") >>= overline;
+    run->set_overline(overline != 0);
+  } catch (const css::beans::UnknownPropertyException&) {
+    // Expected probe result: overlining is an optional character property.
+  }
+  try {
+    rtl::OUString style;
+    props->getPropertyValue("CharStyleName") >>= style;
+    run->set_char_style(utf8(style));
+  } catch (const css::beans::UnknownPropertyException&) {
+    // Expected probe result: only text models with a style catalogue name
+    // their character styles.
+  }
+  // -1 is the office core's own transparent value, and it is what a run
+  // without a highlight reports.
+  run->set_highlight_rgb(-1);
+  try {
+    sal_Int32 highlight = -1;
+    props->getPropertyValue("CharBackColor") >>= highlight;
+    run->set_highlight_rgb(highlight);
+  } catch (const css::beans::UnknownPropertyException&) {
+    // Expected probe result: character backgrounds are optional.
   }
   try {
     css::lang::Locale locale;
@@ -3176,6 +3202,27 @@ bool emit_calc_content(
             out->set_name(utf8(range->getName()));
             out->set_content(utf8(range->getContent()));
             out->set_type_flags(range->getType());
+            out->set_sheet_index(-1);
+            // A name that refers to cells resolves to them; a name holding
+            // an expression does not, and keeps only its content string.
+            try {
+              Reference<css::sheet::XCellRangeReferrer> referrer(range,
+                                                                 UNO_QUERY);
+              Reference<css::sheet::XCellRangeAddressable> address;
+              if (referrer.is()) {
+                address = Reference<css::sheet::XCellRangeAddressable>(
+                    referrer->getReferredCells(), UNO_QUERY);
+              }
+              if (address.is()) {
+                css::table::CellRangeAddress cells = address->getRangeAddress();
+                fill_range_ref(cells, out->mutable_range());
+                out->set_sheet_index(cells.Sheet);
+              }
+            } catch (const css::uno::Exception& error) {
+              warner.warn("named range " + out->name() +
+                              " does not resolve to cells",
+                          error);
+            }
             if (!emit_fn(event)) return false;
           }
         }

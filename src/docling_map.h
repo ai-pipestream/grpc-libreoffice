@@ -66,7 +66,15 @@ class DoclingMapper {
  private:
   // The classification of a new text item, selecting its BaseTextItem
   // variant.
-  enum class TextKind { kTitle, kSectionHeader, kList, kFormula, kText };
+  enum class TextKind {
+    kTitle,
+    kSectionHeader,
+    kList,
+    kFormula,
+    kText,
+    kFieldHeading,
+    kFieldValue,
+  };
 
   // The handle to a freshly appended text item: the shared base fields plus
   // its arena reference.
@@ -134,6 +142,10 @@ class DoclingMapper {
       ai::pipestream::document::v1::DocItemLabel label,
       ai::pipestream::document::v1::ContentLayer layer,
       const std::string& parent_ref, std::string* ref_out);
+  // Creates the form region and the form whose graph pairs the fields, once
+  // the first form field arrives.
+  void ensure_form_arena();
+
   ai::pipestream::document::v1::TableItem* add_table(
       ai::pipestream::document::v1::ContentLayer layer,
       const std::string& parent_ref, std::string* ref_out);
@@ -189,6 +201,17 @@ class DoclingMapper {
       google::protobuf::RepeatedPtrField<
           ai::pipestream::document::v1::InlineSpan>* spans,
       const std::string& owner_ref, long long base_offset = 0);
+
+  // Registers one embedded object as an attachment of the document: its
+  // container class id, the container's own word for what it is, and the
+  // item the payload became.
+  void register_embedded_object(
+      const ai::pipestream::office::v1::EmbeddedObject& object,
+      const std::string& item_ref);
+
+  // The name of a sheet by its zero-based ordinal; empty when no Sheet
+  // header for it has arrived.
+  std::string sheet_label(int index) const;
 
   // The text item behind an arena reference ("#/texts/N"); null when the
   // reference names no text item.
@@ -264,6 +287,16 @@ class DoclingMapper {
   // in ascending offset order.
   std::vector<BodySpan> body_spans_;
   std::vector<PendingComment> pending_comments_;
+  // Comment items by the office core's comment name, and the reply links
+  // waiting for the comment they name to arrive.
+  std::map<std::string, std::string> comment_ref_by_name_;
+  std::vector<std::pair<std::string, std::string>> pending_comment_parents_;
+  // Embedded objects registered as attachments, numbered in arrival order.
+  int attachment_index_ = 0;
+  // Named ranges arrive before the sheets they sit on, so the sheet each
+  // one names is filled in once the sheet headers have streamed past:
+  // (index in Document.named_ranges, zero-based sheet ordinal).
+  std::vector<std::pair<int, int>> pending_range_sheets_;
   std::vector<PendingReference> pending_references_;
   std::vector<PendingAnchor> pending_anchors_;
   std::vector<PendingChange> pending_changes_;
@@ -283,9 +316,13 @@ class DoclingMapper {
   // The text document has a single draw page, so the path alone keys it.
   std::map<std::string, std::string> writer_groups_;
   // The lazily created document-level comment section (Writer comments and
-  // slide annotations) and form-field area group refs.
+  // slide annotations).
   std::string comments_group_ref_;
-  std::string form_fields_group_ref_;
+  // The lazily created form arena: the region every field item hangs from,
+  // and the form whose graph pairs each key with its value.
+  std::string field_region_ref_;
+  std::string form_item_ref_;
+  int graph_cell_id_ = 0;
 };
 
 // Returns structural integrity problems of a mapped document: RefItem

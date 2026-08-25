@@ -8,13 +8,17 @@ survives the fold, what only survives untyped, and what is not captured yet.
 It is a companion to the capture audit; the sections below follow the order
 the audit ranked the gaps in.
 
+The schema now has a typed field for almost everything this collector
+extracts. Where a value still rides `custom_fields`, that is recorded below
+as a gap in the schema, not as a choice.
+
 ## Captured in typed fields
 
 | What | Where it lands |
 |---|---|
 | Resolved text of a field (page number, date, cross-reference, caption number, index or mail-merge result) | inline in `TextItemBase.text`, with an `InlineSpan.field_code` over its range |
 | A cross-reference's destination | `InlineSpan.target`, a `FineRef` into the item the named anchor sits in |
-| Per-run character formatting | `TextItemBase.spans` / `TableCell.spans`: `formatting` (bold, italic, underline, strikethrough, monospace, small caps, script), `font_family`, `font_size_pt`, `color`, `language` |
+| Per-run character formatting | `TextItemBase.spans` / `TableCell.spans`: `formatting` (bold, italic, underline, strikethrough, monospace, small caps, overline, script), `font_family`, `font_size_pt`, `color`, `language`, `style_name`, `highlight_color` |
 | Uniform character formatting | `TextItemBase.formatting`, unchanged, now including `script` |
 | Paragraph style name | `TextItemBase.style_name`, verbatim |
 | Comments | items under a `GROUP_LABEL_COMMENT_SECTION` group, back-linked from the annotated item's `comments` `FineRef` with the annotated range |
@@ -48,25 +52,68 @@ An anchor that falls in content the fold does not emit (a table cell, a
 header, a footnote) keeps its record with no target rather than being
 dropped. An unanchored change is still evidence that the change exists.
 
-## Reaching the document only as untyped values
+## Where the rest of the office plane lands
 
-These still ride `custom_fields`, a `google.protobuf.Value` map. Each one
-has a knowable shape and no typed home in the document schema yet; the map
-is a holding pen, not a destination.
+Everything that used to sit in a `custom_fields` value map has a typed home
+now, and the map copies are gone.
 
-| What | Shape it wants |
+| What | Where it lands |
 |---|---|
-| Comment identity and thread structure | author, initials, instant, resolved flag, parent comment reference, anchored text |
-| Document properties beyond the metadata slot | subject, `modified_by`, printed instant and printer, template name, editing cycles and duration, per-name statistics, typed user properties |
-| Page styles | name, size, four margins, column count, and the variant (shared, first, left, right) |
-| Form fields | the schema's own `FormItem` / `FieldItem` / `FieldValueItem` subtree, which nothing populates today |
-| Named ranges, database ranges, pivot tables | name, sheet reference, row and column spans, header and totals flags, axis field lists |
-| Sheet attributes | index, name, visibility, tab color, print areas |
-| Shape identity | shape type, name, text-frame chain names, z order, rotation |
-| A picture's accessibility title, when it also has a description | the schema has one description slot, so a title only fills it when there is no description |
-| Character style name, highlight color, overline | the run attributes `Formatting` still has no field for |
-| Embedded object identity | name, class id, kind |
-| Index and note attribution | index service name and title; footnote label, endnote flag, and the citation mark's position |
+| Comment identity and threading | `TextItemBase.comment_meta`: author, initials, timestamp, resolved, `parent` `FineRef` to the comment it replies to, anchored text |
+| Shape identity | `TextItemBase.shape` / `PictureItem.shape` (`ShapeMeta`): shape type, name, text-frame chain names, z order, rotation in degrees |
+| Footnote and endnote attribution | `TextItemBase.footnote_meta`: label, endnote flag |
+| Index attribution | `TextItemBase.index_meta`: the source's index service name and title |
+| The property block | `DocumentMeta`: subject, `modified_by`, printed instant and printer, template, editing cycles and duration, `DocumentStatistics`, typed `UserProperty` values |
+| Page styles | `Document.page_styles` (`PageStyle`): name, size, four margins, column count |
+| Named and database ranges | `Document.named_ranges` (`NamedRange`): name, `GridSpan`, header and totals flags, kind |
+| Pivot tables | `Document.pivots` (`PivotSpec`): name, source and output `GridSpan`, the four axis field lists |
+| Sheet attributes | `GroupItem.sheet` (`SheetMeta`): index, visibility, tab color, print areas as grid spans |
+| Embedded object identity | `Document.attachments` (`SubDocumentRef`): id, name, media type, `class_id`, `kind`, and the item the payload became |
+| A picture's accessibility title | `PictureMeta.accessibility_title`, beside `description` |
+| Character style, highlight, overline | `InlineSpan.style_name`, `.highlight_color`, `Formatting.overline` |
+| Form fields | the schema's own form subtree, below |
+
+### The form subtree
+
+A form field is no longer a text item with a bag of attributes. Each one
+becomes:
+
+```
+#/body
+  #/field_regions/0            FieldRegionItem   the form area
+    #/field_items/N            FieldItem         one per office form field
+      #/texts/k                FieldHeadingItem  the field's label
+      #/texts/v                FieldValueItem    its value, with `kind`
+  #/form_items/0               FormItem          the key-to-value graph
+```
+
+`FormItem.graph` carries one `GraphCell` per label and per value, with the
+cell's `item_ref` pointing at the item it describes and a
+`GRAPH_LINK_LABEL_TO_VALUE` link joining the pair. A checkbox's value cell
+is a `GRAPH_CELL_LABEL_CHECKBOX`, and its item carries
+`DOC_ITEM_LABEL_CHECKBOX_SELECTED` or `_UNSELECTED`. The integrity walk
+resolves every one of those references like any other.
+
+## Still without a typed home
+
+Four things have no slot anywhere in the schema and stay on
+`custom_fields`, which is now the exception rather than the rule:
+
+- **A form field's programmatic name, a dropdown's entries and selected
+  index, and the parameters a fieldmark stores.** They sit on the
+  `FieldItem`. The label and the value are typed; these are not.
+- **A form field's span in the annotation text space.** Every other anchor
+  resolves to a `FineRef`; a field has no slot to hold one.
+- **Whether a spreadsheet note is permanently shown.** A display state, on
+  the note item.
+- **A sheet chart's source ranges and header flags.** The same chart also
+  arrives through the embedded-object path with its data, and nothing links
+  the two; the audit's `ChartSourceAnnotation` is the shape that would fix
+  both at once.
+- **Which page style a furniture item belongs to.** `PageItem.style_name`
+  exists, but the office wire says which style a *header block* belongs to,
+  not which style each page uses, so the fold has nothing to resolve it
+  with and leaves it unset.
 
 ## Dates and times
 
@@ -100,6 +147,9 @@ Extraction side:
 - **Calc cell styling**, hidden rows and columns, row heights, frozen panes,
   conditional formatting, data validation, sheet protection.
 - **Cell hyperlinks**, image hyperlinks, and image maps.
+- **A named range holding an expression rather than a range.** `NamedRange`
+  has a `GridSpan` and no expression slot, so a name defined as a formula
+  keeps its name and loses its definition.
 - **What a cross-reference points at.** `InlineSpan.reference_kind` exists,
   but a text document's cross-reference names a bookmark, a reference mark,
   or a sequence, and none of those maps onto citation, footnote, claim, or

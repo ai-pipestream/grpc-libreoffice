@@ -738,6 +738,9 @@ const char kTypedFods[] = R"(<?xml version="1.0" encoding="UTF-8"?>
     <table:table-cell office:value-type="string"><text:p>secret</text:p></table:table-cell>
    </table:table-row>
   </table:table>
+  <table:named-expressions>
+   <table:named-range table:name="Prices" table:base-cell-address="$Data.$A$1" table:cell-range-address="$Data.$C$2:$C$3"/>
+  </table:named-expressions>
   <table:database-ranges>
    <table:database-range table:name="DBData" table:target-range-address="Data.A1:Data.C3" table:contains-header="true" table:display-filter-buttons="true"/>
   </table:database-ranges>
@@ -763,9 +766,14 @@ void verify_typed_spreadsheet() {
   std::vector<officev1::SheetRow> rows;
   std::vector<officev1::SheetCellComment> comments;
   std::vector<officev1::SheetDatabaseRange> database_ranges;
+  bool named_range_ok = true;
   officev1::StreamPagesResponse event;
   for (const std::string& payload : payloads) {
     require(event.ParseFromString(payload), "fods event parses");
+    if (event.has_sheet_named_range()) {
+      const officev1::SheetNamedRange& range = event.sheet_named_range();
+      named_range_ok = range.has_range() && range.sheet_index() >= 0;
+    }
     if (event.has_sheet()) sheets.push_back(event.sheet());
     if (event.has_sheet_row()) rows.push_back(event.sheet_row());
     if (event.has_sheet_cell_comment()) {
@@ -835,6 +843,8 @@ void verify_typed_spreadsheet() {
   require(value_ok, "numeric cell keeps its number");
   require(currency_ok, "currency cell carries its number format code");
   require(date_ok, "a date cell resolves its serial against the null date");
+  require(named_range_ok,
+          "a named range resolves to the cells it refers to");
   require(boolean_ok, "a logical cell is marked boolean, not just numeric");
   require(formula_ok, "formula cell keeps formula and computed number");
   require(comments.size() == 1 && comments[0].sheet_index() == 0 &&
@@ -1759,15 +1769,18 @@ void verify_docling_mapping() {
               && document.pictures(0).image().uri()
                      .starts_with("data:image/"),
           "mapped picture carries a data URI");
-  bool frame_group = false;
   std::string wpg_ref;
   for (const docv1::GroupItem& group : document.groups()) {
-    if (group.name() == "Frame1") {
-      frame_group = group.meta().custom_fields().count("chain_next") == 1;
-    }
     if (group.name() == "WPG1") wpg_ref = group.self_ref();
   }
-  require(frame_group, "mapped frame group keeps its chain name");
+  bool frame_chain = false;
+  for (const docv1::BaseTextItem& item : document.texts()) {
+    if (item.item_case() != docv1::BaseTextItem::kText) continue;
+    const docv1::TextItemBase& base = item.text().base();
+    if (base.shape().name() != "Frame1") continue;
+    frame_chain = base.shape().chain_next() == "Frame2";
+  }
+  require(frame_chain, "the mapped frame item keeps its chain name");
   require(!wpg_ref.empty(), "mapped WPG group container exists");
   int nested = 0;
   for (const docv1::GroupItem& group : document.groups()) {
@@ -2590,6 +2603,9 @@ const char kFieldsFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
   <style:style style:name="DE" style:family="text">
    <style:text-properties fo:language="de" fo:country="DE"/>
   </style:style>
+  <style:style style:name="HL" style:family="text">
+   <style:text-properties fo:background-color="#ffff00" style:text-overline-style="solid"/>
+  </style:style>
   <style:style style:name="SC" style:family="text">
    <style:text-properties fo:font-variant="small-caps" style:font-name="Liberation Mono"/>
   </style:style>
@@ -2597,7 +2613,7 @@ const char kFieldsFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
  <office:body><office:text>
   <text:p>Page <text:page-number text:select-page="current">1</text:page-number> of the report.</text:p>
   <text:p>See <text:bookmark-ref text:reference-format="text" text:ref-name="mark1">Target</text:bookmark-ref> below.</text:p>
-  <text:p>E = mc<text:span text:style-name="SUP">2</text:span> und <text:span text:style-name="DE">Wasser</text:span>. <text:span text:style-name="SC">caps</text:span></text:p>
+  <text:p>E = mc<text:span text:style-name="SUP">2</text:span> und <text:span text:style-name="DE">Wasser</text:span>. <text:span text:style-name="SC">caps</text:span> <text:span text:style-name="HL">lit</text:span></text:p>
   <text:p><text:bookmark-start text:name="mark1"/>Target section<text:bookmark-end text:name="mark1"/></text:p>
   <table:table table:name="Merged">
    <table:table-column table:number-columns-repeated="2"/>
@@ -2629,6 +2645,7 @@ void verify_field_and_structure_content() {
   bool superscript_ok = false;
   bool language_ok = false;
   bool caps_ok = false;
+  bool highlight_ok = false;
   bool alt_text_ok = false;
   bool merge_anchor_ok = false;
   bool merge_wide_ok = false;
@@ -2661,6 +2678,10 @@ void verify_field_and_structure_content() {
           if (run.text() == "caps" && run.small_caps() && run.monospace()) {
             caps_ok = true;
           }
+          if (run.text() == "lit" && run.overline() &&
+              run.highlight_rgb() == 0xffff00) {
+            highlight_ok = true;
+          }
         }
         // Paragraphs are separated by one newline in the same space.
         if (event.paragraph().char_offset() >= 0) next_offset++;
@@ -2692,6 +2713,7 @@ void verify_field_and_structure_content() {
   require(superscript_ok, "a superscript run reports its escapement");
   require(language_ok, "a run in another language reports its locale");
   require(caps_ok, "a run reports its case mapping and font pitch");
+  require(highlight_ok, "a run reports its highlight and its overline");
   require(alt_text_ok, "an image reports its title and alt text");
   require(merge_anchor_ok, "a vertical merge anchor reports its row span");
   require(merge_wide_ok, "a horizontal merge reports its column span");

@@ -39,6 +39,8 @@ const docv1::TextItemBase& base_of(const docv1::BaseTextItem& item) {
       return item.section_header().base();
     case docv1::BaseTextItem::kListItem: return item.list_item().base();
     case docv1::BaseTextItem::kFormula: return item.formula().base();
+    case docv1::BaseTextItem::kFieldHeading: return item.field_heading().base();
+    case docv1::BaseTextItem::kFieldValue: return item.field_value().base();
     default: return item.text().base();
   }
 }
@@ -535,15 +537,24 @@ void verify_writer_stream() {
               && footnote->content_layer() == docv1::CONTENT_LAYER_BODY,
           "writer: footnote is body with FOOTNOTE label");
 
-  // Text frame group.
+  // Text frame group: the chain now rides the item that carries the text.
   bool frame_group = false;
+  std::string frame_child;
   for (const docv1::GroupItem& group : document.groups()) {
-    if (group.name() == "Frame1") {
-      frame_group = group.meta().custom_fields().count("chain_next") == 1
-          && group.children_size() == 1;
+    if (group.name() == "Frame1" && group.children_size() == 1) {
+      frame_group = true;
+      frame_child = group.children(0).ref();
     }
   }
-  require(frame_group, "writer: frame group wraps its text with chain names");
+  require(frame_group, "writer: frame group wraps its text");
+  bool frame_chain = false;
+  for (const docv1::BaseTextItem& item : document.texts()) {
+    const docv1::TextItemBase& base = base_of(item);
+    if (base.self_ref() != frame_child) continue;
+    frame_chain = base.shape().name() == "Frame1"
+        && base.shape().chain_next() == "Frame2";
+  }
+  require(frame_chain, "writer: the frame item names its chain successor");
 }
 
 void verify_calc_stream() {
@@ -618,6 +629,11 @@ void verify_calc_stream() {
     officev1::SheetNamedRange* range = event.mutable_sheet_named_range();
     range->set_name("MyRange");
     range->set_content("$Data.$A$1:$B$3");
+    range->set_sheet_index(0);
+    range->mutable_range()->set_start_row(0);
+    range->mutable_range()->set_start_column(0);
+    range->mutable_range()->set_end_row(2);
+    range->mutable_range()->set_end_column(1);
     mapper.consume(event);
   }
   {
@@ -702,22 +718,26 @@ void verify_calc_stream() {
             "calc: no A1-keyed side map beside the grid");
   }
   require(table.comments_size() == 1, "calc: comment referenced from table");
-  require(document.body().meta().custom_fields().count("named_range:MyRange")
-              == 1,
-          "calc: named range on body meta");
-  require(document.body().meta().custom_fields().count("database_range:Orders")
-              == 1,
-          "calc: database range on body meta");
-  {
-    const auto& fields = document.body().meta().custom_fields()
-        .at("database_range:Orders").struct_value().fields();
-    require(fields.at("range").string_value() == "A1:B3"
-                && fields.at("sheet_index").number_value() == 0
-                && fields.at("contains_header").bool_value()
-                && fields.at("auto_filter").bool_value()
-                && !fields.at("totals_row").bool_value(),
-            "calc: database range fields survive on body meta");
+  require(document.named_ranges_size() == 2,
+          "calc: both range declarations are typed on the document");
+  const docv1::NamedRange* named = nullptr;
+  const docv1::NamedRange* database = nullptr;
+  for (const docv1::NamedRange& range : document.named_ranges()) {
+    if (range.name() == "MyRange") named = &range;
+    if (range.name() == "Orders") database = &range;
   }
+  require(named != nullptr && named->kind() == "named"
+              && named->range().start().row() == 0
+              && named->range().end().col() == 1
+              && named->range().start().sheet() == "Data",
+          "calc: a named range resolves to a sheet grid span");
+  require(database != nullptr && database->kind() == "database"
+              && database->has_headers() && !database->has_totals()
+              && database->range().end().row() == 2,
+          "calc: a database range keeps its span and its header flag");
+  require(document.body().meta().custom_fields().count("named_range:MyRange")
+              == 0,
+          "calc: ranges leave the body custom fields");
   bool chart_ok = false;
   for (const docv1::PictureItem& picture : document.pictures()) {
     if (picture.label() == docv1::DOC_ITEM_LABEL_CHART) {
@@ -1030,10 +1050,8 @@ void verify_marks_stream() {
           "marks: the merged link spans both runs");
 
   const docv1::GroupItem* comments = nullptr;
-  const docv1::GroupItem* form_area = nullptr;
   for (const docv1::GroupItem& group : document.groups()) {
     if (group.label() == docv1::GROUP_LABEL_COMMENT_SECTION) comments = &group;
-    if (group.label() == docv1::GROUP_LABEL_FORM_AREA) form_area = &group;
   }
   require(comments != nullptr && comments->children_size() == 1,
           "marks: one comment in the comment section");
@@ -1045,13 +1063,13 @@ void verify_marks_stream() {
     const docv1::TextItemBase& base = base_of(item);
     if (base.text() != "Please fix") continue;
     comment_ref = base.self_ref();
-    const auto& fields = base.meta().custom_fields();
-    comment_ok = fields.at("author").string_value() == "Alice" &&
-                 fields.at("resolved").bool_value() &&
-                 fields.at("anchored_text").string_value() == "the docs" &&
-                 fields.at("date_ms").number_value() == 1700000000000.0;
+    const docv1::CommentMeta& identity = base.comment_meta();
+    comment_ok = identity.author() == "Alice" && identity.initials() == "A" &&
+                 identity.resolved() &&
+                 identity.anchored_text() == "the docs" &&
+                 identity.timestamp().seconds() == 1700000000;
   }
-  require(comment_ok, "marks: comment carries author and state");
+  require(comment_ok, "marks: comment identity is typed on the item");
   require(paragraph->comments_size() == 1
               && paragraph->comments(0).ref() == comment_ref
               && paragraph->comments(0).range().start() == 4
@@ -1080,26 +1098,39 @@ void verify_marks_stream() {
                      .count("tracked_change:0") == 0,
           "marks: anchors and changes leave the body custom fields");
 
-  require(form_area != nullptr && form_area->children_size() == 2,
-          "marks: both form fields land in the form area");
+  // Form fields live in the schema's own form subtree now.
+  require(document.field_regions_size() == 1
+              && document.field_regions(0).children_size() == 2,
+          "marks: both form fields land in the field region");
+  require(document.field_items_size() == 2, "marks: one field item per field");
   const docv1::TextItemBase* checkbox =
       find_text(document, docv1::DOC_ITEM_LABEL_CHECKBOX_SELECTED);
-  require(checkbox != nullptr, "marks: checked checkbox gets the selected label");
-  const auto& checkbox_fields = checkbox->meta().custom_fields();
-  require(checkbox_fields.at("checked").bool_value() &&
-              checkbox_fields.at("name").string_value() == "check1" &&
+  require(checkbox != nullptr,
+          "marks: a checked checkbox gets the selected label");
+  require(checkbox->parent().ref() == "#/field_items/0",
+          "marks: the value item hangs from its field item");
+  const auto& checkbox_fields =
+      document.field_items(0).meta().custom_fields();
+  require(checkbox_fields.at("name").string_value() == "check1" &&
               checkbox_fields.at("param:Checkbox_Checked").bool_value(),
-          "marks: checkbox state and parameters survive");
+          "marks: the attributes with no slot stay on the field item");
   bool dropdown_ok = false;
   for (const docv1::BaseTextItem& item : document.texts()) {
-    const docv1::TextItemBase& base = base_of(item);
-    if (base.meta().custom_fields().count("selected_index") == 0) continue;
-    const auto& fields = base.meta().custom_fields();
-    dropdown_ok = base.text() == "beta" &&
-                  fields.at("selected_index").number_value() == 1 &&
-                  fields.at("list_entries").list_value().values_size() == 2;
+    if (item.item_case() != docv1::BaseTextItem::kFieldValue) continue;
+    if (item.field_value().base().text() != "beta") continue;
+    dropdown_ok = item.field_value().kind()
+        == "vnd.oasis.opendocument.field.FORMDROPDOWN";
   }
-  require(dropdown_ok, "marks: dropdown selection and entries survive");
+  require(dropdown_ok, "marks: a field value names its own kind");
+  require(document.form_items_size() == 1,
+          "marks: the form carries the key-value graph");
+  const docv1::GraphData& graph = document.form_items(0).graph();
+  bool graph_ok = false;
+  for (const docv1::GraphCell& cell : graph.cells()) {
+    if (cell.label() != docv1::GRAPH_CELL_LABEL_CHECKBOX) continue;
+    graph_ok = cell.item_ref().ref() == checkbox->self_ref();
+  }
+  require(graph_ok, "marks: a checkbox is a checkbox cell pointing at its item");
 
   // Every folded item still carries the collector source.
   for (const docv1::BaseTextItem& item : document.texts()) {
@@ -1575,6 +1606,25 @@ void verify_document_meta() {
     meta->set_modified_epoch_ms(1678924800000);
     meta->add_keywords("finance");
     meta->add_keywords("quarterly");
+    meta->set_subject("Numbers");
+    meta->set_modified_by("Bob Brown");
+    meta->set_printed_epoch_ms(1679011200000);
+    meta->set_printed_by("Front Desk");
+    meta->set_template_name("Report.ott");
+    meta->set_editing_cycles(7);
+    meta->set_editing_duration_seconds(5400);
+    (*meta->mutable_statistics())["WordCount"] = 1234;
+    (*meta->mutable_statistics())["PageCount"] = 12;
+    (*meta->mutable_statistics())["LineCount"] = 99;
+    officev1::UserProperty* owner = meta->add_user_properties();
+    owner->set_name("Owner");
+    owner->set_text("Finance");
+    officev1::UserProperty* reviewed = meta->add_user_properties();
+    reviewed->set_name("Reviewed");
+    reviewed->set_flag(true);
+    officev1::UserProperty* due = meta->add_user_properties();
+    due->set_name("Due");
+    due->set_epoch_ms(1679011200000);
     mapper.consume(event);
   }
   mapper.consume(status_event(""));
@@ -1591,6 +1641,144 @@ void verify_document_meta() {
   require(meta.keywords_size() == 2
               && mapper.document().body().meta().keywords().values_size() == 2,
           "meta: keywords reach both the metadata slot and the body keywords");
+  require(meta.subject() == "Numbers" && meta.modified_by() == "Bob Brown"
+              && meta.printer() == "Front Desk"
+              && meta.template_() == "Report.ott"
+              && meta.printed().seconds() == 1679011200,
+          "meta: the property block is typed, not a value map");
+  require(meta.editing_cycles() == 7
+              && meta.editing_duration_seconds() == 5400,
+          "meta: editing history is typed");
+  require(meta.statistics().words() == 1234
+              && meta.statistics().pages() == 12,
+          "meta: the statistics the schema counts are typed by name");
+  require(meta.user_properties_size() == 3
+              && meta.user_properties(0).text() == "Finance"
+              && meta.user_properties(1).boolean()
+              && meta.user_properties(2).instant().seconds() == 1679011200,
+          "meta: user properties keep the type the source stored");
+  require(mapper.document().body().meta().custom_fields().empty(),
+          "meta: nothing about the document rides a value map");
+}
+
+// The declarations a document makes about its own layout and workbook, and
+// the identity of the objects it embeds, are typed beside the document.
+void verify_typed_declarations() {
+  grlibre::DoclingMapper mapper;
+  mapper.consume(info_event("text", 1, 15840));
+  {
+    officev1::StreamPagesResponse event;
+    officev1::PageStyleInfo* style = event.mutable_page_style();
+    style->set_name("Standard");
+    style->set_width_twips(11906);
+    style->set_height_twips(16838);
+    style->set_margin_left_twips(1134);
+    style->set_margin_right_twips(1135);
+    style->set_margin_top_twips(1136);
+    style->set_margin_bottom_twips(1137);
+    style->set_columns(2);
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::DocumentIndex* index = event.mutable_document_index();
+    index->set_type("com.sun.star.text.ContentIndex");
+    index->set_title("Table of Contents");
+    officev1::TextRun* run = index->add_runs();
+    run->set_text("Chapter 1");
+    run->set_char_offset(-1);
+    run->set_char_length(9);
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::Footnote* note = event.mutable_footnote();
+    note->set_endnote(true);
+    note->set_label("i");
+    note->set_page_index(0);
+    officev1::TextRun* run = note->add_runs();
+    run->set_text("An endnote.");
+    run->set_char_offset(-1);
+    run->set_char_length(11);
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::EmbeddedObject* object = event.mutable_embedded_object();
+    object->set_kind(officev1::EMBEDDED_OBJECT_KIND_OLE_OTHER);
+    object->set_name("Object 1");
+    object->set_clsid("00020906-0000-0000-C000-000000000046");
+    object->set_page_index(0);
+    object->set_replacement_mime_type("image/png");
+    object->set_replacement_image("pngbytes");
+    mapper.consume(event);
+  }
+  mapper.consume(status_event(""));
+  require_integrity(mapper, "declarations");
+
+  const docv1::Document& document = mapper.document();
+  require(document.page_styles_size() == 1
+              && document.page_styles(0).name() == "Standard"
+              && document.page_styles(0).size().width() == 11906.0
+              && document.page_styles(0).margins().left() == 1134.0
+              && document.page_styles(0).margins().bottom() == 1137.0
+              && document.page_styles(0).columns() == 2,
+          "declarations: a page style is a typed declaration");
+  require(document.body().meta().custom_fields().count("page_style:Standard")
+              == 0,
+          "declarations: page styles leave the body custom fields");
+  const docv1::TextItemBase* index =
+      find_text(document, docv1::DOC_ITEM_LABEL_DOCUMENT_INDEX);
+  require(index != nullptr
+              && index->index_meta().service()
+                  == "com.sun.star.text.ContentIndex"
+              && index->index_meta().title() == "Table of Contents",
+          "declarations: an index names its own kind");
+  const docv1::TextItemBase* note =
+      find_text(document, docv1::DOC_ITEM_LABEL_FOOTNOTE);
+  require(note != nullptr && note->footnote_meta().endnote()
+              && note->footnote_meta().label() == "i",
+          "declarations: an endnote says so in a typed field");
+  require(document.attachments_size() == 1
+              && document.attachments(0).class_id()
+                  == "00020906-0000-0000-C000-000000000046"
+              && document.attachments(0).name() == "Object 1"
+              && document.attachments(0).kind() == "ole_other"
+              && document.attachments(0).item_ref() == "#/pictures/0",
+          "declarations: an embedded object is a registered attachment");
+  require(document.pictures(0).meta().custom_fields().count("clsid") == 0,
+          "declarations: the class id leaves the picture custom fields");
+}
+
+// Character styling the office model exposes per run: the named character
+// style, the highlight behind it, and the overline above it.
+void verify_run_styling() {
+  grlibre::DoclingMapper mapper;
+  mapper.consume(info_event("text", 1, 15840));
+  {
+    officev1::StreamPagesResponse event = paragraph_event(0, 0);
+    officev1::Paragraph* paragraph = event.mutable_paragraph();
+    int64_t offset = 0;
+    officev1::TextRun* plain = add_run(paragraph, "plain ", &offset);
+    plain->set_highlight_rgb(-1);
+    officev1::TextRun* marked = add_run(paragraph, "marked", &offset);
+    marked->set_char_style("Emphasis");
+    marked->set_highlight_rgb(0xffff00);
+    marked->set_overline(true);
+    marked->set_highlight_rgb(0xffff00);
+    mapper.consume(event);
+  }
+  mapper.consume(status_event(""));
+  const docv1::TextItemBase& base = base_of(mapper.document().texts(0));
+  require(base.spans_size() == 1,
+          "styling: only the run that says something gets a span");
+  require(base.spans(0).style_name() == "Emphasis"
+              && base.spans(0).highlight_color() == "#ffff00"
+              && base.spans(0).formatting().overline(),
+          "styling: character style, highlight, and overline reach the span");
+  require(base.spans(0).range().start() == 6
+              && base.spans(0).range().end() == 12,
+          "styling: the span covers exactly its run");
 }
 
 int main() {
@@ -1608,6 +1796,8 @@ int main() {
   verify_slide_content();
   verify_page_units_and_format();
   verify_document_meta();
+  verify_typed_declarations();
+  verify_run_styling();
   std::println("docling_map_test passed");
   return 0;
 }
