@@ -194,6 +194,14 @@ void verify_writer_stream() {
     split->set_column(-1);
     split->set_name("B2.1");
     split->set_text("split text");
+    // A vertical merge anchored at A1 covering both rows.
+    table->mutable_cells(0)->set_row_span(2);
+    // A cell name that anchors nowhere has no place in the grid.
+    officev1::TableCellData* stray = table->add_cells();
+    stray->set_row(-1);
+    stray->set_column(-1);
+    stray->set_name("?");
+    stray->set_text("stray text");
     mapper.consume(event);
   }
   {
@@ -404,12 +412,32 @@ void verify_writer_stream() {
   const docv1::TableItem& table = document.tables(0);
   require(table.data().num_rows() == 2 && table.data().num_cols() == 2,
           "writer: table dimensions");
-  require(table.data().table_cells_size() == 4, "writer: four placed cells");
+  require(table.data().table_cells_size() == 5,
+          "writer: four base cells plus the anchored split cell");
   require(table.data().grid_size() == 2
               && table.data().grid(1).cells(1).text() == "cell B2",
           "writer: grid populated");
-  require(table.meta().custom_fields().count("cell:B2.1") == 1,
-          "writer: split cell rides custom fields by name");
+  {
+    // The split cell keeps the base-grid position its office name anchors
+    // at instead of degrading to text under a custom field.
+    const docv1::TableCell* split = nullptr;
+    for (const docv1::TableCell& cell : table.data().table_cells()) {
+      if (cell.text() == "split text") split = &cell;
+    }
+    require(split != nullptr, "writer: split cell stays a real cell");
+    require(split->start_row_offset_idx() == 1
+                && split->start_col_offset_idx() == 1,
+            "writer: split cell anchors where its name says");
+    require(table.meta().custom_fields().count("cell:B2.1") == 0,
+            "writer: an anchored split cell needs no custom field");
+    require(table.meta().custom_fields().count("cell:?") == 1,
+            "writer: a cell name anchoring nowhere still keeps its text");
+  }
+  require(table.data().table_cells(0).row_span() == 2
+              && table.data().table_cells(0).end_row_offset_idx() == 2,
+          "writer: a vertical merge keeps its row span");
+  require(table.data().grid(0).cells(0).row_span() == 2,
+          "writer: the grid copy keeps the merge span");
   {
     // A1 carried per-cell line rectangles; its bbox is the page-local union
     // of both lines, on table_cells and the grid copy alike.
@@ -656,13 +684,23 @@ void verify_calc_stream() {
   }
   require(merged_ok, "calc: merge span mapped");
   require(value_ok, "calc: value cell display text mapped");
-  require(table.meta().custom_fields().count("A3") == 1
-              && table.meta().custom_fields().at("A3").number_value() == 3.5,
-          "calc: numeric value rides custom fields by A1 name");
-  require(table.meta().custom_fields().count("B3") == 1
-              && table.meta().custom_fields().at("B3").struct_value()
-                      .fields().at("formula").string_value() == "=A3*2",
-          "calc: formula rides custom fields by A1 name");
+  {
+    // Values are typed on the cell now, not stringly keyed beside the grid.
+    const docv1::TableCell* a3 = nullptr;
+    const docv1::TableCell* b3 = nullptr;
+    for (const docv1::TableCell& cell : table.data().table_cells()) {
+      if (cell.start_row_offset_idx() != 2) continue;
+      if (cell.start_col_offset_idx() == 0) a3 = &cell;
+      if (cell.start_col_offset_idx() == 1) b3 = &cell;
+    }
+    require(a3 != nullptr && a3->value().number() == 3.5,
+            "calc: numeric value is typed on the cell");
+    require(b3 != nullptr && b3->value().formula() == "=A3*2",
+            "calc: formula is typed on the cell");
+    require(table.meta().custom_fields().count("A3") == 0
+                && table.meta().custom_fields().count("B3") == 0,
+            "calc: no A1-keyed side map beside the grid");
+  }
   require(table.comments_size() == 1, "calc: comment referenced from table");
   require(document.body().meta().custom_fields().count("named_range:MyRange")
               == 1,
@@ -1001,37 +1039,46 @@ void verify_marks_stream() {
           "marks: one comment in the comment section");
   require(comments->parent().ref() == "#/furniture",
           "marks: comments live in furniture");
+  std::string comment_ref;
   bool comment_ok = false;
   for (const docv1::BaseTextItem& item : document.texts()) {
     const docv1::TextItemBase& base = base_of(item);
     if (base.text() != "Please fix") continue;
+    comment_ref = base.self_ref();
     const auto& fields = base.meta().custom_fields();
     comment_ok = fields.at("author").string_value() == "Alice" &&
                  fields.at("resolved").bool_value() &&
-                 fields.at("char_start").number_value() == 4 &&
-                 fields.at("char_end").number_value() == 12 &&
                  fields.at("anchored_text").string_value() == "the docs" &&
                  fields.at("date_ms").number_value() == 1700000000000.0;
   }
-  require(comment_ok, "marks: comment carries author, span, and state");
+  require(comment_ok, "marks: comment carries author and state");
+  require(paragraph->comments_size() == 1
+              && paragraph->comments(0).ref() == comment_ref
+              && paragraph->comments(0).range().start() == 4
+              && paragraph->comments(0).range().end() == 12,
+          "marks: the annotated item back-links the comment over its range");
 
-  const auto& body_fields = document.body().meta().custom_fields();
-  require(body_fields.count("tracked_change:0") == 1,
-          "marks: tracked change recorded on the body");
-  const auto& change = body_fields.at("tracked_change:0").struct_value();
-  require(change.fields().at("kind").string_value() == "Insert" &&
-              change.fields().at("author").string_value() == "Bob" &&
-              change.fields().at("char_start").number_value() == 0 &&
-              change.fields().at("char_end").number_value() == 4 &&
-              change.fields().at("text").string_value() == "See ",
-          "marks: tracked change carries kind, author, and span");
-  require(body_fields.count("bookmark:mark1") == 1,
-          "marks: bookmark recorded on the body");
-  const auto& mark = body_fields.at("bookmark:mark1").struct_value();
-  require(mark.fields().at("char_start").number_value() == 4 &&
-              mark.fields().at("char_end").number_value() == 12 &&
-              mark.fields().at("text").string_value() == "the docs",
-          "marks: bookmark carries its span and covered text");
+  require(document.changes_size() == 1, "marks: one tracked change recorded");
+  const docv1::ChangeRecord& change = document.changes(0);
+  require(change.kind() == "insert" && change.author() == "Bob"
+              && change.content() == "See ",
+          "marks: tracked change carries kind, author, and content");
+  require(change.has_target()
+              && change.target().ref() == paragraph->self_ref()
+              && change.target().range().start() == 0
+              && change.target().range().end() == 4,
+          "marks: tracked change targets the item range it touches");
+
+  require(document.anchors_size() == 1, "marks: one named anchor recorded");
+  require(document.anchors(0).name() == "mark1"
+              && document.anchors(0).target().ref() == paragraph->self_ref()
+              && document.anchors(0).target().range().start() == 4
+              && document.anchors(0).target().range().end() == 12,
+          "marks: bookmark becomes an anchor into the item space");
+  require(document.body().meta().custom_fields().count("bookmark:mark1") == 0
+              && document.body().meta().custom_fields()
+                     .count("tracked_change:0") == 0,
+          "marks: anchors and changes leave the body custom fields");
 
   require(form_area != nullptr && form_area->children_size() == 2,
           "marks: both form fields land in the form area");
@@ -1132,6 +1179,412 @@ void verify_code_item_integrity() {
   require(errors.empty(), "code item: inline references validate cleanly");
 }
 
+// Builds one body paragraph event with the given document-absolute offset.
+officev1::StreamPagesResponse paragraph_event(int index, int64_t char_offset) {
+  officev1::StreamPagesResponse event;
+  officev1::Paragraph* paragraph = event.mutable_paragraph();
+  paragraph->set_index(index);
+  paragraph->set_page_index(0);
+  paragraph->set_list_level(-1);
+  paragraph->set_page_number_offset(-1);
+  paragraph->set_char_offset(char_offset);
+  return event;
+}
+
+// Appends one run of plain body text at the running annotation offset.
+officev1::TextRun* add_run(officev1::Paragraph* paragraph,
+                           const std::string& text, int64_t* offset) {
+  officev1::TextRun* run = paragraph->add_runs();
+  run->set_text(text);
+  run->set_char_offset(*offset);
+  run->set_char_length(static_cast<int64_t>(text.size()));
+  *offset += static_cast<int64_t>(text.size());
+  return run;
+}
+
+// A field's rendered result reaches the body text as a tagged run, and a
+// cross-reference field's span points at the anchor it names.
+void verify_field_runs() {
+  grlibre::DoclingMapper mapper;
+  mapper.consume(info_event("text", 1, 15840));
+  {
+    officev1::StreamPagesResponse event = paragraph_event(0, 0);
+    officev1::Paragraph* paragraph = event.mutable_paragraph();
+    paragraph->set_style("Default Paragraph Style");
+    int64_t offset = 0;
+    add_run(paragraph, "Page ", &offset);
+    officev1::TextRun* page_number = add_run(paragraph, "7", &offset);
+    page_number->set_field_code("PageNumber");
+    add_run(paragraph, " see ", &offset);
+    officev1::TextRun* reference = add_run(paragraph, "Chapter 2", &offset);
+    reference->set_field_code("GetReference");
+    reference->set_field_target("mark1");
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event = paragraph_event(1, 20);
+    officev1::Paragraph* paragraph = event.mutable_paragraph();
+    int64_t offset = 20;
+    add_run(paragraph, "Chapter 2 body", &offset);
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::Bookmark* bookmark = event.mutable_bookmark();
+    bookmark->set_name("mark1");
+    bookmark->set_char_start(20);
+    bookmark->set_char_end(29);
+    bookmark->set_covered_text("Chapter 2");
+    mapper.consume(event);
+  }
+  mapper.consume(status_event(""));
+  require_integrity(mapper, "fields");
+
+  const docv1::Document& document = mapper.document();
+  require(document.texts_size() == 2, "fields: both paragraphs folded");
+  const docv1::TextItemBase& first = base_of(document.texts(0));
+  require(first.text() == "Page 7 see Chapter 2",
+          "fields: resolved field text is part of the body text");
+  require(first.style_name() == "Default Paragraph Style",
+          "fields: the paragraph style name is kept verbatim");
+  const docv1::InlineSpan* page_span = nullptr;
+  const docv1::InlineSpan* reference_span = nullptr;
+  for (const docv1::InlineSpan& span : first.spans()) {
+    if (span.field_code() == "PageNumber") page_span = &span;
+    if (span.field_code() == "GetReference") reference_span = &span;
+  }
+  require(page_span != nullptr && page_span->range().start() == 5
+              && page_span->range().end() == 6,
+          "fields: the page number span covers its resolved text");
+  require(reference_span != nullptr && reference_span->range().start() == 11
+              && reference_span->range().end() == 20,
+          "fields: the cross-reference span covers its resolved text");
+  require(reference_span->has_target()
+              && reference_span->target().ref()
+                  == base_of(document.texts(1)).self_ref()
+              && reference_span->target().range().start() == 0
+              && reference_span->target().range().end() == 9,
+          "fields: a cross-reference points at the anchor it names");
+}
+
+// Per-run formatting survives as inline spans, and the item keeps its
+// all-or-nothing Formatting only when every run agrees.
+void verify_character_spans() {
+  grlibre::DoclingMapper mapper;
+  mapper.consume(info_event("text", 1, 15840));
+  {
+    officev1::StreamPagesResponse event;
+    officev1::DocumentMetadata* meta = event.mutable_metadata();
+    meta->set_language("en-US");
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event = paragraph_event(0, 0);
+    officev1::Paragraph* paragraph = event.mutable_paragraph();
+    int64_t offset = 0;
+    officev1::TextRun* plain = add_run(paragraph, "water H", &offset);
+    plain->set_font("Liberation Serif");
+    plain->set_size_pt(12.0f);
+    plain->set_language("en-US");
+    officev1::TextRun* subscript = add_run(paragraph, "2", &offset);
+    subscript->set_font("Liberation Serif");
+    subscript->set_size_pt(12.0f);
+    subscript->set_language("en-US");
+    subscript->set_escapement(-33);
+    // Two portions the office core split for reasons a reader never sees.
+    for (const char* text : {"O ", "ist "}) {
+      officev1::TextRun* tail = add_run(paragraph, text, &offset);
+      tail->set_font("Liberation Serif");
+      tail->set_size_pt(12.0f);
+      tail->set_language("en-US");
+    }
+    officev1::TextRun* german = add_run(paragraph, "Wasser", &offset);
+    german->set_font("Liberation Serif");
+    german->set_size_pt(12.0f);
+    german->set_weight(150.0f);
+    german->set_color_rgb(0x336699);
+    german->set_language("de-DE");
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event = paragraph_event(1, 20);
+    officev1::Paragraph* paragraph = event.mutable_paragraph();
+    int64_t offset = 20;
+    for (const char* text : {"uni", "form"}) {
+      officev1::TextRun* run = add_run(paragraph, text, &offset);
+      run->set_font("Liberation Sans");
+      run->set_size_pt(10.0f);
+      run->set_weight(150.0f);
+      run->set_escapement(33);
+    }
+    mapper.consume(event);
+  }
+  mapper.consume(status_event(""));
+  require_integrity(mapper, "spans");
+
+  const docv1::Document& document = mapper.document();
+  const docv1::TextItemBase& mixed = base_of(document.texts(0));
+  require(!mixed.has_formatting(),
+          "spans: mixed runs leave item formatting unset");
+  require(mixed.spans_size() == 4, "spans: one span per formatting run");
+  require(mixed.spans(2).range().start() == 8
+              && mixed.spans(2).range().end() == 14,
+          "spans: adjacent runs agreeing on everything coalesce");
+  require(mixed.spans(0).font_family() == "Liberation Serif"
+              && mixed.spans(0).font_size_pt() == 12.0,
+          "spans: font family and size reach the span");
+  require(mixed.spans(0).language().empty(),
+          "spans: a run in the document language carries no language");
+  require(mixed.spans(1).formatting().script() == docv1::SCRIPT_SUB
+              && mixed.spans(1).range().start() == 7
+              && mixed.spans(1).range().end() == 8,
+          "spans: negative escapement is a subscript run");
+  require(mixed.spans(3).formatting().bold()
+              && mixed.spans(3).color() == "#336699"
+              && mixed.spans(3).language() == "de-DE",
+          "spans: bold, color, and a differing language reach the span");
+
+  const docv1::TextItemBase& uniform = base_of(document.texts(1));
+  require(uniform.formatting().bold()
+              && uniform.formatting().script() == docv1::SCRIPT_SUPER,
+          "spans: a uniform item keeps item-level formatting and script");
+  require(uniform.spans_size() == 1
+              && uniform.spans(0).range().start() == 0
+              && uniform.spans(0).range().end() == 7,
+          "spans: uniform runs coalesce into one span over the whole item");
+}
+
+// Spreadsheet cells carry typed values, their format code, column widths,
+// and grid provenance instead of a string-keyed side map.
+void verify_typed_cells() {
+  grlibre::DoclingMapper mapper;
+  {
+    officev1::StreamPagesResponse event = info_event("spreadsheet", 1, 20000);
+    for (auto& rect : *event.mutable_document_info()->mutable_page_rects()) {
+      rect.set_x_twips(0);
+      rect.set_y_twips(0);
+    }
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::Sheet* sheet = event.mutable_sheet();
+    sheet->set_index(0);
+    sheet->set_name("Ledger");
+    sheet->set_visible(true);
+    sheet->set_tab_color_rgb(-1);
+    sheet->set_used_end_row(0);
+    sheet->set_used_end_column(3);
+    sheet->add_column_widths_twips(1280);
+    sheet->add_column_widths_twips(2560);
+    sheet->add_column_widths_twips(1280);
+    sheet->add_column_widths_twips(1280);
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::SheetRow* row = event.mutable_sheet_row();
+    row->set_sheet_index(0);
+    row->set_row(0);
+    officev1::SheetCell* flag = row->add_cells();
+    flag->set_column(0);
+    flag->set_type(officev1::SHEET_CELL_TYPE_VALUE);
+    flag->set_number(1);
+    flag->set_display("TRUE");
+    flag->set_is_boolean(true);
+    flag->set_number_format_string("BOOLEAN");
+    officev1::SheetCell* when = row->add_cells();
+    when->set_column(1);
+    when->set_type(officev1::SHEET_CELL_TYPE_VALUE);
+    when->set_number(45000);
+    when->set_display("2023-03-15");
+    when->set_is_datetime(true);
+    when->set_datetime_epoch_ms(1678838400000);
+    when->set_number_format_string("YYYY-MM-DD");
+    officev1::SheetCell* broken = row->add_cells();
+    broken->set_column(2);
+    broken->set_type(officev1::SHEET_CELL_TYPE_FORMULA);
+    broken->set_formula("=1/0");
+    broken->set_display("#DIV/0!");
+    broken->set_error_code(532);
+    officev1::SheetCell* money = row->add_cells();
+    money->set_column(3);
+    money->set_type(officev1::SHEET_CELL_TYPE_VALUE);
+    money->set_number(12.5);
+    money->set_display("$12.50");
+    money->set_number_format_string("$#,##0.00");
+    mapper.consume(event);
+  }
+  mapper.consume(status_event(""));
+  require_integrity(mapper, "cells");
+
+  const docv1::Document& document = mapper.document();
+  require(document.tables_size() == 1, "cells: one table for the sheet");
+  const docv1::TableData& data = document.tables(0).data();
+  require(data.columns_size() == 4
+              && data.columns(0).name() == "A"
+              && data.columns(1).name() == "B"
+              && data.columns(1).width() == 2560.0,
+          "cells: column widths become a column schema");
+  require(data.table_cells_size() == 4, "cells: every cell mapped");
+  require(data.table_cells(0).value().boolean()
+              && data.table_cells(0).value().number_format() == "BOOLEAN",
+          "cells: a logical format makes a boolean value");
+  require(data.table_cells(1).value().datetime() == "2023-03-15T00:00:00Z"
+              && data.table_cells(1).text() == "2023-03-15",
+          "cells: a date format resolves to an instant, text stays display");
+  require(data.table_cells(2).value().error() == "#DIV/0!",
+          "cells: a failed formula reports its error literal");
+  require(data.table_cells(3).value().number() == 12.5
+              && data.table_cells(3).value().number_format() == "$#,##0.00",
+          "cells: a formatted number keeps both value and format");
+  require(data.row_prov_size() == 1
+              && data.row_prov(0).grid().row() == 0
+              && data.row_prov(0).grid().sheet() == "Ledger",
+          "cells: each used row is located in the sheet grid");
+}
+
+// A deck's pictures and table shapes reach the document under their slide.
+void verify_slide_content() {
+  grlibre::DoclingMapper mapper;
+  mapper.consume(info_event("presentation", 1, 21600));
+  {
+    officev1::StreamPagesResponse event;
+    officev1::Slide* slide = event.mutable_slide();
+    slide->set_index(0);
+    slide->set_name("Slide 1");
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::SlideShape* shape = event.mutable_slide_shape();
+    shape->set_slide_index(0);
+    shape->set_shape_type("com.sun.star.drawing.TableShape");
+    shape->mutable_position()->set_x(1000);
+    shape->mutable_position()->set_y(2000);
+    shape->set_width_twips(8000);
+    shape->set_height_twips(3000);
+    officev1::TableData* table = shape->mutable_table();
+    table->set_index(-1);
+    table->set_page_index(-1);
+    table->set_rows(2);
+    table->set_columns(2);
+    const char* names[] = {"A1", "B1", "A2", "B2"};
+    for (int i = 0; i < 4; i++) {
+      officev1::TableCellData* cell = table->add_cells();
+      cell->set_row(i / 2);
+      cell->set_column(i % 2);
+      cell->set_name(names[i]);
+      cell->set_text(std::string("slide ") + names[i]);
+      cell->set_row_span(1);
+      cell->set_column_span(1);
+    }
+    table->mutable_cells(0)->set_column_span(2);
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::EmbeddedImage* image = event.mutable_embedded_image();
+    image->set_index(0);
+    image->set_page_index(0);
+    image->set_name("Picture 1");
+    image->set_description("A bar chart of quarterly revenue");
+    image->set_mime_type("image/jpeg");
+    image->set_data("jpegbytes");
+    image->mutable_anchor()->set_x(4000);
+    image->mutable_anchor()->set_y(5000);
+    image->set_width_twips(3000);
+    image->set_height_twips(2000);
+    mapper.consume(event);
+  }
+  mapper.consume(status_event(""));
+  require_integrity(mapper, "slides");
+
+  const docv1::Document& document = mapper.document();
+  const docv1::GroupItem* slide = nullptr;
+  for (const docv1::GroupItem& group : document.groups()) {
+    if (group.label() == docv1::GROUP_LABEL_SLIDE) slide = &group;
+  }
+  require(slide != nullptr, "slides: the slide group exists");
+  require(document.tables_size() == 1
+              && document.tables(0).parent().ref() == slide->self_ref(),
+          "slides: a table shape becomes a table under its slide");
+  const docv1::TableData& data = document.tables(0).data();
+  require(data.table_cells_size() == 4
+              && data.table_cells(0).col_span() == 2
+              && data.table_cells(0).text() == "slide A1",
+          "slides: slide table cells keep their text and spans");
+  require(document.pictures_size() == 1
+              && document.pictures(0).parent().ref() == slide->self_ref(),
+          "slides: a slide picture lands under its slide");
+  const docv1::PictureItem& picture = document.pictures(0);
+  require(picture.image().uri().starts_with("data:image/jpeg;base64,"),
+          "slides: slide pictures carry their bytes");
+  require(picture.meta().description().text()
+              == "A bar chart of quarterly revenue",
+          "slides: alt text becomes the picture description");
+  require(picture.prov_size() == 1 && picture.prov(0).bbox().l() == 4000.0,
+          "slides: slide geometry is already page-local");
+}
+
+// Pages declare their coordinate unit, and a page image reports the
+// encoding the request actually asked for.
+void verify_page_units_and_format() {
+  grlibre::DoclingMapper mapper;
+  mapper.consume(info_event("text", 1, 15840));
+  {
+    officev1::StreamPagesResponse event;
+    officev1::PageImage* image = event.mutable_page_image();
+    image->set_index(0);
+    image->set_width_px(816);
+    image->set_height_px(1056);
+    image->set_dpi(96);
+    image->set_png("webpbytes");
+    image->set_format(officev1::PAGE_IMAGE_FORMAT_WEBP);
+    mapper.consume(event);
+  }
+  mapper.consume(status_event(""));
+  const docv1::Document& document = mapper.document();
+  const docv1::PageItem& page = document.pages().at(1);
+  require(page.unit() == "twip", "pages: the coordinate unit is declared");
+  require(page.image().mimetype() == "image/webp"
+              && page.image().uri().starts_with("data:image/webp;base64,"),
+          "pages: the page image reports the encoding it carries");
+}
+
+// The document's own properties reach the schema's metadata slot.
+void verify_document_meta() {
+  grlibre::DoclingMapper mapper;
+  mapper.consume(info_event("text", 1, 15840));
+  {
+    officev1::StreamPagesResponse event;
+    officev1::DocumentMetadata* meta = event.mutable_metadata();
+    meta->set_title("Quarterly Report");
+    meta->set_author("Alice Adams");
+    meta->set_language("en-US");
+    meta->set_generator("LibreOffice/25.2");
+    meta->set_created_epoch_ms(1678838400000);
+    meta->set_modified_epoch_ms(1678924800000);
+    meta->add_keywords("finance");
+    meta->add_keywords("quarterly");
+    mapper.consume(event);
+  }
+  mapper.consume(status_event(""));
+  const docv1::DocumentMeta& meta = mapper.document().source_meta();
+  require(meta.title() == "Quarterly Report"
+              && meta.authors_size() == 1
+              && meta.authors(0) == "Alice Adams",
+          "meta: title and author land in the metadata slot");
+  require(meta.created() == "2023-03-15T00:00:00Z"
+              && meta.modified() == "2023-03-16T00:00:00Z",
+          "meta: timestamps become ISO 8601 instants");
+  require(meta.language() == "en-US" && meta.generator() == "LibreOffice/25.2",
+          "meta: language and generator are kept");
+  require(meta.keywords_size() == 2
+              && mapper.document().body().meta().keywords().values_size() == 2,
+          "meta: keywords reach both the metadata slot and the body keywords");
+}
+
 int main() {
   verify_writer_stream();
   verify_calc_stream();
@@ -1141,6 +1594,12 @@ int main() {
   verify_marks_stream();
   verify_out_of_grid_table_cell();
   verify_code_item_integrity();
+  verify_field_runs();
+  verify_character_spans();
+  verify_typed_cells();
+  verify_slide_content();
+  verify_page_units_and_format();
+  verify_document_meta();
   std::println("docling_map_test passed");
   return 0;
 }

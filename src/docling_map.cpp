@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
+#include <ctime>
 #include <set>
 #include <sstream>
 
@@ -17,6 +19,11 @@ namespace {
 
 // The schema identity docling-core v2 interop expects on the root.
 constexpr const char* kSchemaName = "docling_document_v2";
+
+// Every coordinate this mapper emits is in twips, the office core's own
+// unit; the page declares it so a merge with another producer's geometry
+// cannot silently mix spaces.
+constexpr const char* kCoordinateUnit = "twip";
 
 // Grids above this cell count keep table_cells only; a fully materialized
 // grid over a sparse used range would dwarf the data it carries.
@@ -62,6 +69,89 @@ std::string base64(const std::string& data) {
 
 std::string data_uri(const std::string& mime, const std::string& bytes) {
   return "data:" + mime + ";base64," + base64(bytes);
+}
+
+// The media type of a rendered page image. The request selects the encoding
+// and the response names it; a producer that predates format selection sends
+// PNG and no name.
+std::string page_image_mime(officev1::PageImageFormat format) {
+  switch (format) {
+    case officev1::PAGE_IMAGE_FORMAT_JPEG: return "image/jpeg";
+    case officev1::PAGE_IMAGE_FORMAT_WEBP: return "image/webp";
+    case officev1::PAGE_IMAGE_FORMAT_SVG: return "image/svg+xml";
+    default: return "image/png";
+  }
+}
+
+// An instant as an ISO 8601 UTC timestamp, the shape the document schema
+// declares for source timestamps. Empty for the zero instant, which the
+// office wire uses for "unset".
+std::string iso8601_utc(int64_t epoch_ms) {
+  if (epoch_ms == 0) return std::string();
+  time_t seconds = static_cast<time_t>(epoch_ms / 1000);
+  struct tm parts = {};
+  if (gmtime_r(&seconds, &parts) == nullptr) return std::string();
+  char text[64];
+  std::snprintf(text, sizeof(text), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+                parts.tm_year + 1900, parts.tm_mon + 1, parts.tm_mday,
+                parts.tm_hour, parts.tm_min, parts.tm_sec);
+  return text;
+}
+
+// A run color as #rrggbb. The office core reports automatic color as 0, so
+// an explicit black is indistinguishable from no color at all and both stay
+// unset rather than claiming a color the document never declared.
+std::string hex_color(uint32_t color_rgb) {
+  if (color_rgb == 0) return std::string();
+  char text[8];
+  std::snprintf(text, sizeof(text), "#%02x%02x%02x", (color_rgb >> 16) & 0xff,
+                (color_rgb >> 8) & 0xff, color_rgb & 0xff);
+  return text;
+}
+
+// The vertical position of a run from its escapement percentage: the office
+// core raises superscript above the baseline and lowers subscript below it.
+docv1::Script script_for(int escapement) {
+  if (escapement > 0) return docv1::SCRIPT_SUPER;
+  if (escapement < 0) return docv1::SCRIPT_SUB;
+  return docv1::SCRIPT_UNSPECIFIED;
+}
+
+// Every character attribute of a run. Adjacent runs agreeing on all of them
+// are one inline span; a portion boundary the reader cannot see is not a
+// formatting boundary.
+struct RunKey {
+  std::string font;
+  float size_pt = 0;
+  bool bold = false;
+  bool italic = false;
+  bool underline = false;
+  bool strikethrough = false;
+  uint32_t color_rgb = 0;
+  int escapement = 0;
+  std::string language;
+  std::string hyperlink;
+  std::string field_code;
+  std::string field_target;
+
+  bool operator==(const RunKey& other) const = default;
+};
+
+RunKey run_key(const officev1::TextRun& run) {
+  RunKey key;
+  key.font = run.font();
+  key.size_pt = run.size_pt();
+  key.bold = run.weight() >= 150.0f;
+  key.italic = run.italic();
+  key.underline = run.underline();
+  key.strikethrough = run.strikethrough();
+  key.color_rgb = run.color_rgb();
+  key.escapement = run.escapement();
+  key.language = run.language();
+  key.hyperlink = run.hyperlink_url();
+  key.field_code = run.field_code();
+  key.field_target = run.field_target();
+  return key;
 }
 
 std::string mime_for_extension(const std::string& extension) {
@@ -125,22 +215,25 @@ long long runs_length(
   return total;
 }
 
-// Sets item-level Formatting when every run agrees on the four flags docling
-// models; mixed-format text keeps formatting unset.
+// Sets item-level Formatting when every run agrees on the flags the item
+// level models; mixed-format text keeps item formatting unset and is
+// described run by run in the item's inline spans instead.
 void set_uniform_formatting(
     const google::protobuf::RepeatedPtrField<officev1::TextRun>& runs,
     docv1::TextItemBase* base) {
   if (runs.empty()) return;
   bool bold = runs[0].weight() >= 150.0f;
+  docv1::Script script = script_for(runs[0].escapement());
   for (const officev1::TextRun& run : runs) {
     if ((run.weight() >= 150.0f) != bold || run.italic() != runs[0].italic()
         || run.underline() != runs[0].underline()
-        || run.strikethrough() != runs[0].strikethrough()) {
+        || run.strikethrough() != runs[0].strikethrough()
+        || script_for(run.escapement()) != script) {
       return;
     }
   }
   if (!bold && !runs[0].italic() && !runs[0].underline()
-      && !runs[0].strikethrough()) {
+      && !runs[0].strikethrough() && script == docv1::SCRIPT_UNSPECIFIED) {
     return;
   }
   docv1::Formatting* formatting = base->mutable_formatting();
@@ -148,6 +241,7 @@ void set_uniform_formatting(
   formatting->set_italic(runs[0].italic());
   formatting->set_underline(runs[0].underline());
   formatting->set_strikethrough(runs[0].strikethrough());
+  formatting->set_script(script);
 }
 
 // Attaches the runs' hyperlinks to the item: the first link lands in the
@@ -199,6 +293,16 @@ void apply_run_hyperlinks(
       std::move(value);
 }
 
+// Attaches a shape's alt text to a picture. The schema has one description
+// slot and the description is the accessible text, so a title only fills it
+// when the shape declares no description of its own.
+void set_alt_text(const std::string& title, const std::string& description,
+                  docv1::PictureItem* picture) {
+  const std::string& text = description.empty() ? title : description;
+  if (text.empty()) return;
+  picture->mutable_meta()->mutable_description()->set_text(text);
+}
+
 std::string column_name(int column) {
   std::string name;
   for (int c = column; c >= 0; c = c / 26 - 1) {
@@ -209,6 +313,31 @@ std::string column_name(int column) {
 
 std::string a1_name(int row, int column) {
   return column_name(column) + std::to_string(row + 1);
+}
+
+// "B7" and "B7.1.2" both anchor at row 6, column 1: an office cell name
+// starts with the base-grid cell it was split from, so a split cell still
+// has a place in the grid. False when the name anchors nowhere.
+bool anchor_of_cell_name(const std::string& name, int* row, int* column) {
+  size_t pos = 0;
+  long col = 0;
+  while (pos < name.size()
+         && std::isupper(static_cast<unsigned char>(name[pos]))) {
+    col = col * 26 + (name[pos] - 'A' + 1);
+    pos++;
+  }
+  if (pos == 0 || pos >= name.size()) return false;
+  long row_number = 0;
+  size_t digit = pos;
+  for (; digit < name.size()
+         && std::isdigit(static_cast<unsigned char>(name[digit]));
+       digit++) {
+    row_number = row_number * 10 + (name[digit] - '0');
+  }
+  if (digit == pos || row_number <= 0) return false;
+  *row = static_cast<int>(row_number - 1);
+  *column = static_cast<int>(col - 1);
+  return true;
 }
 
 std::string range_a1(const officev1::SheetRangeRef& range) {
@@ -334,6 +463,152 @@ docv1::TableItem* DoclingMapper::add_table(docv1::ContentLayer layer,
   return table;
 }
 
+void DoclingMapper::add_run_spans(
+    const google::protobuf::RepeatedPtrField<officev1::TextRun>& runs,
+    google::protobuf::RepeatedPtrField<docv1::InlineSpan>* spans,
+    const std::string& owner_ref, long long base_offset) {
+  long long local = base_offset;
+  for (int index = 0; index < runs.size();) {
+    const RunKey key = run_key(runs[index]);
+    long long start = local;
+    int end_index = index;
+    // Adjacent runs agreeing on every attribute are one span: the office
+    // core splits portions for reasons a reader never sees.
+    while (end_index < runs.size() && run_key(runs[end_index]) == key) {
+      local += runs[end_index].char_length();
+      end_index++;
+    }
+    index = end_index;
+    if (local <= start) continue;
+    const std::string color = hex_color(key.color_rgb);
+    const docv1::Script script = script_for(key.escapement);
+    const bool language_differs =
+        !key.language.empty() && key.language != document_language_;
+    const bool formatted = key.bold || key.italic || key.underline
+        || key.strikethrough || script != docv1::SCRIPT_UNSPECIFIED;
+    if (!formatted && key.font.empty() && key.size_pt <= 0 && color.empty()
+        && !language_differs && key.hyperlink.empty()
+        && key.field_code.empty()) {
+      // Nothing the item does not already say; a span here would be noise.
+      continue;
+    }
+    docv1::InlineSpan* span = spans->Add();
+    span->mutable_range()->set_start(clamp32(start));
+    span->mutable_range()->set_end(clamp32(local));
+    if (formatted) {
+      docv1::Formatting* formatting = span->mutable_formatting();
+      formatting->set_bold(key.bold);
+      formatting->set_italic(key.italic);
+      formatting->set_underline(key.underline);
+      formatting->set_strikethrough(key.strikethrough);
+      formatting->set_script(script);
+    }
+    if (!key.font.empty()) span->set_font_family(key.font);
+    if (key.size_pt > 0) span->set_font_size_pt(key.size_pt);
+    if (!color.empty()) span->set_color(color);
+    if (language_differs) span->set_language(key.language);
+    if (!key.hyperlink.empty()) span->set_hyperlink(key.hyperlink);
+    if (!key.field_code.empty()) span->set_field_code(key.field_code);
+    if (!key.field_target.empty() && !owner_ref.empty()) {
+      // The anchor the reference names may not have streamed yet, so the
+      // target is filled in once the whole document has.
+      pending_references_.push_back(
+          {owner_ref, spans->size() - 1, key.field_target});
+    }
+  }
+}
+
+docv1::TextItemBase* DoclingMapper::text_by_ref(const std::string& ref) {
+  const std::string prefix = "#/texts/";
+  if (!ref.starts_with(prefix)) return nullptr;
+  int index = std::atoi(ref.c_str() + prefix.size());
+  if (index < 0 || index >= document_.texts_size()) return nullptr;
+  docv1::BaseTextItem* item = document_.mutable_texts(index);
+  switch (item->item_case()) {
+    case docv1::BaseTextItem::kTitle:
+      return item->mutable_title()->mutable_base();
+    case docv1::BaseTextItem::kSectionHeader:
+      return item->mutable_section_header()->mutable_base();
+    case docv1::BaseTextItem::kListItem:
+      return item->mutable_list_item()->mutable_base();
+    case docv1::BaseTextItem::kFormula:
+      return item->mutable_formula()->mutable_base();
+    case docv1::BaseTextItem::kText:
+      return item->mutable_text()->mutable_base();
+    case docv1::BaseTextItem::kFieldHeading:
+      return item->mutable_field_heading()->mutable_base();
+    case docv1::BaseTextItem::kFieldValue:
+      return item->mutable_field_value()->mutable_base();
+    case docv1::BaseTextItem::kCode:
+    case docv1::BaseTextItem::ITEM_NOT_SET:
+      return nullptr;
+  }
+  return nullptr;
+}
+
+bool DoclingMapper::resolve_doc_span(long long start, long long end,
+                                     docv1::FineRef* out) const {
+  if (start < 0) return false;
+  // The index is built in arrival order, which is ascending offset order,
+  // so the item holding an offset is the last one starting at or before it.
+  auto after = std::upper_bound(
+      body_spans_.begin(), body_spans_.end(), start,
+      [](long long value, const BodySpan& span) { return value < span.start; });
+  if (after == body_spans_.begin()) return false;
+  const BodySpan& span = *std::prev(after);
+  if (start >= span.end && start != span.start) return false;
+  out->set_ref(span.ref);
+  long long local_start = start - span.start;
+  long long local_end = (end > start ? end : start) - span.start;
+  long long length = span.end - span.start;
+  out->mutable_range()->set_start(clamp32(std::min(local_start, length)));
+  out->mutable_range()->set_end(clamp32(std::min(local_end, length)));
+  return true;
+}
+
+void DoclingMapper::resolve_anchors() {
+  // Comments first: the item they annotate gains a back-link carrying the
+  // annotated range in that item's own characters.
+  for (const PendingComment& pending : pending_comments_) {
+    docv1::FineRef anchor;
+    if (!resolve_doc_span(pending.start, pending.end, &anchor)) continue;
+    docv1::TextItemBase* base = text_by_ref(anchor.ref());
+    if (base == nullptr) continue;
+    docv1::FineRef* link = base->add_comments();
+    link->set_ref(pending.ref);
+    *link->mutable_range() = anchor.range();
+  }
+  for (const PendingChange& pending : pending_changes_) {
+    if (pending.index >= document_.changes_size()) continue;
+    docv1::ChangeRecord* change = document_.mutable_changes(pending.index);
+    docv1::FineRef target;
+    // An anchor in content the fold does not emit keeps its record and
+    // loses only the target: an unanchored change is still evidence.
+    if (resolve_doc_span(pending.start, pending.end, &target)) {
+      *change->mutable_target() = target;
+    }
+  }
+  std::map<std::string, docv1::FineRef> resolved_anchors;
+  for (const PendingAnchor& pending : pending_anchors_) {
+    docv1::NamedAnchor* anchor = document_.add_anchors();
+    anchor->set_name(pending.name);
+    docv1::FineRef target;
+    if (resolve_doc_span(pending.start, pending.end, &target)) {
+      *anchor->mutable_target() = target;
+      resolved_anchors[pending.name] = target;
+    }
+  }
+  // A cross-reference field points at a named anchor; now that every anchor
+  // is placed, the field's span can point at the same item.
+  for (const PendingReference& pending : pending_references_) {
+    auto found = resolved_anchors.find(pending.target_name);
+    if (found == resolved_anchors.end()) continue;
+    docv1::TextItemBase* base = text_by_ref(pending.item_ref);
+    if (base == nullptr || pending.span_index >= base->spans_size()) continue;
+    *base->mutable_spans(pending.span_index)->mutable_target() = found->second;
+  }
+}
+
 void DoclingMapper::add_prov(
     google::protobuf::RepeatedPtrField<docv1::ProvenanceItem>* prov,
     int page_index, bool page_local, double l, double t, double r, double b,
@@ -450,20 +725,31 @@ void DoclingMapper::fold_table(const officev1::TableData& table,
   data->set_num_rows(table.rows());
   data->set_num_cols(table.columns());
   for (const officev1::TableCellData& cell : table.cells()) {
-    if (cell.row() < 0 || cell.column() < 0) {
-      // Split or merged office cells fall outside the base grid; their text
-      // stays addressable by office cell name.
+    // A split or merged office cell has no base-grid position of its own,
+    // but its name anchors at one; placing it there with its merge spans is
+    // what makes a merged table structurally readable. Only a name that
+    // anchors nowhere has nowhere to go.
+    int row = cell.row();
+    int column = cell.column();
+    if ((row < 0 || column < 0)
+        && !anchor_of_cell_name(cell.name(), &row, &column)) {
+      row = -1;
+      column = -1;
+    }
+    if (row < 0 || column < 0) {
       (*item->mutable_meta()->mutable_custom_fields())["cell:" + cell.name()] =
           str_value(cell.text());
       continue;
     }
+    int row_span = std::max(1, cell.row_span());
+    int col_span = std::max(1, cell.column_span());
     docv1::TableCell* out = data->add_table_cells();
-    out->set_start_row_offset_idx(cell.row());
-    out->set_end_row_offset_idx(cell.row() + 1);
-    out->set_start_col_offset_idx(cell.column());
-    out->set_end_col_offset_idx(cell.column() + 1);
-    out->set_row_span(1);
-    out->set_col_span(1);
+    out->set_start_row_offset_idx(row);
+    out->set_end_row_offset_idx(row + row_span);
+    out->set_start_col_offset_idx(column);
+    out->set_end_col_offset_idx(column + col_span);
+    out->set_row_span(row_span);
+    out->set_col_span(col_span);
     out->set_text(cell.text());
     if (!cell.line_rects().empty()) {
       docv1::BoundingBox box;
@@ -484,15 +770,28 @@ void DoclingMapper::fold_table(const officev1::TableData& table,
         out->set_col_span(1);
       }
     }
+    // Several cells can anchor at one slot when a base cell was split, so
+    // the first cell placed there keeps it: the base cell is emitted before
+    // the pieces split out of it.
+    std::set<std::pair<int, int>> filled;
     for (const docv1::TableCell& cell : data->table_cells()) {
       // Merged or irregular office tables can report cells beyond the
       // declared grid; those stay in table_cells but have no grid slot.
       if (cell.start_row_offset_idx() >= data->grid_size()) continue;
       docv1::TableRow* out_row = data->mutable_grid(cell.start_row_offset_idx());
       if (cell.start_col_offset_idx() >= out_row->cells_size()) continue;
+      if (!filled.insert({cell.start_row_offset_idx(),
+                          cell.start_col_offset_idx()}).second) {
+        continue;
+      }
       docv1::TableCell* slot =
           out_row->mutable_cells(cell.start_col_offset_idx());
       slot->set_text(cell.text());
+      slot->set_row_span(cell.row_span());
+      slot->set_col_span(cell.col_span());
+      slot->set_end_row_offset_idx(cell.end_row_offset_idx());
+      slot->set_end_col_offset_idx(cell.end_col_offset_idx());
+      if (cell.has_value()) *slot->mutable_value() = cell.value();
       if (cell.has_bbox()) *slot->mutable_bbox() = cell.bbox();
     }
   }
@@ -574,6 +873,7 @@ void DoclingMapper::on_document_info(const officev1::DocumentInfo& info) {
     const officev1::PageRect& rect = info.page_rects(index);
     docv1::PageItem* page = &(*document_.mutable_pages())[index + 1];
     page->set_page_no(index + 1);
+    page->set_unit(kCoordinateUnit);
     page->mutable_size()->set_width(static_cast<double>(rect.width_twips()));
     page->mutable_size()->set_height(static_cast<double>(rect.height_twips()));
   }
@@ -582,23 +882,46 @@ void DoclingMapper::on_document_info(const officev1::DocumentInfo& info) {
 void DoclingMapper::on_page_image(const officev1::PageImage& image) {
   docv1::PageItem* page = &(*document_.mutable_pages())[image.index() + 1];
   page->set_page_no(image.index() + 1);
+  page->set_unit(kCoordinateUnit);
   if (page->size().width() <= 0 && image.dpi() > 0) {
     page->mutable_size()->set_width(
         static_cast<double>(image.width_px()) * 1440.0 / image.dpi());
     page->mutable_size()->set_height(
         static_cast<double>(image.height_px()) * 1440.0 / image.dpi());
   }
+  // The request selects the page encoding, so the media type has to come
+  // from what the response says it produced, not from the default.
+  const std::string mime = page_image_mime(image.format());
   docv1::ImageRef* ref = page->mutable_image();
-  ref->set_mimetype("image/png");
+  ref->set_mimetype(mime);
   ref->set_dpi(image.dpi());
   ref->mutable_size()->set_width(image.width_px());
   ref->mutable_size()->set_height(image.height_px());
-  ref->set_uri(data_uri("image/png", image.png()));
+  ref->set_uri(data_uri(mime, image.png()));
 }
 
 void DoclingMapper::on_metadata(const officev1::DocumentMetadata& meta) {
   if (!meta.title().empty()) document_.set_name(meta.title());
+  document_language_ = meta.language();
+  // The properties the document declares about itself land in the schema's
+  // own metadata slot. Timestamps are ISO 8601 UTC, the shape the schema
+  // declares; the office wire counts them in epoch milliseconds.
+  docv1::DocumentMeta* source_meta = document_.mutable_source_meta();
+  if (!meta.title().empty()) source_meta->set_title(meta.title());
+  if (!meta.author().empty()) source_meta->add_authors(meta.author());
+  if (meta.created_epoch_ms() != 0) {
+    source_meta->set_created(iso8601_utc(meta.created_epoch_ms()));
+  }
+  if (meta.modified_epoch_ms() != 0) {
+    source_meta->set_modified(iso8601_utc(meta.modified_epoch_ms()));
+  }
+  if (!meta.language().empty()) source_meta->set_language(meta.language());
+  if (!meta.generator().empty()) source_meta->set_generator(meta.generator());
   docv1::BaseMeta* body_meta = document_.mutable_body()->mutable_meta();
+  for (const std::string& keyword : meta.keywords()) {
+    source_meta->add_keywords(keyword);
+    body_meta->mutable_keywords()->add_values(keyword);
+  }
   auto* fields = body_meta->mutable_custom_fields();
   if (!meta.author().empty()) (*fields)["author"] = str_value(meta.author());
   if (!meta.subject().empty()) (*fields)["subject"] = str_value(meta.subject());
@@ -683,6 +1006,10 @@ void DoclingMapper::on_status(const officev1::RenderStatus& status) {
   for (const std::string& warning : status.warnings()) {
     warnings_.push_back(warning);
   }
+  // Anchors resolve only once the whole body has streamed past: a comment
+  // can close before the paragraph it sits in is emitted, and a
+  // cross-reference can name an anchor from a later page.
+  resolve_anchors();
   finished_ = true;
 }
 
@@ -711,8 +1038,19 @@ void DoclingMapper::on_paragraph(const officev1::Paragraph& paragraph) {
   }
   handle.base->set_text(text);
   handle.base->set_orig(text);
+  if (!paragraph.style().empty()) {
+    handle.base->set_style_name(paragraph.style());
+  }
   set_uniform_formatting(paragraph.runs(), handle.base);
+  add_run_spans(paragraph.runs(), handle.base->mutable_spans(), handle.ref);
   apply_run_hyperlinks(paragraph.runs(), handle.base);
+  // The paragraph's extent in the document-absolute character space, which
+  // is where comments, tracked changes, and bookmarks anchor.
+  if (paragraph.char_offset() >= 0) {
+    body_spans_.push_back(
+        {paragraph.char_offset(), paragraph.char_offset() + length,
+         handle.ref});
+  }
   if (!paragraph.line_rects().empty()) {
     add_line_prov(handle.base->mutable_prov(), paragraph.line_rects(),
                   span_start, span_end);
@@ -736,8 +1074,17 @@ void DoclingMapper::on_table(const officev1::TableData& table) {
 
 void DoclingMapper::on_embedded_image(const officev1::EmbeddedImage& image) {
   std::string parent = "#/body";
-  if (auto container = writer_groups_.find(image.group_path());
-      container != writer_groups_.end()) {
+  // A slide picture belongs under its slide; its geometry is already
+  // page-local, unlike a text document's document-absolute anchors.
+  bool page_local = false;
+  if (document_type_ == "presentation") {
+    page_local = true;
+    if (auto slide = slide_group_.find(image.page_index());
+        slide != slide_group_.end()) {
+      parent = slide->second;
+    }
+  } else if (auto container = writer_groups_.find(image.group_path());
+             container != writer_groups_.end()) {
     parent = container->second;
   }
   docv1::PictureItem* picture = add_picture(
@@ -747,6 +1094,7 @@ void DoclingMapper::on_embedded_image(const officev1::EmbeddedImage& image) {
     (*picture->mutable_meta()->mutable_custom_fields())["name"] =
         str_value(image.name());
   }
+  set_alt_text(image.title(), image.description(), picture);
   if (!image.data().empty()) {
     docv1::ImageRef* ref = picture->mutable_image();
     ref->set_mimetype(image.mime_type());
@@ -755,7 +1103,7 @@ void DoclingMapper::on_embedded_image(const officev1::EmbeddedImage& image) {
     ref->set_uri(data_uri(image.mime_type(), image.data()));
   }
   if (image.has_anchor()) {
-    add_prov(picture->mutable_prov(), image.page_index(), false,
+    add_prov(picture->mutable_prov(), image.page_index(), page_local,
              static_cast<double>(image.anchor().x()),
              static_cast<double>(image.anchor().y()),
              static_cast<double>(image.anchor().x() + image.width_twips()),
@@ -775,6 +1123,8 @@ void DoclingMapper::on_footnote(const officev1::Footnote& footnote) {
   auto* fields = handle.base->mutable_meta()->mutable_custom_fields();
   if (!footnote.label().empty()) (*fields)["label"] = str_value(footnote.label());
   (*fields)["endnote"] = bool_value(footnote.endnote());
+  set_uniform_formatting(footnote.runs(), handle.base);
+  add_run_spans(footnote.runs(), handle.base->mutable_spans(), handle.ref);
   apply_run_hyperlinks(footnote.runs(), handle.base);
   add_caret_prov(handle.base->mutable_prov(), footnote.page_index(),
                  footnote.anchor(), footnote.anchor(), 0,
@@ -791,7 +1141,11 @@ void DoclingMapper::on_header_footer(const officev1::HeaderFooter& block) {
     std::string text = concat_runs(paragraph.runs());
     handle.base->set_text(text);
     handle.base->set_orig(text);
+    if (!paragraph.style().empty()) {
+      handle.base->set_style_name(paragraph.style());
+    }
     set_uniform_formatting(paragraph.runs(), handle.base);
+    add_run_spans(paragraph.runs(), handle.base->mutable_spans(), handle.ref);
     apply_run_hyperlinks(paragraph.runs(), handle.base);
     (*handle.base->mutable_meta()->mutable_custom_fields())["page_style"] =
         str_value(block.page_style());
@@ -827,6 +1181,8 @@ void DoclingMapper::on_document_index(const officev1::DocumentIndex& index) {
   auto* fields = handle.base->mutable_meta()->mutable_custom_fields();
   (*fields)["index_type"] = str_value(index.type());
   if (!index.title().empty()) (*fields)["title"] = str_value(index.title());
+  set_uniform_formatting(index.runs(), handle.base);
+  add_run_spans(index.runs(), handle.base->mutable_spans(), handle.ref);
   apply_run_hyperlinks(index.runs(), handle.base);
   add_caret_prov(handle.base->mutable_prov(), index.page_index(),
                  index.anchor(), index.anchor(), 0, runs_length(index.runs()));
@@ -861,6 +1217,7 @@ void DoclingMapper::on_drawing_shape(const officev1::DrawingShape& shape) {
     handle.base->set_text(text);
     handle.base->set_orig(text);
     set_uniform_formatting(shape.runs(), handle.base);
+    add_run_spans(shape.runs(), handle.base->mutable_spans(), handle.ref);
     apply_run_hyperlinks(shape.runs(), handle.base);
     (*handle.base->mutable_meta()->mutable_custom_fields())["shape_type"] =
         str_value(shape.shape_type());
@@ -875,6 +1232,7 @@ void DoclingMapper::on_drawing_shape(const officev1::DrawingShape& shape) {
   auto* fields = picture->mutable_meta()->mutable_custom_fields();
   (*fields)["shape_type"] = str_value(shape.shape_type());
   if (!shape.name().empty()) (*fields)["name"] = str_value(shape.name());
+  set_alt_text(shape.title(), shape.description(), picture);
   add_prov(picture->mutable_prov(), shape.page_index(), true, l, t, r, b, 0, 0);
 }
 
@@ -906,6 +1264,15 @@ void DoclingMapper::on_slide_shape(const officev1::SlideShape& shape) {
   double r = l + static_cast<double>(shape.width_twips());
   double b = t + static_cast<double>(shape.height_twips());
 
+  // A table shape carries its content in a cell grid, not in shape text, so
+  // it folds into a real table under the slide rather than a placeholder.
+  if (shape.has_table()) {
+    docv1::TableItem* item = add_table(layer, parent, nullptr);
+    fold_table(shape.table(), item);
+    add_prov(item->mutable_prov(), prov_page, true, l, t, r, b, 0, 0);
+    return;
+  }
+
   bool has_text = false;
   for (const officev1::SlideTextParagraph& paragraph : shape.paragraphs()) {
     if (!paragraph.runs().empty()) has_text = true;
@@ -919,6 +1286,7 @@ void DoclingMapper::on_slide_shape(const officev1::SlideShape& shape) {
                                                 layer, parent, nullptr);
       (*picture->mutable_meta()->mutable_custom_fields())["shape_type"] =
           str_value(shape.shape_type());
+      set_alt_text(shape.title(), shape.description(), picture);
       add_prov(picture->mutable_prov(), prov_page, true, l, t, r, b, 0, 0);
     }
     return;
@@ -942,6 +1310,7 @@ void DoclingMapper::on_slide_shape(const officev1::SlideShape& shape) {
       handle.base->set_text(text);
       handle.base->set_orig(text);
       set_uniform_formatting(paragraph.runs(), handle.base);
+      add_run_spans(paragraph.runs(), handle.base->mutable_spans(), handle.ref);
       apply_run_hyperlinks(paragraph.runs(), handle.base);
       add_prov(handle.base->mutable_prov(), prov_page, true, l, t, r, b, 0,
                runs_length(paragraph.runs()));
@@ -960,8 +1329,14 @@ void DoclingMapper::on_slide_shape(const officev1::SlideShape& shape) {
   std::string text;
   long long length = 0;
   for (const officev1::SlideTextParagraph& paragraph : shape.paragraphs()) {
-    if (!text.empty()) text += "\n";
+    if (!text.empty()) {
+      text += "\n";
+      length += 1;
+    }
     text += concat_runs(paragraph.runs());
+    // Spans stay aligned with the joined text, newline separators included.
+    add_run_spans(paragraph.runs(), handle.base->mutable_spans(), handle.ref,
+                  length);
     length += runs_length(paragraph.runs());
   }
   handle.base->set_text(text);
@@ -985,6 +1360,7 @@ void DoclingMapper::on_text_frame(const officev1::TextFrame& frame) {
   handle.base->set_text(text);
   handle.base->set_orig(text);
   set_uniform_formatting(frame.runs(), handle.base);
+  add_run_spans(frame.runs(), handle.base->mutable_spans(), handle.ref);
   apply_run_hyperlinks(frame.runs(), handle.base);
   if (frame.has_anchor()) {
     add_prov(handle.base->mutable_prov(), frame.page_index(), false,
@@ -1046,6 +1422,7 @@ void DoclingMapper::on_shape(const officev1::Shape& shape) {
   handle.base->set_text(text);
   handle.base->set_orig(text);
   set_uniform_formatting(shape.runs(), handle.base);
+  add_run_spans(shape.runs(), handle.base->mutable_spans(), handle.ref);
   apply_run_hyperlinks(shape.runs(), handle.base);
   if (shape.has_anchor()) {
     add_prov(handle.base->mutable_prov(), shape.page_index(), false,
@@ -1238,22 +1615,49 @@ void DoclingMapper::on_sheet(const officev1::Sheet& sheet) {
     (*fields)["print_areas"] = areas;
   }
   sheet_group_[sheet.index()] = group->self_ref();
+  sheet_name_[sheet.index()] = sheet.name();
 
   // The sheet's cell grid folds into one TableItem in absolute row and
   // column offsets, so cell addresses survive the mapping.
   sheet_table_[sheet.index()] = document_.tables_size();
   docv1::TableItem* table = add_table(layer, group->self_ref(), nullptr);
-  table->mutable_data()->set_num_rows(sheet.used_end_row() + 1);
-  table->mutable_data()->set_num_cols(sheet.used_end_column() + 1);
+  docv1::TableData* data = table->mutable_data();
+  data->set_num_rows(sheet.used_end_row() + 1);
+  data->set_num_cols(sheet.used_end_column() + 1);
+  // The sheet's columns are its schema: each one names its spreadsheet
+  // column and carries the declared width in the page unit.
+  for (int column = 0; column < sheet.column_widths_twips_size(); column++) {
+    docv1::TableColumnSchema* schema = data->add_columns();
+    schema->set_name(column_name(column));
+    schema->set_width(
+        static_cast<double>(sheet.column_widths_twips(column)));
+  }
   add_prov(table->mutable_prov(), sheet.index(), true, 0, 0, 0, 0, 0, 0);
+  if (table->prov_size() > 0 && !sheet.name().empty()) {
+    table->mutable_prov(0)->mutable_grid()->set_sheet(sheet.name());
+  }
 }
 
 void DoclingMapper::on_sheet_row(const officev1::SheetRow& row) {
   auto found = sheet_table_.find(row.sheet_index());
   if (found == sheet_table_.end()) return;
   docv1::TableItem* table = document_.mutable_tables(found->second);
+  docv1::TableData* data = table->mutable_data();
+  // One provenance entry per used row, locating it in the sheet grid; the
+  // cells themselves carry no provenance slot.
+  if (!row.cells().empty()) {
+    docv1::ProvenanceItem* row_prov = data->add_row_prov();
+    row_prov->set_page_no(row.sheet_index() + 1);
+    docv1::GridCell* grid = row_prov->mutable_grid();
+    grid->set_row(row.row());
+    grid->set_col(row.cells(0).column());
+    if (auto name = sheet_name_.find(row.sheet_index());
+        name != sheet_name_.end()) {
+      grid->set_sheet(name->second);
+    }
+  }
   for (const officev1::SheetCell& cell : row.cells()) {
-    docv1::TableCell* out = table->mutable_data()->add_table_cells();
+    docv1::TableCell* out = data->add_table_cells();
     out->set_start_row_offset_idx(row.row());
     out->set_end_row_offset_idx(row.row() + std::max(1, cell.merged_rows()));
     out->set_start_col_offset_idx(cell.column());
@@ -1262,19 +1666,31 @@ void DoclingMapper::on_sheet_row(const officev1::SheetRow& row) {
     out->set_row_span(std::max(1, cell.merged_rows()));
     out->set_col_span(std::max(1, cell.merged_columns()));
     out->set_text(cell.display());
-    // TableCell has no numeric or formula slot; numbers stay numbers in the
-    // table meta, keyed by the cell's A1 name.
-    if (cell.type() == officev1::SHEET_CELL_TYPE_VALUE) {
-      (*table->mutable_meta()->mutable_custom_fields())
-          [a1_name(row.row(), cell.column())] = num_value(cell.number());
+    // The cell's typed value: text stays the display string, and the value
+    // says what the sheet actually holds. An error beats a formula, because
+    // a formula that failed has no value to report.
+    docv1::CellValue value;
+    bool typed = true;
+    if (cell.error_code() != 0) {
+      value.set_error(cell.display().empty()
+                          ? "Err:" + std::to_string(cell.error_code())
+                          : cell.display());
     } else if (cell.type() == officev1::SHEET_CELL_TYPE_FORMULA) {
-      google::protobuf::Value value;
-      auto* fields = value.mutable_struct_value()->mutable_fields();
-      (*fields)["formula"] = str_value(cell.formula());
-      (*fields)["number"] = num_value(cell.number());
-      (*table->mutable_meta()->mutable_custom_fields())
-          [a1_name(row.row(), cell.column())] = value;
+      value.set_formula(cell.formula());
+    } else if (cell.is_boolean()) {
+      value.set_boolean(cell.number() != 0);
+    } else if (cell.is_datetime()) {
+      value.set_datetime(iso8601_utc(cell.datetime_epoch_ms()));
+    } else if (cell.type() == officev1::SHEET_CELL_TYPE_VALUE) {
+      value.set_number(cell.number());
+    } else {
+      typed = false;
     }
+    if (!cell.number_format_string().empty()) {
+      value.set_number_format(cell.number_format_string());
+      typed = true;
+    }
+    if (typed) *out->mutable_value() = value;
   }
 }
 
@@ -1433,9 +1849,11 @@ void DoclingMapper::on_comment(const officev1::Comment& comment) {
     (*fields)["reply_to"] = str_value(comment.parent_name());
   }
   if (comment.char_start() >= 0) {
-    (*fields)["char_start"] =
-        num_value(static_cast<double>(comment.char_start()));
-    (*fields)["char_end"] = num_value(static_cast<double>(comment.char_end()));
+    // The item this comment annotates is not known yet: a comment can close
+    // before the paragraph holding it is emitted. The back-link is made
+    // once the whole body has streamed past.
+    pending_comments_.push_back(
+        {handle.ref, comment.char_start(), comment.char_end()});
   }
   if (!comment.anchored_text().empty()) {
     (*fields)["anchored_text"] = str_value(comment.anchored_text());
@@ -1447,65 +1865,32 @@ void DoclingMapper::on_comment(const officev1::Comment& comment) {
 
 void DoclingMapper::on_tracked_change(const officev1::TrackedChange& change) {
   // Tracked changes annotate spans of the body text rather than adding
-  // display text of their own, so they ride the body metadata; the changed
-  // text itself is already in the body items when the change is displayed.
-  google::protobuf::Value value;
-  google::protobuf::Struct* fields = value.mutable_struct_value();
-  (*fields->mutable_fields())["kind"] = str_value(
-      change.kind_name().empty() ? "Unspecified" : change.kind_name());
-  if (!change.author().empty()) {
-    (*fields->mutable_fields())["author"] = str_value(change.author());
-  }
+  // display text of their own, so they are records of the document, each
+  // pointing at the item and range it touches.
+  int index = document_.changes_size();
+  docv1::ChangeRecord* record = document_.add_changes();
+  record->set_id(change.identifier().empty()
+                     ? std::to_string(change.index())
+                     : change.identifier());
+  std::string kind = change.kind_name();
+  std::ranges::transform(kind, kind.begin(),
+                         [](unsigned char c) { return std::tolower(c); });
+  record->set_kind(kind);
+  record->set_author(change.author());
   if (change.epoch_ms() != 0) {
-    (*fields->mutable_fields())["date_ms"] =
-        num_value(static_cast<double>(change.epoch_ms()));
+    record->set_timestamp(iso8601_utc(change.epoch_ms()));
   }
-  if (!change.comment().empty()) {
-    (*fields->mutable_fields())["comment"] = str_value(change.comment());
-  }
-  (*fields->mutable_fields())["char_start"] =
-      num_value(static_cast<double>(change.char_start()));
-  (*fields->mutable_fields())["char_end"] =
-      num_value(static_cast<double>(change.char_end()));
   if (!change.changed_text().empty()) {
-    (*fields->mutable_fields())["text"] = str_value(change.changed_text());
+    record->set_content(change.changed_text());
   }
-  if (change.has_successor()) {
-    google::protobuf::Struct* successor =
-        (*fields->mutable_fields())["supersedes"].mutable_struct_value();
-    (*successor->mutable_fields())["kind"] =
-        str_value(change.successor().kind_name());
-    if (!change.successor().author().empty()) {
-      (*successor->mutable_fields())["author"] =
-          str_value(change.successor().author());
-    }
-    if (change.successor().epoch_ms() != 0) {
-      (*successor->mutable_fields())["date_ms"] =
-          num_value(static_cast<double>(change.successor().epoch_ms()));
-    }
-  }
-  (*document_.mutable_body()->mutable_meta()->mutable_custom_fields())
-      ["tracked_change:" + std::to_string(change.index())] = std::move(value);
+  pending_changes_.push_back({index, change.char_start(), change.char_end()});
 }
 
 void DoclingMapper::on_bookmark(const officev1::Bookmark& bookmark) {
-  // Bookmarks name spans of the body text; like tracked changes they ride
-  // the body metadata instead of adding display text.
-  google::protobuf::Value value;
-  google::protobuf::Struct* fields = value.mutable_struct_value();
-  (*fields->mutable_fields())["char_start"] =
-      num_value(static_cast<double>(bookmark.char_start()));
-  (*fields->mutable_fields())["char_end"] =
-      num_value(static_cast<double>(bookmark.char_end()));
-  if (bookmark.page_index() >= 0) {
-    (*fields->mutable_fields())["page"] =
-        num_value(static_cast<double>(bookmark.page_index() + 1));
-  }
-  if (!bookmark.covered_text().empty()) {
-    (*fields->mutable_fields())["text"] = str_value(bookmark.covered_text());
-  }
-  (*document_.mutable_body()->mutable_meta()->mutable_custom_fields())
-      ["bookmark:" + bookmark.name()] = std::move(value);
+  // A bookmark names a position other content points at, so it becomes a
+  // named anchor; the target resolves once the body index is complete.
+  pending_anchors_.push_back(
+      {bookmark.name(), bookmark.char_start(), bookmark.char_end()});
 }
 
 void DoclingMapper::on_form_field(const officev1::FormField& field) {
@@ -1705,6 +2090,37 @@ std::vector<std::string> docling_integrity_errors(
         errors.push_back("comment ref " + comment.ref() + " of "
                          + table.self_ref() + " does not resolve");
       }
+    }
+  }
+  // The anchored references the fold resolves against the document-absolute
+  // character space: a back-link, a change target, or a named anchor that
+  // names nothing would be worse than one left unset.
+  for (const docv1::BaseTextItem& item : document.texts()) {
+    const docv1::TextItemBase* base = text_base(item);
+    if (base == nullptr) continue;
+    for (const docv1::FineRef& comment : base->comments()) {
+      if (!refs.contains(comment.ref())) {
+        errors.push_back("comment ref " + comment.ref() + " of "
+                         + base->self_ref() + " does not resolve");
+      }
+    }
+    for (const docv1::InlineSpan& span : base->spans()) {
+      if (span.has_target() && !refs.contains(span.target().ref())) {
+        errors.push_back("span target " + span.target().ref() + " of "
+                         + base->self_ref() + " does not resolve");
+      }
+    }
+  }
+  for (const docv1::ChangeRecord& change : document.changes()) {
+    if (change.has_target() && !refs.contains(change.target().ref())) {
+      errors.push_back("change target " + change.target().ref() + " of "
+                       + change.id() + " does not resolve");
+    }
+  }
+  for (const docv1::NamedAnchor& anchor : document.anchors()) {
+    if (anchor.has_target() && !refs.contains(anchor.target().ref())) {
+      errors.push_back("anchor target " + anchor.target().ref() + " of "
+                       + anchor.name() + " does not resolve");
     }
   }
   return errors;
