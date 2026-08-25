@@ -1111,6 +1111,27 @@ void verify_out_of_grid_table_cell() {
   require(beyond_kept, "out-of-grid: overflow cell text preserved");
 }
 
+// A well-linked code item must pass the integrity walk: it carries its
+// reference fields inline rather than in a nested base, and the walk must
+// read them instead of reporting an unset variant.
+void verify_code_item_integrity() {
+  docv1::Document document;
+  docv1::GroupItem* body = document.mutable_body();
+  body->set_self_ref("#/body");
+  body->add_children()->set_ref("#/texts/0");
+  document.mutable_furniture()->set_self_ref("#/furniture");
+  docv1::CodeItem* code = document.add_texts()->mutable_code();
+  code->set_self_ref("#/texts/0");
+  code->mutable_parent()->set_ref("#/body");
+  code->set_text("x = 1");
+  const std::vector<std::string> errors =
+      grlibre::docling_integrity_errors(document);
+  for (const std::string& error : errors) {
+    std::println(stderr, "integrity: {}", error);
+  }
+  require(errors.empty(), "code item: inline references validate cleanly");
+}
+
 int main() {
   verify_writer_stream();
   verify_calc_stream();
@@ -1119,6 +1140,7 @@ int main() {
   verify_partial_stream();
   verify_marks_stream();
   verify_out_of_grid_table_cell();
+  verify_code_item_integrity();
   std::println("docling_map_test passed");
   return 0;
 }
