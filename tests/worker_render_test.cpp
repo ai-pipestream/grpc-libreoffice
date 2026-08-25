@@ -2580,6 +2580,9 @@ const char kFieldsFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
  xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
  xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
  office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:font-face-decls>
+  <style:font-face style:name="Liberation Mono" svg:font-family="'Liberation Mono'" style:font-family-generic="modern" style:font-pitch="fixed"/>
+ </office:font-face-decls>
  <office:automatic-styles>
   <style:style style:name="SUP" style:family="text">
    <style:text-properties style:text-position="super 58%"/>
@@ -2587,11 +2590,14 @@ const char kFieldsFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
   <style:style style:name="DE" style:family="text">
    <style:text-properties fo:language="de" fo:country="DE"/>
   </style:style>
+  <style:style style:name="SC" style:family="text">
+   <style:text-properties fo:font-variant="small-caps" style:font-name="Liberation Mono"/>
+  </style:style>
  </office:automatic-styles>
  <office:body><office:text>
   <text:p>Page <text:page-number text:select-page="current">1</text:page-number> of the report.</text:p>
   <text:p>See <text:bookmark-ref text:reference-format="text" text:ref-name="mark1">Target</text:bookmark-ref> below.</text:p>
-  <text:p>E = mc<text:span text:style-name="SUP">2</text:span> und <text:span text:style-name="DE">Wasser</text:span>.</text:p>
+  <text:p>E = mc<text:span text:style-name="SUP">2</text:span> und <text:span text:style-name="DE">Wasser</text:span>. <text:span text:style-name="SC">caps</text:span></text:p>
   <text:p><text:bookmark-start text:name="mark1"/>Target section<text:bookmark-end text:name="mark1"/></text:p>
   <table:table table:name="Merged">
    <table:table-column table:number-columns-repeated="2"/>
@@ -2622,6 +2628,7 @@ void verify_field_and_structure_content() {
   bool reference_field_ok = false;
   bool superscript_ok = false;
   bool language_ok = false;
+  bool caps_ok = false;
   bool alt_text_ok = false;
   bool merge_anchor_ok = false;
   bool merge_wide_ok = false;
@@ -2650,6 +2657,9 @@ void verify_field_and_structure_content() {
           if (run.text() == "2" && run.escapement() > 0) superscript_ok = true;
           if (run.text() == "Wasser" && run.language() == "de-DE") {
             language_ok = true;
+          }
+          if (run.text() == "caps" && run.small_caps() && run.monospace()) {
+            caps_ok = true;
           }
         }
         // Paragraphs are separated by one newline in the same space.
@@ -2681,6 +2691,7 @@ void verify_field_and_structure_content() {
           "field runs keep the annotation text space contiguous");
   require(superscript_ok, "a superscript run reports its escapement");
   require(language_ok, "a run in another language reports its locale");
+  require(caps_ok, "a run reports its case mapping and font pitch");
   require(alt_text_ok, "an image reports its title and alt text");
   require(merge_anchor_ok, "a vertical merge anchor reports its row span");
   require(merge_wide_ok, "a horizontal merge reports its column span");

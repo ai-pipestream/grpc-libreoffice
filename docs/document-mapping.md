@@ -14,7 +14,7 @@ the audit ranked the gaps in.
 |---|---|
 | Resolved text of a field (page number, date, cross-reference, caption number, index or mail-merge result) | inline in `TextItemBase.text`, with an `InlineSpan.field_code` over its range |
 | A cross-reference's destination | `InlineSpan.target`, a `FineRef` into the item the named anchor sits in |
-| Per-run character formatting | `TextItemBase.spans` / `TableCell.spans`: `formatting` (bold, italic, underline, strikethrough, script), `font_family`, `font_size_pt`, `color`, `language` |
+| Per-run character formatting | `TextItemBase.spans` / `TableCell.spans`: `formatting` (bold, italic, underline, strikethrough, monospace, small caps, script), `font_family`, `font_size_pt`, `color`, `language` |
 | Uniform character formatting | `TextItemBase.formatting`, unchanged, now including `script` |
 | Paragraph style name | `TextItemBase.style_name`, verbatim |
 | Comments | items under a `GROUP_LABEL_COMMENT_SECTION` group, back-linked from the annotated item's `comments` `FineRef` with the annotated range |
@@ -63,6 +63,8 @@ is a holding pen, not a destination.
 | Named ranges, database ranges, pivot tables | name, sheet reference, row and column spans, header and totals flags, axis field lists |
 | Sheet attributes | index, name, visibility, tab color, print areas |
 | Shape identity | shape type, name, text-frame chain names, z order, rotation |
+| A picture's accessibility title, when it also has a description | the schema has one description slot, so a title only fills it when there is no description |
+| Character style name, highlight color, overline | the run attributes `Formatting` still has no field for |
 | Embedded object identity | name, class id, kind |
 | Index and note attribution | index service name and title; footnote label, endnote flag, and the citation mark's position |
 
@@ -98,6 +100,10 @@ Extraction side:
 - **Calc cell styling**, hidden rows and columns, row heights, frozen panes,
   conditional formatting, data validation, sheet protection.
 - **Cell hyperlinks**, image hyperlinks, and image maps.
+- **What a cross-reference points at.** `InlineSpan.reference_kind` exists,
+  but a text document's cross-reference names a bookmark, a reference mark,
+  or a sequence, and none of those maps onto citation, footnote, claim, or
+  section with any confidence. It stays unset rather than guessing.
 - **The style catalogue.** `StyleFamilies` is never enumerated, so a consumer
   cannot tell that "Quote" is a blockquote and "Code" is code.
 - **Footnote citation marks in the body.** The in-body note portion is still

@@ -683,6 +683,11 @@ message TextRun {
   // bookmark, reference mark, or sequence name); empty for every other
   // field and for authored text.
   string field_target = 17;
+  // True when the run's font declares a fixed pitch, which is what makes
+  // monospaced text monospaced.
+  bool monospace = 18;
+  // True when the run's case mapping renders it in small capitals.
+  bool small_caps = 19;
 }
 
 // Paragraph is one body paragraph of a text document, in reading order, with

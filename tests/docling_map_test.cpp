@@ -1312,10 +1312,12 @@ void verify_character_spans() {
     int64_t offset = 20;
     for (const char* text : {"uni", "form"}) {
       officev1::TextRun* run = add_run(paragraph, text, &offset);
-      run->set_font("Liberation Sans");
+      run->set_font("Liberation Mono");
       run->set_size_pt(10.0f);
       run->set_weight(150.0f);
       run->set_escapement(33);
+      run->set_monospace(true);
+      run->set_small_caps(true);
     }
     mapper.consume(event);
   }
@@ -1346,7 +1348,9 @@ void verify_character_spans() {
 
   const docv1::TextItemBase& uniform = base_of(document.texts(1));
   require(uniform.formatting().bold()
-              && uniform.formatting().script() == docv1::SCRIPT_SUPER,
+              && uniform.formatting().script() == docv1::SCRIPT_SUPER
+              && uniform.formatting().monospace()
+              && uniform.formatting().small_caps(),
           "spans: a uniform item keeps item-level formatting and script");
   require(uniform.spans_size() == 1
               && uniform.spans(0).range().start() == 0

@@ -127,6 +127,8 @@ struct RunKey {
   bool italic = false;
   bool underline = false;
   bool strikethrough = false;
+  bool monospace = false;
+  bool small_caps = false;
   uint32_t color_rgb = 0;
   int escapement = 0;
   std::string language;
@@ -145,6 +147,8 @@ RunKey run_key(const officev1::TextRun& run) {
   key.italic = run.italic();
   key.underline = run.underline();
   key.strikethrough = run.strikethrough();
+  key.monospace = run.monospace();
+  key.small_caps = run.small_caps();
   key.color_rgb = run.color_rgb();
   key.escapement = run.escapement();
   key.language = run.language();
@@ -228,12 +232,15 @@ void set_uniform_formatting(
     if ((run.weight() >= 150.0f) != bold || run.italic() != runs[0].italic()
         || run.underline() != runs[0].underline()
         || run.strikethrough() != runs[0].strikethrough()
+        || run.monospace() != runs[0].monospace()
+        || run.small_caps() != runs[0].small_caps()
         || script_for(run.escapement()) != script) {
       return;
     }
   }
   if (!bold && !runs[0].italic() && !runs[0].underline()
-      && !runs[0].strikethrough() && script == docv1::SCRIPT_UNSPECIFIED) {
+      && !runs[0].strikethrough() && !runs[0].monospace()
+      && !runs[0].small_caps() && script == docv1::SCRIPT_UNSPECIFIED) {
     return;
   }
   docv1::Formatting* formatting = base->mutable_formatting();
@@ -241,6 +248,8 @@ void set_uniform_formatting(
   formatting->set_italic(runs[0].italic());
   formatting->set_underline(runs[0].underline());
   formatting->set_strikethrough(runs[0].strikethrough());
+  formatting->set_monospace(runs[0].monospace());
+  formatting->set_small_caps(runs[0].small_caps());
   formatting->set_script(script);
 }
 
@@ -485,7 +494,8 @@ void DoclingMapper::add_run_spans(
     const bool language_differs =
         !key.language.empty() && key.language != document_language_;
     const bool formatted = key.bold || key.italic || key.underline
-        || key.strikethrough || script != docv1::SCRIPT_UNSPECIFIED;
+        || key.strikethrough || key.monospace || key.small_caps
+        || script != docv1::SCRIPT_UNSPECIFIED;
     if (!formatted && key.font.empty() && key.size_pt <= 0 && color.empty()
         && !language_differs && key.hyperlink.empty()
         && key.field_code.empty()) {
@@ -501,6 +511,8 @@ void DoclingMapper::add_run_spans(
       formatting->set_italic(key.italic);
       formatting->set_underline(key.underline);
       formatting->set_strikethrough(key.strikethrough);
+      formatting->set_monospace(key.monospace);
+      formatting->set_small_caps(key.small_caps);
       formatting->set_script(script);
     }
     if (!key.font.empty()) span->set_font_family(key.font);

@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include <com/sun/star/awt/FontPitch.hpp>
 #include <com/sun/star/awt/FontSlant.hpp>
 #include <com/sun/star/awt/Point.hpp>
 #include <com/sun/star/awt/Size.hpp>
@@ -78,6 +79,7 @@
 #include <com/sun/star/lang/XMultiComponentFactory.hpp>
 #include <com/sun/star/packages/zip/ZipIOException.hpp>
 #include <com/sun/star/presentation/XPresentationPage.hpp>
+#include <com/sun/star/style/CaseMap.hpp>
 #include <com/sun/star/style/XStyle.hpp>
 #include <com/sun/star/style/XStyleFamiliesSupplier.hpp>
 #include <com/sun/star/frame/XModel.hpp>
@@ -1523,6 +1525,20 @@ void fill_run_char_props(const Reference<css::beans::XPropertySet>& props,
     run->set_escapement(escapement);
   } catch (const css::beans::UnknownPropertyException&) {
     // Expected probe result: not every text model models escapement.
+  }
+  try {
+    sal_Int16 pitch = css::awt::FontPitch::DONTKNOW;
+    props->getPropertyValue("CharFontPitch") >>= pitch;
+    run->set_monospace(pitch == css::awt::FontPitch::FIXED);
+  } catch (const css::beans::UnknownPropertyException&) {
+    // Expected probe result: font pitch is an optional character property.
+  }
+  try {
+    sal_Int16 case_map = css::style::CaseMap::NONE;
+    props->getPropertyValue("CharCaseMap") >>= case_map;
+    run->set_small_caps(case_map == css::style::CaseMap::SMALLCAPS);
+  } catch (const css::beans::UnknownPropertyException&) {
+    // Expected probe result: case mapping is an optional character property.
   }
   try {
     css::lang::Locale locale;
