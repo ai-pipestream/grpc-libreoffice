@@ -368,6 +368,21 @@ int64_t datetime_epoch_ms(const css::util::DateTime& value) {
 // for dates before 1970. A spreadsheet's null date is 1899-12-30 by default,
 // which is exactly the range datetime_epoch_ms clamps away, so serial dates
 // resolve through this helper instead.
+// Splits a day count expressed in milliseconds from the Unix epoch into its
+// wall-clock components. The sum a spreadsheet serial produces is a civil
+// value, not an instant, so it is decomposed rather than reported as one.
+void fill_cell_datetime(int64_t day_ms, officev1::CellDateTime* out) {
+  time_t seconds = static_cast<time_t>(day_ms / 1000);
+  struct tm parts = {};
+  if (gmtime_r(&seconds, &parts) == nullptr) return;
+  out->set_year(parts.tm_year + 1900);
+  out->set_month(parts.tm_mon + 1);
+  out->set_day(parts.tm_mday);
+  out->set_hour(parts.tm_hour);
+  out->set_minute(parts.tm_min);
+  out->set_second(parts.tm_sec);
+}
+
 int64_t date_midnight_epoch_ms(const css::util::Date& value) {
   if (value.Year == 0) return 0;
   struct tm parts = {};
@@ -3373,12 +3388,15 @@ bool emit_calc_content(
               out_cell->set_is_boolean(true);
             } else if ((format.category & css::util::NumberFormat::DATETIME)
                        != 0) {
-              // DATETIME is DATE|TIME, so the mask catches all three.
+              // DATETIME is DATE|TIME, so the mask catches all three. The
+              // serial counts days from the null date; the wall-clock
+              // components fall out of that sum with no timezone claimed.
               out_cell->set_is_datetime(true);
-              out_cell->set_datetime_epoch_ms(
+              fill_cell_datetime(
                   null_date_epoch_ms +
-                  static_cast<int64_t>(
-                      std::llround(cell->getValue() * 86400000.0)));
+                      static_cast<int64_t>(
+                          std::llround(cell->getValue() * 86400000.0)),
+                  out_cell->mutable_datetime());
             }
             if (type == css::table::CellContentType_FORMULA) {
               out_cell->set_error_code(cell->getError());

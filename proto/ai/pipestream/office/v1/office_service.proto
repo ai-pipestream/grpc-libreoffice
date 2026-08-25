@@ -1302,6 +1302,18 @@ message Sheet {
   repeated int32 column_widths_twips = 10;
 }
 
+// CellDateTime is a spreadsheet cell's wall-clock date and time. A cell's
+// date is a civil value the document writes without a timezone, so the
+// components are reported as written rather than as an instant.
+message CellDateTime {
+  int32 year = 1;
+  int32 month = 2;
+  int32 day = 3;
+  int32 hour = 4;
+  int32 minute = 5;
+  int32 second = 6;
+}
+
 // SheetCell is one non-empty cell of a used row.
 message SheetCell {
   // Zero-based absolute column on the sheet.
@@ -1328,9 +1340,10 @@ message SheetCell {
   // True when the cell's number format is a date, time, or datetime format,
   // so number is a date serial rather than a plain quantity.
   bool is_datetime = 10;
-  // The cell's instant as milliseconds since the Unix epoch, UTC, resolved
-  // against the document's own null date; meaningful only when is_datetime.
-  int64 datetime_epoch_ms = 11;
+  // The cell's wall-clock date and time, resolved from its serial against
+  // the document's own null date; set only when is_datetime. A spreadsheet
+  // date states no timezone, so neither does this.
+  CellDateTime datetime = 11;
   // True when the cell's number format is a logical format, so number is 0
   // or 1 standing for false or true.
   bool is_boolean = 12;

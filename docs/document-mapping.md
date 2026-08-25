@@ -20,7 +20,7 @@ the audit ranked the gaps in.
 | Comments | items under a `GROUP_LABEL_COMMENT_SECTION` group, back-linked from the annotated item's `comments` `FineRef` with the annotated range |
 | Tracked changes | `Document.changes`, each a `ChangeRecord` targeting the item range it touches |
 | Bookmarks | `Document.anchors`, each a `NamedAnchor` targeting the item range it names |
-| Spreadsheet cell values | `TableCell.value`: number, boolean, instant, formula, or error literal, with `number_format` |
+| Spreadsheet cell values | `TableCell.value`: number, boolean, civil date and time, formula, or error literal, with `number_format` |
 | Sheet column widths | `TableData.columns[].width` (twips), one entry per used column |
 | Sheet row position | `TableData.row_prov[].grid`: sheet name, row, first used column |
 | Merged and split table cells | `TableCell.row_span` / `col_span` and the base-grid position the office cell name anchors at |
@@ -28,7 +28,7 @@ the audit ranked the gaps in.
 | Slide tables | `TableItem` folded from the table shape's cell grid, parented to its slide group |
 | Speaker notes | `CONTENT_LAYER_NOTES` items under the slide group |
 | Image alt text | `PictureMeta.description.text` |
-| Document properties | `Document.source_meta`: title, author, created, modified, language, generator, keywords (also `BaseMeta.keywords`) |
+| Document properties | `Document.source_meta`: title, author, created and modified instants, language, generator, keywords (also `BaseMeta.keywords`) |
 | Coordinate unit | `PageItem.unit` = `"twip"` on every page |
 
 ## The document-absolute character space
@@ -66,14 +66,19 @@ is a holding pen, not a destination.
 | Embedded object identity | name, class id, kind |
 | Index and note attribution | index service name and title; footnote label, endnote flag, and the citation mark's position |
 
-## Timestamps
+## Dates and times
 
-Every instant the fold writes is an ISO 8601 UTC string, because that is the
-shape the document schema declares today: `DocumentMeta.created` and
-`.modified`, `ChangeRecord.timestamp`, and `CellValue.datetime`. The office
-wire carries them as epoch milliseconds, which is the lossless form. When
-the schema grows typed timestamps these become the raw fallback rather than
-the value.
+Instants are typed: `DocumentMeta.created` and `.modified` and
+`ChangeRecord.timestamp` are `google.protobuf.Timestamp`, converted from the
+epoch milliseconds the office wire carries. The office core does not report
+the source's own spelling of a document date, so the `_raw` twins the schema
+offers stay unset rather than holding a re-rendering of the parsed value.
+
+A spreadsheet date is not an instant. It is a wall-clock value the document
+writes without a timezone, so it stays one: the extractor resolves the
+cell's serial against the document's own null date into calendar
+components, and the fold puts them in `CellValue.datetime`, a
+`CivilDateTime`. Nothing along that path invents an offset.
 
 ## Not captured yet
 

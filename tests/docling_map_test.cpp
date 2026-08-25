@@ -1399,7 +1399,9 @@ void verify_typed_cells() {
     when->set_number(45000);
     when->set_display("2023-03-15");
     when->set_is_datetime(true);
-    when->set_datetime_epoch_ms(1678838400000);
+    when->mutable_datetime()->set_year(2023);
+    when->mutable_datetime()->set_month(3);
+    when->mutable_datetime()->set_day(15);
     when->set_number_format_string("YYYY-MM-DD");
     officev1::SheetCell* broken = row->add_cells();
     broken->set_column(2);
@@ -1430,9 +1432,11 @@ void verify_typed_cells() {
   require(data.table_cells(0).value().boolean()
               && data.table_cells(0).value().number_format() == "BOOLEAN",
           "cells: a logical format makes a boolean value");
-  require(data.table_cells(1).value().datetime() == "2023-03-15T00:00:00Z"
+  require(data.table_cells(1).value().datetime().year() == 2023
+              && data.table_cells(1).value().datetime().month() == 3
+              && data.table_cells(1).value().datetime().day() == 15
               && data.table_cells(1).text() == "2023-03-15",
-          "cells: a date format resolves to an instant, text stays display");
+          "cells: a date format resolves to a civil date, text stays display");
   require(data.table_cells(2).value().error() == "#DIV/0!",
           "cells: a failed formula reports its error literal");
   require(data.table_cells(3).value().number() == 12.5
@@ -1575,9 +1579,9 @@ void verify_document_meta() {
               && meta.authors_size() == 1
               && meta.authors(0) == "Alice Adams",
           "meta: title and author land in the metadata slot");
-  require(meta.created() == "2023-03-15T00:00:00Z"
-              && meta.modified() == "2023-03-16T00:00:00Z",
-          "meta: timestamps become ISO 8601 instants");
+  require(meta.created().seconds() == 1678838400
+              && meta.modified().seconds() == 1678924800,
+          "meta: timestamps become typed instants");
   require(meta.language() == "en-US" && meta.generator() == "LibreOffice/25.2",
           "meta: language and generator are kept");
   require(meta.keywords_size() == 2

@@ -811,9 +811,9 @@ void verify_typed_spreadsheet() {
                    cell.number() == 42.0;
       }
       if (row.sheet_index() == 0 && row.row() == 3 && cell.column() == 0) {
-        // 2023-03-15T00:00:00Z, resolved against the document's null date.
-        date_ok = cell.is_datetime() &&
-                  cell.datetime_epoch_ms() == 1678838400000LL;
+        // 2023-03-15, resolved against the document's own null date.
+        date_ok = cell.is_datetime() && cell.datetime().year() == 2023 &&
+                  cell.datetime().month() == 3 && cell.datetime().day() == 15;
       }
       if (row.sheet_index() == 0 && row.row() == 3 && cell.column() == 1) {
         boolean_ok = cell.is_boolean() && cell.number() == 1.0;

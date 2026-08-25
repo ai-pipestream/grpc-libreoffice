@@ -9,6 +9,7 @@
 #include <sstream>
 
 #include <google/protobuf/struct.pb.h>
+#include <google/protobuf/timestamp.pb.h>
 
 namespace grlibre {
 
@@ -83,19 +84,18 @@ std::string page_image_mime(officev1::PageImageFormat format) {
   }
 }
 
-// An instant as an ISO 8601 UTC timestamp, the shape the document schema
-// declares for source timestamps. Empty for the zero instant, which the
-// office wire uses for "unset".
-std::string iso8601_utc(int64_t epoch_ms) {
-  if (epoch_ms == 0) return std::string();
-  time_t seconds = static_cast<time_t>(epoch_ms / 1000);
-  struct tm parts = {};
-  if (gmtime_r(&seconds, &parts) == nullptr) return std::string();
-  char text[64];
-  std::snprintf(text, sizeof(text), "%04d-%02d-%02dT%02d:%02d:%02dZ",
-                parts.tm_year + 1900, parts.tm_mon + 1, parts.tm_mday,
-                parts.tm_hour, parts.tm_min, parts.tm_sec);
-  return text;
+// The office wire counts instants in epoch milliseconds; the schema wants
+// them typed. Negative remainders borrow a second so the nanos stay in
+// range for instants before 1970.
+void set_instant(int64_t epoch_ms, google::protobuf::Timestamp* out) {
+  int64_t seconds = epoch_ms / 1000;
+  int64_t millis = epoch_ms % 1000;
+  if (millis < 0) {
+    millis += 1000;
+    seconds -= 1;
+  }
+  out->set_seconds(seconds);
+  out->set_nanos(static_cast<int32_t>(millis * 1000000));
 }
 
 // A run color as #rrggbb. The office core reports automatic color as 0, so
@@ -910,10 +910,10 @@ void DoclingMapper::on_metadata(const officev1::DocumentMetadata& meta) {
   if (!meta.title().empty()) source_meta->set_title(meta.title());
   if (!meta.author().empty()) source_meta->add_authors(meta.author());
   if (meta.created_epoch_ms() != 0) {
-    source_meta->set_created(iso8601_utc(meta.created_epoch_ms()));
+    set_instant(meta.created_epoch_ms(), source_meta->mutable_created());
   }
   if (meta.modified_epoch_ms() != 0) {
-    source_meta->set_modified(iso8601_utc(meta.modified_epoch_ms()));
+    set_instant(meta.modified_epoch_ms(), source_meta->mutable_modified());
   }
   if (!meta.language().empty()) source_meta->set_language(meta.language());
   if (!meta.generator().empty()) source_meta->set_generator(meta.generator());
@@ -1680,7 +1680,14 @@ void DoclingMapper::on_sheet_row(const officev1::SheetRow& row) {
     } else if (cell.is_boolean()) {
       value.set_boolean(cell.number() != 0);
     } else if (cell.is_datetime()) {
-      value.set_datetime(iso8601_utc(cell.datetime_epoch_ms()));
+      // A spreadsheet date is a wall-clock value; it stays one.
+      docv1::CivilDateTime* when = value.mutable_datetime();
+      when->set_year(cell.datetime().year());
+      when->set_month(cell.datetime().month());
+      when->set_day(cell.datetime().day());
+      when->set_hour(cell.datetime().hour());
+      when->set_minute(cell.datetime().minute());
+      when->set_second(cell.datetime().second());
     } else if (cell.type() == officev1::SHEET_CELL_TYPE_VALUE) {
       value.set_number(cell.number());
     } else {
@@ -1878,7 +1885,7 @@ void DoclingMapper::on_tracked_change(const officev1::TrackedChange& change) {
   record->set_kind(kind);
   record->set_author(change.author());
   if (change.epoch_ms() != 0) {
-    record->set_timestamp(iso8601_utc(change.epoch_ms()));
+    set_instant(change.epoch_ms(), record->mutable_timestamp());
   }
   if (!change.changed_text().empty()) {
     record->set_content(change.changed_text());
