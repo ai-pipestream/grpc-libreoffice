@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <print>
 #include <ctime>
@@ -116,8 +117,11 @@
 #include <com/sun/star/text/TextContentAnchorType.hpp>
 #include <com/sun/star/table/XTableCharts.hpp>
 #include <com/sun/star/table/XTableChartsSupplier.hpp>
+#include <com/sun/star/table/XMergeableCell.hpp>
+#include <com/sun/star/table/XTable.hpp>
 #include <com/sun/star/table/XTableColumns.hpp>
 #include <com/sun/star/table/XTableRows.hpp>
+#include <com/sun/star/util/NumberFormat.hpp>
 #include <com/sun/star/text/XSimpleText.hpp>
 #include <com/sun/star/util/XMergeable.hpp>
 #include <com/sun/star/util/XNumberFormats.hpp>
@@ -358,6 +362,19 @@ int64_t datetime_epoch_ms(const css::util::DateTime& value) {
   if (seconds < 0) return 0;
   return static_cast<int64_t>(seconds) * 1000 +
          static_cast<int64_t>(value.NanoSeconds / 1000000);
+}
+
+// Milliseconds from the Unix epoch to midnight of a calendar date, negative
+// for dates before 1970. A spreadsheet's null date is 1899-12-30 by default,
+// which is exactly the range datetime_epoch_ms clamps away, so serial dates
+// resolve through this helper instead.
+int64_t date_midnight_epoch_ms(const css::util::Date& value) {
+  if (value.Year == 0) return 0;
+  struct tm parts = {};
+  parts.tm_year = value.Year - 1900;
+  parts.tm_mon = value.Month - 1;
+  parts.tm_mday = value.Day;
+  return static_cast<int64_t>(timegm(&parts)) * 1000;
 }
 
 bool emit_metadata(const Reference<css::frame::XModel>& model,
@@ -1456,10 +1473,162 @@ void measure_line_boundaries(
   }
 }
 
+// Reads the character attributes of one text portion onto its run: font,
+// size, weight, slant, underline, strikeout, color, vertical escapement,
+// locale, and the hyperlink the portion sits inside. The four attributes
+// every text model carries are read unguarded, so a model that cannot answer
+// them unwinds to the caller's warning; the optional ones probe.
+void fill_run_char_props(const Reference<css::beans::XPropertySet>& props,
+                         officev1::TextRun* run) {
+  rtl::OUString font;
+  props->getPropertyValue("CharFontName") >>= font;
+  run->set_font(utf8(font));
+  float size_pt = 0;
+  props->getPropertyValue("CharHeight") >>= size_pt;
+  run->set_size_pt(size_pt);
+  float weight = 0;
+  props->getPropertyValue("CharWeight") >>= weight;
+  run->set_weight(weight);
+  css::awt::FontSlant slant = css::awt::FontSlant_NONE;
+  props->getPropertyValue("CharPosture") >>= slant;
+  run->set_italic(slant == css::awt::FontSlant_ITALIC ||
+                  slant == css::awt::FontSlant_OBLIQUE);
+  sal_Int16 underline = 0;
+  props->getPropertyValue("CharUnderline") >>= underline;
+  run->set_underline(underline != 0);
+  sal_Int16 strikeout = 0;
+  props->getPropertyValue("CharStrikeout") >>= strikeout;
+  run->set_strikethrough(strikeout != 0);
+  sal_Int32 color = 0;
+  props->getPropertyValue("CharColor") >>= color;
+  run->set_color_rgb(color >= 0 ? static_cast<uint32_t>(color) : 0);
+  try {
+    sal_Int16 escapement = 0;
+    props->getPropertyValue("CharEscapement") >>= escapement;
+    run->set_escapement(escapement);
+  } catch (const css::beans::UnknownPropertyException&) {
+    // Expected probe result: not every text model models escapement.
+  }
+  try {
+    css::lang::Locale locale;
+    props->getPropertyValue("CharLocale") >>= locale;
+    std::string tag = utf8(locale.Language);
+    if (!tag.empty() && !locale.Country.isEmpty()) {
+      tag += "-" + utf8(locale.Country);
+    }
+    run->set_language(tag);
+  } catch (const css::beans::UnknownPropertyException&) {
+    // Expected probe result: character locales are optional.
+  }
+  try {
+    rtl::OUString url;
+    props->getPropertyValue("HyperLinkURL") >>= url;
+    if (!url.isEmpty()) {
+      run->set_hyperlink_url(utf8(url));
+      rtl::OUString target;
+      props->getPropertyValue("HyperLinkTarget") >>= target;
+      run->set_hyperlink_target(utf8(target));
+      rtl::OUString link_name;
+      props->getPropertyValue("HyperLinkName") >>= link_name;
+      run->set_hyperlink_name(utf8(link_name));
+    }
+  } catch (const css::beans::UnknownPropertyException&) {
+    // Expected probe result: not every text model carries hyperlink
+    // character properties.
+  }
+}
+
+// The last segment of a text field's programmatic service name, for example
+// "PageNumber" for com.sun.star.text.textfield.PageNumber. A field answers
+// several service names; the most specific one wins, so a document-info
+// field reports "docinfo.Title" rather than the shared base name. Empty when
+// the field does not name itself.
+std::string text_field_code(const Reference<css::text::XTextField>& field) {
+  Reference<css::lang::XServiceInfo> info(field, UNO_QUERY);
+  if (!info.is()) return std::string();
+  static const std::string kPrefix = "com.sun.star.text.textfield.";
+  std::string best;
+  for (const rtl::OUString& name : info->getSupportedServiceNames()) {
+    std::string service = utf8(name);
+    if (!service.starts_with(kPrefix)) continue;
+    std::string code = service.substr(kPrefix.size());
+    if (code.size() > best.size()) best = code;
+  }
+  return best;
+}
+
+// The name a cross-reference or reference-mark field points at (the
+// bookmark, reference mark, or sequence it resolves against); empty for
+// every other field.
+std::string text_field_target(const Reference<css::text::XTextField>& field) {
+  Reference<css::beans::XPropertySet> props(field, UNO_QUERY);
+  if (!props.is()) return std::string();
+  try {
+    rtl::OUString source;
+    props->getPropertyValue("SourceName") >>= source;
+    return utf8(source);
+  } catch (const css::beans::UnknownPropertyException&) {
+    // Expected probe result: only reference fields point at a name.
+  } catch (const css::uno::Exception&) {
+    // A field that refuses the read simply has no target to report.
+  }
+  return std::string();
+}
+
+// Appends the rendered result of one field portion as a run tagged with the
+// field's own type. Field results are the printed page numbers, dates,
+// cross-references, caption numbers, and mail-merge values a reader sees;
+// without this they are holes in the extracted text. A field that renders
+// nothing adds no run.
+void fill_field_run(const Reference<css::text::XTextRange>& range,
+                    const Reference<css::beans::XPropertySet>& props,
+                    const std::string& label,
+                    google::protobuf::RepeatedPtrField<officev1::TextRun>* runs,
+                    int64_t* offset, MarkerCollector* marks, Warner& warner) {
+  Reference<css::text::XTextField> field;
+  try {
+    props->getPropertyValue("TextField") >>= field;
+  } catch (const css::beans::UnknownPropertyException&) {
+    // Expected probe result: a field portion may not expose its field.
+  }
+  std::string resolved = utf8(range->getString());
+  if (resolved.empty() && field.is()) {
+    try {
+      resolved = utf8(field->getPresentation(false));
+    } catch (const css::uno::Exception& error) {
+      warner.warn(label + " field presentation query failed", error);
+    }
+  }
+  if (resolved.empty()) return;
+  officev1::TextRun* run = runs->Add();
+  run->set_text(resolved);
+  int64_t length = codepoints(resolved);
+  run->set_char_length(length);
+  if (offset != nullptr) {
+    run->set_char_offset(*offset);
+    *offset += length;
+  } else {
+    run->set_char_offset(-1);
+  }
+  std::string code = field.is() ? text_field_code(field) : std::string();
+  // A field whose service names say nothing is still a field; the generic
+  // code keeps generated text distinguishable from authored text.
+  run->set_field_code(code.empty() ? "TextField" : code);
+  if (field.is()) run->set_field_target(text_field_target(field));
+  try {
+    fill_run_char_props(props, run);
+  } catch (const css::uno::Exception& error) {
+    warner.warn(label + " field run character properties failed", error);
+  }
+  if (marks != nullptr) marks->on_run_text(run->text());
+}
+
 // Appends one run per uniformly formatted text portion. When offset is null
 // the runs are outside the body flow and carry char_offset -1; otherwise
 // *offset is the running position in the annotation text space and advances
-// by each run's length. marks, when non-null, observes the non-Text
+// by each run's length. Field portions contribute their rendered result as
+// a tagged run, so the annotation space and the extracted text both hold
+// what the page shows. marks, when non-null, observes the remaining non-Text
 // portions (comment, bookmark, tracked-change, and form-field boundaries)
 // and the walked run text.
 void fill_runs(const Reference<css::container::XEnumerationAccess>& paragraph,
@@ -1478,6 +1647,10 @@ void fill_runs(const Reference<css::container::XEnumerationAccess>& paragraph,
       rtl::OUString portion_type;
       props->getPropertyValue("TextPortionType") >>= portion_type;
       if (portion_type != "Text") {
+        if (portion_type == "TextField") {
+          fill_field_run(range, props, label, runs, offset, marks, warner);
+          continue;
+        }
         if (marks != nullptr) {
           marks->on_portion(portion_type, range, props, offset);
         }
@@ -1493,44 +1666,7 @@ void fill_runs(const Reference<css::container::XEnumerationAccess>& paragraph,
       } else {
         run->set_char_offset(-1);
       }
-      rtl::OUString font;
-      props->getPropertyValue("CharFontName") >>= font;
-      run->set_font(utf8(font));
-      float size_pt = 0;
-      props->getPropertyValue("CharHeight") >>= size_pt;
-      run->set_size_pt(size_pt);
-      float weight = 0;
-      props->getPropertyValue("CharWeight") >>= weight;
-      run->set_weight(weight);
-      css::awt::FontSlant slant = css::awt::FontSlant_NONE;
-      props->getPropertyValue("CharPosture") >>= slant;
-      run->set_italic(slant == css::awt::FontSlant_ITALIC ||
-                      slant == css::awt::FontSlant_OBLIQUE);
-      sal_Int16 underline = 0;
-      props->getPropertyValue("CharUnderline") >>= underline;
-      run->set_underline(underline != 0);
-      sal_Int16 strikeout = 0;
-      props->getPropertyValue("CharStrikeout") >>= strikeout;
-      run->set_strikethrough(strikeout != 0);
-      sal_Int32 color = 0;
-      props->getPropertyValue("CharColor") >>= color;
-      run->set_color_rgb(color >= 0 ? static_cast<uint32_t>(color) : 0);
-      try {
-        rtl::OUString url;
-        props->getPropertyValue("HyperLinkURL") >>= url;
-        if (!url.isEmpty()) {
-          run->set_hyperlink_url(utf8(url));
-          rtl::OUString target;
-          props->getPropertyValue("HyperLinkTarget") >>= target;
-          run->set_hyperlink_target(utf8(target));
-          rtl::OUString link_name;
-          props->getPropertyValue("HyperLinkName") >>= link_name;
-          run->set_hyperlink_name(utf8(link_name));
-        }
-      } catch (const css::beans::UnknownPropertyException&) {
-        // Expected probe result: not every text model carries hyperlink
-        // character properties.
-      }
+      fill_run_char_props(props, run);
       if (marks != nullptr) marks->on_run_text(run->text());
     } catch (const css::uno::Exception& error) {
       warner.warn(label + " portion " + std::to_string(portion_index - 1) +
@@ -1610,8 +1746,9 @@ bool fill_paragraph(const css::uno::Any& element, int32_t index,
   return true;
 }
 
-// "B7" -> row 6, column 1. Split-cell names ("B7.1.2") report -1/-1; the
-// name itself stays on the wire.
+// "B7" -> row 6, column 1. Split-cell names ("B7.1.2") have no base-grid
+// position of their own and report -1/-1; the name itself stays on the wire,
+// and the anchoring cell it starts from is recoverable from it.
 void parse_cell_name(const std::string& name, int32_t* row, int32_t* column) {
   *row = -1;
   *column = -1;
@@ -1623,13 +1760,38 @@ void parse_cell_name(const std::string& name, int32_t* row, int32_t* column) {
   }
   if (pos == 0 || pos >= name.size()) return;
   long row_number = 0;
-  for (size_t digit = pos; digit < name.size(); digit++) {
-    if (!std::isdigit(static_cast<unsigned char>(name[digit]))) return;
+  size_t digit = pos;
+  for (; digit < name.size() &&
+         std::isdigit(static_cast<unsigned char>(name[digit]));
+       digit++) {
     row_number = row_number * 10 + (name[digit] - '0');
   }
-  if (row_number <= 0) return;
+  if (digit == pos || row_number <= 0 || digit != name.size()) return;
   *row = static_cast<int32_t>(row_number - 1);
   *column = static_cast<int32_t>(col - 1);
+}
+
+// Derives each cell's column span from the gaps between the cell names of
+// its row: a horizontal merge is the only thing that makes a text table's
+// row jump from A1 straight to C1, and the width of the jump is the merged
+// cell's span. Cells with no base-grid position of their own keep span 1.
+void fill_column_spans(officev1::TableData* table) {
+  std::map<int32_t, std::vector<officev1::TableCellData*>> rows;
+  for (officev1::TableCellData& cell : *table->mutable_cells()) {
+    if (cell.row() < 0 || cell.column() < 0) continue;
+    rows[cell.row()].push_back(&cell);
+  }
+  for (auto& [row, cells] : rows) {
+    std::ranges::sort(cells, {}, [](const officev1::TableCellData* cell) {
+      return cell->column();
+    });
+    for (size_t i = 0; i < cells.size(); i++) {
+      int32_t next = i + 1 < cells.size() ? cells[i + 1]->column()
+                                          : table->columns();
+      int32_t span = next - cells[i]->column();
+      cells[i]->set_column_span(span > 1 ? span : 1);
+    }
+  }
 }
 
 bool emit_table(const Reference<css::text::XTextTable>& table, int32_t index,
@@ -1673,6 +1835,23 @@ bool emit_table(const Reference<css::text::XTextTable>& table, int32_t index,
       cell_out->set_column(column);
       cell_out->set_name(cell_name);
       cell_out->set_text(utf8(cell->getString()));
+      cell_out->set_row_span(1);
+      cell_out->set_column_span(1);
+      Reference<css::beans::XPropertySet> cell_props(cell, UNO_QUERY);
+      if (cell_props.is()) {
+        try {
+          sal_Int32 span = 1;
+          cell_props->getPropertyValue("RowSpan") >>= span;
+          // The office core reports 0 or a negative count on the cells a
+          // vertical merge covers; the anchor carries the whole block.
+          cell_out->set_row_span(span > 0 ? static_cast<int32_t>(span) : 0);
+        } catch (const css::beans::UnknownPropertyException&) {
+          // Expected probe result: older office cores expose no row span.
+        } catch (const css::uno::Exception& error) {
+          warner.warn(label + " cell " + cell_name + " row span query failed",
+                      error);
+        }
+      }
       if (want_cell || want_pool) {
         auto* target = want_cell ? cell_out->mutable_line_rects()
                                  : out->mutable_line_rects();
@@ -1685,6 +1864,7 @@ bool emit_table(const Reference<css::text::XTextTable>& table, int32_t index,
         }
       }
     }
+    fill_column_spans(out);
     if (names.hasElements()) {
       Reference<css::text::XText> first(table->getCellByName(names[0]), UNO_QUERY);
       Reference<css::text::XText> last(
@@ -1749,6 +1929,29 @@ void flatten_text_runs(const Reference<css::text::XText>& text,
     Reference<css::container::XEnumerationAccess> paragraph(
         paragraphs->nextElement(), UNO_QUERY);
     if (paragraph.is()) fill_runs(paragraph, label, runs, nullptr, marks, warner);
+  }
+}
+
+// Reads a shape's accessibility title and description, the alt text an
+// author writes for a reader who cannot see the picture. Both properties
+// are optional across every shape family, so an absent one is not a
+// problem worth a warning.
+void fill_alt_text(const Reference<css::beans::XPropertySet>& props,
+                   std::string* title, std::string* description) {
+  if (!props.is()) return;
+  try {
+    rtl::OUString value;
+    props->getPropertyValue("Title") >>= value;
+    *title = utf8(value);
+  } catch (const css::uno::Exception&) {
+    // Expected probe result: not every shape carries a title.
+  }
+  try {
+    rtl::OUString value;
+    props->getPropertyValue("Description") >>= value;
+    *description = utf8(value);
+  } catch (const css::uno::Exception&) {
+    // Expected probe result: not every shape carries a description.
   }
 }
 
@@ -2043,6 +2246,7 @@ bool emit_writer_shapes(const Reference<css::container::XIndexAccess>& shapes,
       out->set_group_path(group_path);
       Reference<css::container::XNamed> named(props, UNO_QUERY);
       if (named.is()) out->set_name(utf8(named->getName()));
+      fill_alt_text(props, out->mutable_title(), out->mutable_description());
       std::string image_label = "image " + std::to_string(walk->image_index);
 
       encode_graphic(graphic, walk->provider, image_label,
@@ -2130,6 +2334,7 @@ bool emit_writer_shapes(const Reference<css::container::XIndexAccess>& shapes,
     out->set_group_path(group_path);
     Reference<css::container::XNamed> named(props, UNO_QUERY);
     if (named.is()) out->set_name(utf8(named->getName()));
+    fill_alt_text(props, out->mutable_title(), out->mutable_description());
     Reference<css::drawing::XShape> shape(props, UNO_QUERY);
     if (shape.is()) {
       out->set_shape_type(utf8(shape->getShapeType()));
@@ -2332,6 +2537,7 @@ bool emit_shapes(const Reference<css::drawing::XShapes>& shapes,
       warner.warn(label + " geometry query failed", error);
     }
     Reference<css::beans::XPropertySet> props(shape, UNO_QUERY);
+    fill_alt_text(props, out->mutable_title(), out->mutable_description());
     if (want_shapes && props.is()) {
       try {
         sal_Int32 rotation = 0;
@@ -2378,6 +2584,8 @@ bool emit_shapes(const Reference<css::drawing::XShapes>& shapes,
         image->set_index((*image_counter)++);
         image->set_page_index(page_index);
         image->set_name(out->name());
+        image->set_title(out->title());
+        image->set_description(out->description());
         image->set_width_twips(out->width_twips());
         image->set_height_twips(out->height_twips());
         encode_graphic(graphic, provider,
@@ -2448,9 +2656,74 @@ officev1::PlaceholderRole placeholder_role_for(const std::string& shape_type) {
 // groups so nested placeholders keep their paint order. Graphic, OLE, chart,
 // and table shapes emit only this header; their heavy content (image bytes,
 // chart data, table grid) belongs to the embedded-objects work.
+// "A1" for row 0, column 0; the office core's own cell naming, rebuilt here
+// because a drawing table's cells are addressed by position only.
+std::string cell_name_for(int32_t row, int32_t column) {
+  std::string name;
+  for (int32_t c = column; c >= 0; c = c / 26 - 1) {
+    name.insert(name.begin(), static_cast<char>('A' + c % 26));
+  }
+  return name + std::to_string(row + 1);
+}
+
+// Fills a table shape's cell grid from its table model. A drawing table
+// exposes its content through XTable rather than through the shape's own
+// text interface, which is why a slide table's content is invisible to a
+// text walk. Returns false when the shape is not a table shape.
+bool fill_slide_table(const Reference<css::beans::XPropertySet>& props,
+                      const std::string& label, officev1::TableData* out,
+                      Warner& warner) {
+  if (!props.is()) return false;
+  Reference<css::table::XTable> model;
+  try {
+    props->getPropertyValue("Model") >>= model;
+  } catch (const css::beans::UnknownPropertyException&) {
+    // Expected probe result: only a table shape carries a table model.
+    return false;
+  } catch (const css::uno::Exception& error) {
+    warner.warn(label + " table model query failed", error);
+    return false;
+  }
+  if (!model.is()) return false;
+  out->set_index(-1);
+  out->set_page_index(-1);
+  try {
+    int32_t rows = static_cast<int32_t>(model->getRowCount());
+    int32_t columns = static_cast<int32_t>(model->getColumnCount());
+    out->set_rows(rows);
+    out->set_columns(columns);
+    for (int32_t r = 0; r < rows; r++) {
+      for (int32_t c = 0; c < columns; c++) {
+        Reference<css::table::XCell> cell = model->getCellByPosition(c, r);
+        if (!cell.is()) continue;
+        Reference<css::table::XMergeableCell> merge(cell, UNO_QUERY);
+        // A covered cell repeats its anchor's content; only the anchor is
+        // emitted, and it carries the whole block's spans.
+        if (merge.is() && merge->isMerged()) continue;
+        officev1::TableCellData* out_cell = out->add_cells();
+        out_cell->set_row(r);
+        out_cell->set_column(c);
+        out_cell->set_name(cell_name_for(r, c));
+        out_cell->set_row_span(
+            merge.is() ? std::max<int32_t>(1, merge->getRowSpan()) : 1);
+        out_cell->set_column_span(
+            merge.is() ? std::max<int32_t>(1, merge->getColumnSpan()) : 1);
+        Reference<css::text::XText> text(cell, UNO_QUERY);
+        if (text.is()) out_cell->set_text(utf8(text->getString()));
+      }
+    }
+  } catch (const css::uno::Exception& error) {
+    warner.warn(label + " table walk failed", error);
+  }
+  return true;
+}
+
 bool emit_slide_shape(const Reference<css::drawing::XShape>& shape,
                       int32_t slide_index, int32_t z_order, bool notes,
-                      const EmitFn& emit_fn, Warner& warner) {
+                      bool want_slides,
+                      const Reference<css::graphic::XGraphicProvider>& provider,
+                      int32_t* image_counter, const EmitFn& emit_fn,
+                      Warner& warner) {
   std::string shape_type = utf8(shape->getShapeType());
   std::string label = "slide " + std::to_string(slide_index) +
                       (notes ? " notes shape " : " shape ") +
@@ -2463,6 +2736,10 @@ bool emit_slide_shape(const Reference<css::drawing::XShape>& shape,
   out->set_placeholder_role(placeholder_role_for(shape_type));
   out->set_notes(notes);
   Reference<css::beans::XPropertySet> props(shape, UNO_QUERY);
+  fill_alt_text(props, out->mutable_title(), out->mutable_description());
+  if (shape_type.ends_with(".TableShape")) {
+    fill_slide_table(props, label, out->mutable_table(), warner);
+  }
   if (props.is()) {
     try {
       sal_Bool is_placeholder = false;
@@ -2522,7 +2799,42 @@ bool emit_slide_shape(const Reference<css::drawing::XShape>& shape,
       paragraph_index++;
     }
   }
-  if (!emit_fn(event)) return false;
+  // An images-only selection still walks the shapes, to find the pictures
+  // inside them, but emits no shape events of its own.
+  if (want_slides && !emit_fn(event)) return false;
+
+  // A slide picture reaches the consumer as bytes through the same
+  // EmbeddedImage event the text and drawing walks emit; without it a deck's
+  // pictures arrive as empty placeholders.
+  if (image_counter != nullptr && props.is() &&
+      shape_type.ends_with(".GraphicObjectShape")) {
+    Reference<css::graphic::XGraphic> graphic;
+    try {
+      props->getPropertyValue("Graphic") >>= graphic;
+    } catch (const css::uno::Exception& error) {
+      warner.warn(label + " graphic query failed", error);
+    }
+    if (graphic.is()) {
+      officev1::StreamPagesResponse image_event;
+      officev1::EmbeddedImage* image = image_event.mutable_embedded_image();
+      image->set_index((*image_counter)++);
+      // Slide geometry is page-local, and the slide index is the page.
+      image->set_page_index(notes ? -1 : slide_index);
+      Reference<css::container::XNamed> named(shape, UNO_QUERY);
+      if (named.is()) image->set_name(utf8(named->getName()));
+      image->set_title(out->title());
+      image->set_description(out->description());
+      *image->mutable_anchor() = out->position();
+      image->set_width_twips(out->width_twips());
+      image->set_height_twips(out->height_twips());
+      encode_graphic(graphic, provider,
+                     "image " + std::to_string(image->index()),
+                     image->mutable_mime_type(), image->mutable_data(),
+                     warner);
+      if (!emit_fn(image_event)) return false;
+    }
+  }
+
   Reference<css::drawing::XShapes> children;
   if (shape_type.ends_with(".GroupShape")) {
     children = Reference<css::drawing::XShapes>(shape, UNO_QUERY);
@@ -2541,7 +2853,8 @@ bool emit_slide_shape(const Reference<css::drawing::XShape>& shape,
       }
       if (!child.is()) continue;
       if (!emit_slide_shape(child, slide_index, static_cast<int32_t>(i), notes,
-                            emit_fn, warner)) {
+                            want_slides, provider, image_counter, emit_fn,
+                            warner)) {
         return false;
       }
     }
@@ -2599,8 +2912,17 @@ bool emit_slide_annotations(const Reference<css::drawing::XDrawPage>& slide,
 
 bool emit_presentation_content(
     const Reference<css::drawing::XDrawPagesSupplier>& supplier,
+    const Reference<css::uno::XComponentContext>& context,
     const PartSelection& parts, const EmitFn& emit_fn, Warner& warner) {
   int32_t comment_index = 0;
+  int32_t image_index = 0;
+  // Slide pictures are gated on the images part like every other picture
+  // walk; a null counter switches the walk's image emission off entirely.
+  bool want_images = parts.wants(officev1::DOCUMENT_PART_IMAGES);
+  Reference<css::graphic::XGraphicProvider> provider;
+  if (want_images) provider = graphic_provider(context, warner);
+  int32_t* image_counter = want_images ? &image_index : nullptr;
+  bool want_slides = parts.wants(officev1::DOCUMENT_PART_SLIDES);
   Reference<css::drawing::XDrawPages> pages = supplier->getDrawPages();
   if (!pages.is()) {
     warner.warn("presentation document has no slides");
@@ -2618,8 +2940,9 @@ bool emit_presentation_content(
     }
     if (!slide.is()) continue;
 
-    // A comments-only selection walks just the annotations.
-    if (!parts.wants(officev1::DOCUMENT_PART_SLIDES)) {
+    // A selection asking for neither slides nor their pictures walks just
+    // the annotations.
+    if (!want_slides && !want_images) {
       if (!emit_slide_annotations(slide, static_cast<int32_t>(i),
                                   &comment_index, emit_fn, warner)) {
         return false;
@@ -2654,7 +2977,7 @@ bool emit_presentation_content(
     } catch (const css::uno::Exception& error) {
       warner.warn(label + " master page query failed", error);
     }
-    if (!emit_fn(slide_event)) return false;
+    if (want_slides && !emit_fn(slide_event)) return false;
 
     Reference<css::drawing::XShapes> shapes(slide, UNO_QUERY);
     if (shapes.is()) {
@@ -2671,8 +2994,8 @@ bool emit_presentation_content(
         }
         if (!shape.is()) continue;
         if (!emit_slide_shape(shape, static_cast<int32_t>(i),
-                              static_cast<int32_t>(z), false, emit_fn,
-                              warner)) {
+                              static_cast<int32_t>(z), false, want_slides,
+                              provider, image_counter, emit_fn, warner)) {
           return false;
         }
       }
@@ -2707,8 +3030,8 @@ bool emit_presentation_content(
               }
             }
             if (!emit_slide_shape(shape, static_cast<int32_t>(i),
-                                  static_cast<int32_t>(z), true, emit_fn,
-                                  warner)) {
+                                  static_cast<int32_t>(z), true, want_slides,
+                                  provider, image_counter, emit_fn, warner)) {
               return false;
             }
           }
@@ -2757,27 +3080,52 @@ bool emit_calc_content(
     Reference<css::util::XNumberFormatsSupplier> supplier(model, UNO_QUERY);
     if (supplier.is()) formats = supplier->getNumberFormats();
   }
-  std::map<sal_Int32, std::string> format_cache;
-  auto format_code = [&](sal_Int32 key) -> std::string {
-    if (key == 0 || !formats.is()) return std::string();
+  // One entry per number-format key: its code string and its category
+  // flags, both resolved on first sight. The category is what tells a date
+  // serial from a plain quantity and a logical from the number 1.
+  struct NumberFormatInfo {
+    std::string code;
+    sal_Int16 category = 0;
+  };
+  std::map<sal_Int32, NumberFormatInfo> format_cache;
+  auto format_info = [&](sal_Int32 key) -> const NumberFormatInfo& {
+    static const NumberFormatInfo kGeneral;
+    if (key == 0 || !formats.is()) return kGeneral;
     if (auto found = format_cache.find(key); found != format_cache.end()) {
       return found->second;
     }
-    std::string code;
+    NumberFormatInfo info;
     try {
       Reference<css::beans::XPropertySet> props = formats->getByKey(key);
       if (props.is()) {
         rtl::OUString text;
         props->getPropertyValue("FormatString") >>= text;
-        code = utf8(text);
+        info.code = utf8(text);
+        props->getPropertyValue("Type") >>= info.category;
       }
     } catch (const css::uno::Exception& error) {
       warner.warn("number format " + std::to_string(key) + " query failed",
                   error);
     }
-    format_cache[key] = code;
-    return code;
+    return format_cache.emplace(key, std::move(info)).first->second;
   };
+
+  // Serial dates count days from the document's own null date, 1899-12-30
+  // unless the document says otherwise, so the epoch conversion has to ask.
+  css::util::Date null_date;
+  null_date.Year = 1899;
+  null_date.Month = 12;
+  null_date.Day = 30;
+  if (want_sheets) {
+    try {
+      Reference<css::beans::XPropertySet> doc_props(model, UNO_QUERY);
+      if (doc_props.is()) doc_props->getPropertyValue("NullDate") >>= null_date;
+    } catch (const css::uno::Exception& error) {
+      warner.warn("null date query failed, serial dates assume 1899-12-30",
+                  error);
+    }
+  }
+  const int64_t null_date_epoch_ms = date_midnight_epoch_ms(null_date);
 
   if (want_sheets) {
     // Named ranges are a readonly property on the model, not a supplier
@@ -2952,6 +3300,28 @@ bool emit_calc_content(
       } catch (const css::uno::Exception& error) {
         warner.warn(label + " print areas query failed", error);
       }
+      try {
+        Reference<css::table::XColumnRowRange> grid(sheet, UNO_QUERY);
+        if (grid.is()) {
+          Reference<css::table::XTableColumns> columns = grid->getColumns();
+          if (columns.is()) {
+            sal_Int32 last = std::min<sal_Int32>(used.EndColumn,
+                                                 columns->getCount() - 1);
+            for (sal_Int32 c = 0; c <= last; c++) {
+              Reference<css::beans::XPropertySet> column_props(
+                  columns->getByIndex(c), UNO_QUERY);
+              sal_Int32 width = 0;
+              if (column_props.is()) {
+                column_props->getPropertyValue("Width") >>= width;
+              }
+              out->add_column_widths_twips(
+                  static_cast<int32_t>(hundredth_mm_to_twips(width)));
+            }
+          }
+        }
+      } catch (const css::uno::Exception& error) {
+        warner.warn(label + " column widths query failed", error);
+      }
       if (!emit_fn(event)) return false;
 
       for (sal_Int32 r = used.StartRow; r <= used.EndRow; r++) {
@@ -2997,7 +3367,22 @@ bool emit_calc_content(
               cell_props->getPropertyValue("NumberFormat") >>= key;
             }
             out_cell->set_number_format(key);
-            out_cell->set_number_format_string(format_code(key));
+            const NumberFormatInfo& format = format_info(key);
+            out_cell->set_number_format_string(format.code);
+            if ((format.category & css::util::NumberFormat::LOGICAL) != 0) {
+              out_cell->set_is_boolean(true);
+            } else if ((format.category & css::util::NumberFormat::DATETIME)
+                       != 0) {
+              // DATETIME is DATE|TIME, so the mask catches all three.
+              out_cell->set_is_datetime(true);
+              out_cell->set_datetime_epoch_ms(
+                  null_date_epoch_ms +
+                  static_cast<int64_t>(
+                      std::llround(cell->getValue() * 86400000.0)));
+            }
+            if (type == css::table::CellContentType_FORMULA) {
+              out_cell->set_error_code(cell->getError());
+            }
             out_cell->set_merged_columns(1);
             out_cell->set_merged_rows(1);
             // The merge cursor is built only when the cheap gate says the
@@ -4015,12 +4400,14 @@ bool emit_typed_content(const PartSelection& parts, SelectionProbe* probe,
     if (info.is() && info->supportsService(
                          "com.sun.star.presentation.PresentationDocument")) {
       if (!parts.wants(officev1::DOCUMENT_PART_SLIDES) &&
-          !parts.wants(officev1::DOCUMENT_PART_COMMENTS)) {
+          !parts.wants(officev1::DOCUMENT_PART_COMMENTS) &&
+          !parts.wants(officev1::DOCUMENT_PART_IMAGES)) {
         return true;
       }
       Reference<css::drawing::XDrawPagesSupplier> slides(model, UNO_QUERY);
       if (slides.is()) {
-        return emit_presentation_content(slides, parts, emit_fn, warner);
+        return emit_presentation_content(slides, context, parts, emit_fn,
+                                         warner);
       }
       return true;
     }

@@ -700,6 +700,12 @@ const char kTypedFods[] = R"(<?xml version="1.0" encoding="UTF-8"?>
    <number:number number:decimal-places="2" number:min-integer-digits="1"/>
   </number:currency-style>
   <style:style style:name="ce1" style:family="table-cell" style:data-style-name="N107"/>
+  <number:date-style style:name="N84">
+   <number:year number:style="long"/><number:text>-</number:text><number:month number:style="long"/><number:text>-</number:text><number:day number:style="long"/>
+  </number:date-style>
+  <style:style style:name="ce2" style:family="table-cell" style:data-style-name="N84"/>
+  <number:boolean-style style:name="N99"><number:boolean/></number:boolean-style>
+  <style:style style:name="ce3" style:family="table-cell" style:data-style-name="N99"/>
   <style:style style:name="ta2" style:family="table">
    <style:table-properties table:display="false"/>
   </style:style>
@@ -720,6 +726,11 @@ const char kTypedFods[] = R"(<?xml version="1.0" encoding="UTF-8"?>
     <table:table-cell/>
     <table:table-cell/>
     <table:table-cell table:formula="of:=[.B2]*[.C2]" office:value-type="float" office:value="419.58"><text:p>419.58</text:p></table:table-cell>
+   </table:table-row>
+   <table:table-row>
+    <table:table-cell table:style-name="ce2" office:value-type="date" office:date-value="2023-03-15"><text:p>2023-03-15</text:p></table:table-cell>
+    <table:table-cell table:style-name="ce3" office:value-type="boolean" office:boolean-value="true"><text:p>TRUE</text:p></table:table-cell>
+    <table:table-cell/>
    </table:table-row>
   </table:table>
   <table:table table:name="Hidden" table:style-name="ta2">
@@ -771,15 +782,20 @@ void verify_typed_spreadsheet() {
   require(sheets[1].index() == 1 && sheets[1].name() == "Hidden" &&
               !sheets[1].visible(),
           "hidden sheet detected at index 1");
-  require(sheets[0].used_end_row() == 2 && sheets[0].used_end_column() == 2,
-          "used bounds cover A1:C3");
+  require(sheets[0].used_end_row() == 3 && sheets[0].used_end_column() == 2,
+          "used bounds cover A1:C4");
+  require(sheets[0].column_widths_twips_size() == 3
+              && sheets[0].column_widths_twips(0) > 0,
+          "the sheet reports a width for every used column");
   bool merge_ok = false;
   bool value_ok = false;
   bool currency_ok = false;
   bool formula_ok = false;
   bool covered_cell_absent = true;
+  bool date_ok = false;
+  bool boolean_ok = false;
   for (const officev1::SheetRow& row : rows) {
-    require(row.sheet_index() != 0 || row.row() <= 2,
+    require(row.sheet_index() != 0 || row.row() <= 3,
             "rows stay inside the used bounds");
     for (const officev1::SheetCell& cell : row.cells()) {
       if (row.sheet_index() == 0 && row.row() == 0 && cell.column() == 0) {
@@ -793,6 +809,14 @@ void verify_typed_spreadsheet() {
       if (row.sheet_index() == 0 && row.row() == 1 && cell.column() == 1) {
         value_ok = cell.type() == officev1::SHEET_CELL_TYPE_VALUE &&
                    cell.number() == 42.0;
+      }
+      if (row.sheet_index() == 0 && row.row() == 3 && cell.column() == 0) {
+        // 2023-03-15T00:00:00Z, resolved against the document's null date.
+        date_ok = cell.is_datetime() &&
+                  cell.datetime_epoch_ms() == 1678838400000LL;
+      }
+      if (row.sheet_index() == 0 && row.row() == 3 && cell.column() == 1) {
+        boolean_ok = cell.is_boolean() && cell.number() == 1.0;
       }
       if (row.sheet_index() == 0 && row.row() == 1 && cell.column() == 2) {
         currency_ok = cell.type() == officev1::SHEET_CELL_TYPE_VALUE &&
@@ -810,6 +834,8 @@ void verify_typed_spreadsheet() {
   require(covered_cell_absent, "covered merge cells are absent");
   require(value_ok, "numeric cell keeps its number");
   require(currency_ok, "currency cell carries its number format code");
+  require(date_ok, "a date cell resolves its serial against the null date");
+  require(boolean_ok, "a logical cell is marked boolean, not just numeric");
   require(formula_ok, "formula cell keeps formula and computed number");
   require(comments.size() == 1 && comments[0].sheet_index() == 0 &&
               comments[0].row() == 1 && comments[0].column() == 0 &&
@@ -1009,6 +1035,7 @@ void verify_draw_shapes() {
 // diskless and reviewable.
 const char kTypedFodp[] = R"(<?xml version="1.0" encoding="UTF-8"?>
 <office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
  xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
  xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
  xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
@@ -1046,8 +1073,23 @@ const char kTypedFodp[] = R"(<?xml version="1.0" encoding="UTF-8"?>
      </text:list-item></text:list>
     </draw:text-box>
    </draw:frame>
+   <draw:frame draw:name="Tbl1" svg:x="2cm" svg:y="15cm" svg:width="18cm" svg:height="4cm">
+    <table:table>
+     <table:table-column table:number-columns-repeated="2"/>
+     <table:table-row>
+      <table:table-cell><text:p>Quarter</text:p></table:table-cell>
+      <table:table-cell><text:p>Revenue</text:p></table:table-cell>
+     </table:table-row>
+     <table:table-row>
+      <table:table-cell><text:p>Q1</text:p></table:table-cell>
+      <table:table-cell><text:p>1200</text:p></table:table-cell>
+     </table:table-row>
+    </table:table>
+   </draw:frame>
    <draw:frame draw:name="Pic1" svg:x="24cm" svg:y="4cm" svg:width="1cm" svg:height="1cm">
     <draw:image><office:binary-data>iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==</office:binary-data></draw:image>
+    <svg:title>Slide picture</svg:title>
+    <svg:desc>A one pixel placeholder</svg:desc>
    </draw:frame>
   </draw:page>
   <draw:page draw:name="NotesSlide" draw:master-page-name="Default">
@@ -1081,12 +1123,33 @@ void verify_typed_presentation() {
   require(first.document_info().page_count() == 3, "three slides painted");
   std::vector<officev1::Slide> slides;
   std::vector<officev1::SlideShape> shapes;
+  std::vector<officev1::EmbeddedImage> images;
   officev1::StreamPagesResponse event;
   for (const std::string& payload : payloads) {
     require(event.ParseFromString(payload), "fodp event parses");
     if (event.has_slide()) slides.push_back(event.slide());
     if (event.has_slide_shape()) shapes.push_back(event.slide_shape());
+    if (event.has_embedded_image()) images.push_back(event.embedded_image());
   }
+  // A deck's pictures and tables were invisible before: the picture never
+  // got bytes and the table's content lived behind an interface the text
+  // walk does not reach.
+  require(images.size() == 1 && !images[0].data().empty()
+              && images[0].page_index() == 1,
+          "a slide picture arrives with its bytes on its own slide");
+  require(images[0].description() == "A one pixel placeholder"
+              && images[0].title() == "Slide picture",
+          "a slide picture reports its alt text");
+  bool slide_table_ok = false;
+  for (const officev1::SlideShape& shape : shapes) {
+    if (!shape.has_table()) continue;
+    const officev1::TableData& table = shape.table();
+    if (table.rows() != 2 || table.columns() != 2) continue;
+    for (const officev1::TableCellData& cell : table.cells()) {
+      if (cell.name() == "B2" && cell.text() == "1200") slide_table_ok = true;
+    }
+  }
+  require(slide_table_ok, "a slide table shape carries its cell grid");
   require(slides.size() == 3, "one Slide header per slide");
   for (int i = 0; i < 3; i++) {
     require(slides[i].index() == i, "slide indexes are in slide order");
@@ -2505,6 +2568,124 @@ void verify_unknown_form_value_is_harmless() {
           "unknown form value keeps status ok");
 }
 
+// A document whose reader-visible text comes largely from fields, whose
+// picture carries alt text, and whose table is vertically merged: the three
+// places a text walk used to lose content outright.
+const char kFieldsFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+ xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
+ office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:automatic-styles>
+  <style:style style:name="SUP" style:family="text">
+   <style:text-properties style:text-position="super 58%"/>
+  </style:style>
+  <style:style style:name="DE" style:family="text">
+   <style:text-properties fo:language="de" fo:country="DE"/>
+  </style:style>
+ </office:automatic-styles>
+ <office:body><office:text>
+  <text:p>Page <text:page-number text:select-page="current">1</text:page-number> of the report.</text:p>
+  <text:p>See <text:bookmark-ref text:reference-format="text" text:ref-name="mark1">Target</text:bookmark-ref> below.</text:p>
+  <text:p>E = mc<text:span text:style-name="SUP">2</text:span> und <text:span text:style-name="DE">Wasser</text:span>.</text:p>
+  <text:p><text:bookmark-start text:name="mark1"/>Target section<text:bookmark-end text:name="mark1"/></text:p>
+  <table:table table:name="Merged">
+   <table:table-column table:number-columns-repeated="2"/>
+   <table:table-row>
+    <table:table-cell table:number-rows-spanned="2"><text:p>spanning</text:p></table:table-cell>
+    <table:table-cell><text:p>right one</text:p></table:table-cell>
+   </table:table-row>
+   <table:table-row>
+    <table:covered-table-cell/>
+    <table:table-cell><text:p>right two</text:p></table:table-cell>
+   </table:table-row>
+   <table:table-row>
+    <table:table-cell table:number-columns-spanned="2"><text:p>wide</text:p></table:table-cell>
+    <table:covered-table-cell/>
+   </table:table-row>
+  </table:table>
+  <text:p><draw:frame draw:name="Img2" svg:width="1cm" svg:height="1cm"><draw:image><office:binary-data>iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==</office:binary-data></draw:image><svg:title>Revenue chart</svg:title><svg:desc>Quarterly revenue, rising</svg:desc></draw:frame></text:p>
+ </office:text></office:body>
+</office:document>
+)";
+
+void verify_field_and_structure_content() {
+  std::vector<std::string> payloads;
+  auto outcome = run("pages", "fodt", kFieldsFodt, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "fields fodt renders ok: " + outcome.detail);
+  bool page_field_ok = false;
+  bool reference_field_ok = false;
+  bool superscript_ok = false;
+  bool language_ok = false;
+  bool alt_text_ok = false;
+  bool merge_anchor_ok = false;
+  bool merge_wide_ok = false;
+  bool offsets_monotonic = true;
+  int64_t next_offset = 0;
+  officev1::StreamPagesResponse event;
+  for (const std::string& payload : payloads) {
+    require(event.ParseFromString(payload), "fields event parses");
+    switch (event.event_case()) {
+      case officev1::StreamPagesResponse::kParagraph: {
+        for (const officev1::TextRun& run : event.paragraph().runs()) {
+          if (run.char_offset() >= 0) {
+            // Field runs are part of the annotation text space, so the
+            // offsets stay contiguous across them.
+            offsets_monotonic =
+                offsets_monotonic && run.char_offset() == next_offset;
+            next_offset = run.char_offset() + run.char_length();
+          }
+          if (run.field_code() == "PageNumber") {
+            page_field_ok = !run.text().empty() && run.char_length() > 0;
+          }
+          if (run.field_code() == "GetReference") {
+            reference_field_ok =
+                run.field_target() == "mark1" && !run.text().empty();
+          }
+          if (run.text() == "2" && run.escapement() > 0) superscript_ok = true;
+          if (run.text() == "Wasser" && run.language() == "de-DE") {
+            language_ok = true;
+          }
+        }
+        // Paragraphs are separated by one newline in the same space.
+        if (event.paragraph().char_offset() >= 0) next_offset++;
+        break;
+      }
+      case officev1::StreamPagesResponse::kEmbeddedImage:
+        if (event.embedded_image().name() == "Img2") {
+          alt_text_ok =
+              event.embedded_image().description() == "Quarterly revenue, rising"
+              && event.embedded_image().title() == "Revenue chart";
+        }
+        break;
+      case officev1::StreamPagesResponse::kTable:
+        for (const officev1::TableCellData& cell : event.table().cells()) {
+          if (cell.name() == "A1") merge_anchor_ok = cell.row_span() == 2;
+          if (cell.name() == "A3") merge_wide_ok = cell.column_span() == 2;
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  require(page_field_ok,
+          "a page number field contributes its rendered text as a run");
+  require(reference_field_ok,
+          "a cross-reference field names the anchor it points at");
+  require(offsets_monotonic,
+          "field runs keep the annotation text space contiguous");
+  require(superscript_ok, "a superscript run reports its escapement");
+  require(language_ok, "a run in another language reports its locale");
+  require(alt_text_ok, "an image reports its title and alt text");
+  require(merge_anchor_ok, "a vertical merge anchor reports its row span");
+  require(merge_wide_ok, "a horizontal merge reports its column span");
+}
+
 int main() {
   if (!std::filesystem::exists(lo_install_path())) {
     std::println(stderr, "SKIP: no LibreOffice at {}", lo_install_path());
@@ -2516,6 +2697,7 @@ int main() {
   verify_pdf_mode();
   verify_pdf_chunk_streaming();
   verify_typed_content();
+  verify_field_and_structure_content();
   verify_typed_spreadsheet();
   verify_draw_shapes();
   verify_typed_presentation();

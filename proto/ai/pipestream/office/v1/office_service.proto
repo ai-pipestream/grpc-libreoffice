@@ -649,8 +649,8 @@ message TextRun {
   // Offset of this run's first character in the document's annotation text
   // space, counted in Unicode code points. The annotation text space is the
   // concatenation of every body run's text in emission order with one
-  // newline after each body paragraph. -1 for runs outside the body flow
-  // (headers, footers, footnotes, indexes).
+  // newline after each body paragraph, resolved field runs included. -1 for
+  // runs outside the body flow (headers, footers, footnotes, indexes).
   int64 char_offset = 9;
   // The run's length in Unicode code points.
   int64 char_length = 10;
@@ -664,6 +664,25 @@ message TextRun {
   // The hyperlink's name as authored; empty when unset or when the run is
   // not inside a hyperlink.
   string hyperlink_name = 13;
+  // Character escapement on the office core's percentage scale: positive
+  // raises the run (superscript), negative lowers it (subscript), 0 sits on
+  // the baseline.
+  int32 escapement = 14;
+  // The run's own language as a BCP-47 tag built from the office core's
+  // character locale, for example "de-DE"; empty when the run declares no
+  // locale of its own.
+  string language = 15;
+  // The office field type this run's text was resolved from, as the last
+  // segment of the field's programmatic service name, for example
+  // "PageNumber", "DateTime", "GetReference", or "Database". Empty for
+  // authored text. A run carrying this holds the field's rendered result,
+  // not its command, and it is part of the annotation text space like any
+  // other run.
+  string field_code = 16;
+  // The name a cross-reference or reference-mark field points at (the
+  // bookmark, reference mark, or sequence name); empty for every other
+  // field and for authored text.
+  string field_target = 17;
 }
 
 // Paragraph is one body paragraph of a text document, in reading order, with
@@ -1022,6 +1041,14 @@ message TableCellData {
   // round-trip per cell; empty otherwise or when the layout could not be
   // measured.
   repeated LineBox line_rects = 5;
+  // Row span of a vertical merge anchored at this cell: 1 when the cell is
+  // not merged, greater when the cell anchors a merged block. A text table
+  // leaves the cells a merge covers out of its cell list entirely, so a
+  // covered cell rarely gets an event of its own; 0 marks one that does.
+  int32 row_span = 6;
+  // Column span of the cell, derived from the distance to the next cell
+  // name in the same row: 1 when the cell is not merged horizontally.
+  int32 column_span = 7;
 }
 
 // TableData is one table of a text document, in reading order, with its cell
@@ -1085,6 +1112,11 @@ message EmbeddedImage {
   // a draw-page group of a text document; empty at the top level. The same
   // scheme as Shape.group_path.
   string group_path = 10;
+  // The image's accessibility title from the document; empty when unset.
+  string title = 11;
+  // The image's accessibility description (alt text) from the document;
+  // empty when unset.
+  string description = 12;
 }
 
 // EmbeddedObjectKind classifies an embedded object's inner content.
@@ -1265,6 +1297,9 @@ message Sheet {
   int32 used_end_column = 8;
   // Defined print areas; empty when the whole used area prints.
   repeated SheetRangeRef print_areas = 9;
+  // Column widths in twips for columns 0 through used_end_column, in column
+  // order; empty when the office core did not report them.
+  repeated int32 column_widths_twips = 10;
 }
 
 // SheetCell is one non-empty cell of a used row.
@@ -1290,6 +1325,19 @@ message SheetCell {
   int32 merged_columns = 8;
   // Row span of a merged region anchored at this cell; 1 when not merged.
   int32 merged_rows = 9;
+  // True when the cell's number format is a date, time, or datetime format,
+  // so number is a date serial rather than a plain quantity.
+  bool is_datetime = 10;
+  // The cell's instant as milliseconds since the Unix epoch, UTC, resolved
+  // against the document's own null date; meaningful only when is_datetime.
+  int64 datetime_epoch_ms = 11;
+  // True when the cell's number format is a logical format, so number is 0
+  // or 1 standing for false or true.
+  bool is_boolean = 12;
+  // The office core's error code for a formula cell that evaluates to an
+  // error; 0 when the cell holds a value. display carries the rendered
+  // error literal.
+  int32 error_code = 13;
 }
 
 // SheetRow is one used row of a sheet, streamed the moment it is parsed.
@@ -1470,6 +1518,11 @@ message Shape {
   // children, which have no caret anchor; also set alongside anchor when
   // the model reports it.
   TwipsPoint position = 14;
+  // The shape's accessibility title from the document; empty when unset.
+  string title = 15;
+  // The shape's accessibility description (alt text) from the document;
+  // empty when unset.
+  string description = 16;
 }
 
 // PlaceholderRole is the presentation role of a slide shape, derived from
@@ -1549,6 +1602,16 @@ message SlideShape {
   // painted slide; its geometry is in notes-page space and has no
   // PageImage.
   bool notes = 11;
+  // The shape's cell grid when it is a table shape; unset for every other
+  // shape. Only rows, columns, and cells are meaningful here: a table shape
+  // has no reading-order index, and its geometry is the shape's own
+  // position and size.
+  TableData table = 12;
+  // The shape's accessibility title from the document; empty when unset.
+  string title = 13;
+  // The shape's accessibility description (alt text) from the document;
+  // empty when unset.
+  string description = 14;
 }
 
 // DrawingShape is one shape from a drawing page, in paint order. A group
@@ -1593,6 +1656,11 @@ message DrawingShape {
   // char_offset is -1 because drawing shapes sit outside the body annotation
   // text space.
   repeated TextRun runs = 12;
+  // The shape's accessibility title from the document; empty when unset.
+  string title = 13;
+  // The shape's accessibility description (alt text) from the document;
+  // empty when unset.
+  string description = 14;
 }
 
 // PdfChunk is one chunk of a produced PDF, in order. Concatenating every
