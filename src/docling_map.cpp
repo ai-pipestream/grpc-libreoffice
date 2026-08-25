@@ -211,12 +211,6 @@ google::protobuf::Value num_value(double number) {
   return value;
 }
 
-google::protobuf::Value bool_value(bool flag) {
-  google::protobuf::Value value;
-  value.set_bool_value(flag);
-  return value;
-}
-
 std::string concat_runs(
     const google::protobuf::RepeatedPtrField<officev1::TextRun>& runs) {
   std::string text;
@@ -268,65 +262,16 @@ void set_uniform_formatting(
   formatting->set_script(script);
 }
 
-// Attaches the runs' hyperlinks to the item: the first link lands in the
-// docling hyperlink slot, and every link gets an entry in the "hyperlinks"
-// custom field with its item-local character span, merging the runs a link
-// was split into by other formatting boundaries.
+// Sets the item-level hyperlink from the first link among the runs. Every
+// link, this one included, also reaches the item as an InlineSpan carrying
+// its own range, so nothing here has to record the rest.
 void apply_run_hyperlinks(
     const google::protobuf::RepeatedPtrField<officev1::TextRun>& runs,
     docv1::TextItemBase* base) {
-  google::protobuf::ListValue links;
-  long long local = 0;
-  std::string url;
-  std::string target;
-  std::string name;
-  long long start = 0;
-  auto flush = [&]() {
-    if (url.empty()) return;
-    google::protobuf::Struct* link =
-        links.add_values()->mutable_struct_value();
-    (*link->mutable_fields())["url"] = str_value(url);
-    if (!target.empty()) (*link->mutable_fields())["target"] = str_value(target);
-    if (!name.empty()) (*link->mutable_fields())["name"] = str_value(name);
-    (*link->mutable_fields())["char_start"] =
-        num_value(static_cast<double>(start));
-    (*link->mutable_fields())["char_end"] =
-        num_value(static_cast<double>(local));
-    url.clear();
-    target.clear();
-    name.clear();
-  };
   for (const officev1::TextRun& run : runs) {
-    if (run.hyperlink_url() != url || run.hyperlink_target() != target ||
-        run.hyperlink_name() != name) {
-      flush();
-      url = run.hyperlink_url();
-      target = run.hyperlink_target();
-      name = run.hyperlink_name();
-      start = local;
-    }
-    local += run.char_length();
-  }
-  flush();
-  if (links.values_size() == 0) return;
-  base->set_hyperlink(
-      links.values(0).struct_value().fields().at("url").string_value());
-  google::protobuf::Value value;
-  *value.mutable_list_value() = std::move(links);
-  (*base->mutable_meta()->mutable_custom_fields())["hyperlinks"] =
-      std::move(value);
-}
-
-// Attaches a shape's alt text to a picture. Title and description are two
-// source strings and now have a slot each, so neither has to stand in for
-// the other.
-void set_alt_text(const std::string& title, const std::string& description,
-                  docv1::PictureItem* picture) {
-  if (!description.empty()) {
-    picture->mutable_meta()->mutable_description()->set_text(description);
-  }
-  if (!title.empty()) {
-    picture->mutable_meta()->set_accessibility_title(title);
+    if (run.hyperlink_url().empty()) continue;
+    base->set_hyperlink(run.hyperlink_url());
+    return;
   }
 }
 
@@ -369,16 +314,25 @@ void set_drawing_shape_meta(const officev1::DrawingShape& shape,
   }
 }
 
+// Attaches a shape's alt text to a picture. Title and description are two
+// source strings and now have a slot each, so neither has to stand in for
+// the other.
+void set_alt_text(const std::string& title, const std::string& description,
+                  docv1::PictureItem* picture) {
+  if (!description.empty()) {
+    picture->mutable_meta()->mutable_description()->set_text(description);
+  }
+  if (!title.empty()) {
+    picture->mutable_meta()->set_accessibility_title(title);
+  }
+}
+
 std::string column_name(int column) {
   std::string name;
   for (int c = column; c >= 0; c = c / 26 - 1) {
     name.insert(name.begin(), static_cast<char>('A' + c % 26));
   }
   return name;
-}
-
-std::string a1_name(int row, int column) {
-  return column_name(column) + std::to_string(row + 1);
 }
 
 // "B7" and "B7.1.2" both anchor at row 6, column 1: an office cell name
@@ -404,11 +358,6 @@ bool anchor_of_cell_name(const std::string& name, int* row, int* column) {
   *row = static_cast<int>(row_number - 1);
   *column = static_cast<int>(col - 1);
   return true;
-}
-
-std::string range_a1(const officev1::SheetRangeRef& range) {
-  return a1_name(range.start_row(), range.start_column()) + ":"
-      + a1_name(range.end_row(), range.end_column());
 }
 
 // A wire cell range as a grid span, naming its sheet on both corners so a
@@ -754,6 +703,12 @@ void DoclingMapper::resolve_anchors() {
     docv1::FineRef* link = base->add_comments();
     link->set_ref(pending.ref);
     *link->mutable_range() = anchor.range();
+  }
+  for (const PendingFieldSpan& pending : pending_field_spans_) {
+    if (pending.index >= document_.field_items_size()) continue;
+    docv1::FineRef span;
+    if (!resolve_doc_span(pending.start, pending.end, &span)) continue;
+    *document_.mutable_field_items(pending.index)->mutable_span() = span;
   }
   for (const PendingChange& pending : pending_changes_) {
     if (pending.index >= document_.changes_size()) continue;
@@ -1546,12 +1501,12 @@ void DoclingMapper::on_shape(const officev1::Shape& shape) {
   }
 
   if (shape.is_group()) {
+    // The group's own shape type is always the office core's group shape,
+    // which GROUP_LABEL_PICTURE_AREA already says.
     docv1::GroupItem* group = add_group(parent,
                                         docv1::GROUP_LABEL_PICTURE_AREA,
                                         shape.name(),
                                         docv1::CONTENT_LAYER_BODY);
-    (*group->mutable_meta()->mutable_custom_fields())["shape_type"] =
-        str_value(shape.shape_type());
     std::string child_path = shape.group_path().empty()
         ? std::to_string(shape.z_order())
         : shape.group_path() + "/" + std::to_string(shape.z_order());
@@ -1862,6 +1817,8 @@ void DoclingMapper::on_sheet_named_range(
       pending_range_sheets_.emplace_back(document_.named_ranges_size() - 1,
                                          range.sheet_index());
     }
+  } else if (!range.content().empty()) {
+    out->set_expression(range.content());
   }
 }
 
@@ -1915,10 +1872,7 @@ void DoclingMapper::on_sheet_cell_comment(
   grid->set_col(comment.column());
   const std::string sheet = sheet_label(comment.sheet_index());
   if (!sheet.empty()) grid->set_sheet(sheet);
-  // Whether the office core keeps a note permanently on screen is a display
-  // state with no slot in the document model.
-  (*handle.base->mutable_meta()->mutable_custom_fields())["visible"] =
-      bool_value(comment.visible());
+  identity->set_shown(comment.visible());
   auto table = sheet_table_.find(comment.sheet_index());
   if (table != sheet_table_.end()) {
     document_.mutable_tables(table->second)->add_comments()->set_ref(
@@ -1940,16 +1894,14 @@ void DoclingMapper::on_sheet_chart(const officev1::SheetChart& chart) {
   docv1::PictureItem* picture = add_picture(docv1::DOC_ITEM_LABEL_CHART, layer,
                                             sheet_ref, nullptr);
   if (!chart.name().empty()) picture->mutable_shape()->set_name(chart.name());
-  auto* fields = picture->mutable_meta()->mutable_custom_fields();
-  if (!chart.ranges().empty()) {
-    google::protobuf::Value ranges;
-    for (const officev1::SheetRangeRef& range : chart.ranges()) {
-      *ranges.mutable_list_value()->add_values() = str_value(range_a1(range));
-    }
-    (*fields)["source_ranges"] = ranges;
+  // Where the chart's data came from, as grid spans on the sheet it sits on.
+  docv1::ChartMeta* provenance = picture->mutable_chart();
+  const std::string sheet = sheet_label(chart.sheet_index());
+  for (const officev1::SheetRangeRef& range : chart.ranges()) {
+    set_grid_span(range, sheet, provenance->add_sources());
   }
-  (*fields)["has_column_headers"] = bool_value(chart.has_column_headers());
-  (*fields)["has_row_headers"] = bool_value(chart.has_row_headers());
+  provenance->set_has_column_headers(chart.has_column_headers());
+  provenance->set_has_row_headers(chart.has_row_headers());
   add_prov(picture->mutable_prov(), chart.sheet_index(), true, 0, 0, 0, 0, 0,
            0);
 }
@@ -2146,57 +2098,54 @@ void DoclingMapper::on_form_field(const officev1::FormField& field) {
     link->set_target_cell_id(value_cell_id);
   }
 
-  // What the office core stores about a field beyond its key and value has
-  // no slot in the form subtree: its programmatic name, a dropdown's
-  // entries and which one is selected, the parameters a fieldmark carries,
-  // and the field's own span in the annotation text space.
-  auto* fields = item->mutable_meta()->mutable_custom_fields();
-  if (!field.name().empty()) (*fields)["name"] = str_value(field.name());
-  if (field.control()) (*fields)["control"] = bool_value(true);
+  // The field's own identity: what the form calls it, what a choice field
+  // offers and which entry is chosen, and the parameters a fieldmark
+  // stores. A draw-page form control is told from an in-text fieldmark by
+  // whether the field carries a span.
+  if (!field.name().empty()) item->set_field_name(field.name());
+  for (const std::string& entry : field.list_entries()) {
+    item->add_options(entry);
+  }
   if (field.selected_index() >= 0) {
-    (*fields)["selected_index"] =
-        num_value(static_cast<double>(field.selected_index()));
+    item->set_selected_index(field.selected_index());
   }
-  if (!field.list_entries().empty()) {
-    google::protobuf::Value entries;
-    for (const std::string& entry : field.list_entries()) {
-      *entries.mutable_list_value()->add_values() = str_value(entry);
-    }
-    (*fields)["list_entries"] = entries;
-  }
-  if (field.char_start() >= 0) {
-    (*fields)["char_start"] =
-        num_value(static_cast<double>(field.char_start()));
-    (*fields)["char_end"] = num_value(static_cast<double>(field.char_end()));
-  }
+  auto* parameters = item->mutable_parameters();
   for (const officev1::FormFieldParameter& parameter : field.parameters()) {
-    google::protobuf::Value parameter_value;
     switch (parameter.value_case()) {
       case officev1::FormFieldParameter::kBoolValue:
-        parameter_value = bool_value(parameter.bool_value());
+        (*parameters)[parameter.name()] =
+            parameter.bool_value() ? "true" : "false";
         break;
       case officev1::FormFieldParameter::kIntValue:
-        parameter_value =
-            num_value(static_cast<double>(parameter.int_value()));
+        (*parameters)[parameter.name()] =
+            std::to_string(parameter.int_value());
         break;
       case officev1::FormFieldParameter::kDoubleValue:
-        parameter_value = num_value(parameter.double_value());
+        (*parameters)[parameter.name()] =
+            std::to_string(parameter.double_value());
         break;
       case officev1::FormFieldParameter::kStringValue:
-        parameter_value = str_value(parameter.string_value());
+        (*parameters)[parameter.name()] = parameter.string_value();
         break;
       case officev1::FormFieldParameter::VALUE_NOT_SET:
-        if (!parameter.string_list().empty()) {
-          for (const std::string& entry : parameter.string_list()) {
-            *parameter_value.mutable_list_value()->add_values() =
-                str_value(entry);
-          }
-        } else {
-          parameter_value.set_null_value(google::protobuf::NULL_VALUE);
+        if (parameter.string_list().empty()) {
+          (*parameters)[parameter.name()] = std::string();
+          break;
+        }
+        // A list keeps one entry per key rather than a joined string, so no
+        // separator has to be guessed back out on the way in.
+        for (int entry = 0; entry < parameter.string_list_size(); entry++) {
+          (*parameters)[parameter.name() + "[" + std::to_string(entry) + "]"] =
+              parameter.string_list(entry);
         }
         break;
     }
-    (*fields)["param:" + parameter.name()] = parameter_value;
+  }
+  if (field.char_start() >= 0) {
+    // The span resolves against the body index once the whole body has
+    // streamed past, like every other anchor.
+    pending_field_spans_.push_back(
+        {field_index, field.char_start(), field.char_end()});
   }
 
   if (field.control() && field.width_twips() > 0 && field.has_anchor()) {

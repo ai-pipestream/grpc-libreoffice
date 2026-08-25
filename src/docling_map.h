@@ -115,6 +115,14 @@ class DoclingMapper {
     long long end = 0;
   };
 
+  // A form field and the document-absolute range it covers; the index is
+  // the field's own arena position.
+  struct PendingFieldSpan {
+    int index = 0;
+    long long start = 0;
+    long long end = 0;
+  };
+
   // A tracked change and the document-absolute range it touches; the index
   // is the change's own arena position.
   struct PendingChange {
@@ -300,6 +308,7 @@ class DoclingMapper {
   std::vector<PendingReference> pending_references_;
   std::vector<PendingAnchor> pending_anchors_;
   std::vector<PendingChange> pending_changes_;
+  std::vector<PendingFieldSpan> pending_field_spans_;
   // Per-sheet arena bookkeeping: the sheet's group ref, its folded table's
   // arena index, its lazily created comment-section group ref, and its
   // content layer (hidden sheets map to the invisible layer).

@@ -622,6 +622,7 @@ void verify_calc_stream() {
     comment->set_column(0);
     comment->set_author("Reviewer");
     comment->set_text("check this");
+    comment->set_visible(true);
     mapper.consume(event);
   }
   {
@@ -652,6 +653,7 @@ void verify_calc_stream() {
     officev1::SheetChart* chart = event.mutable_sheet_chart();
     chart->set_sheet_index(0);
     chart->set_name("Chart 1");
+    chart->set_has_column_headers(true);
     officev1::SheetRangeRef* range = chart->add_ranges();
     range->set_end_row(2);
     range->set_end_column(1);
@@ -718,6 +720,18 @@ void verify_calc_stream() {
             "calc: no A1-keyed side map beside the grid");
   }
   require(table.comments_size() == 1, "calc: comment referenced from table");
+  bool note_ok = false;
+  for (const docv1::BaseTextItem& item : document.texts()) {
+    const docv1::TextItemBase& base = base_of(item);
+    if (base.comment_meta().author() != "Reviewer") continue;
+    note_ok = base.comment_meta().shown() && base.prov_size() == 1
+        && base.prov(0).grid().row() == 2
+        && base.prov(0).grid().sheet() == "Data";
+    require(base.meta().custom_fields().empty(),
+            "calc: nothing about a cell note rides a value map");
+  }
+  require(note_ok,
+          "calc: a shown cell note says so and sits in the sheet grid");
   require(document.named_ranges_size() == 2,
           "calc: both range declarations are typed on the document");
   const docv1::NamedRange* named = nullptr;
@@ -740,12 +754,17 @@ void verify_calc_stream() {
           "calc: ranges leave the body custom fields");
   bool chart_ok = false;
   for (const docv1::PictureItem& picture : document.pictures()) {
-    if (picture.label() == docv1::DOC_ITEM_LABEL_CHART) {
-      chart_ok = picture.meta().custom_fields().at("source_ranges")
-              .list_value().values(0).string_value() == "A1:B3";
-    }
+    if (picture.label() != docv1::DOC_ITEM_LABEL_CHART) continue;
+    const docv1::ChartMeta& provenance = picture.chart();
+    chart_ok = provenance.sources_size() == 1
+        && provenance.sources(0).start().row() == 0
+        && provenance.sources(0).end().col() == 1
+        && provenance.sources(0).start().sheet() == "Data"
+        && provenance.has_column_headers();
   }
-  require(chart_ok, "calc: sheet chart with A1 source ranges");
+  require(chart_ok, "calc: a sheet chart names its data as grid spans");
+  require(document.pictures(0).meta().custom_fields().empty(),
+          "calc: the chart's source ranges leave the custom fields");
 }
 
 void verify_impress_stream() {
@@ -1022,8 +1041,9 @@ void verify_marks_stream() {
     field->set_selected_index(1);
     field->add_list_entries("alpha");
     field->add_list_entries("beta");
-    field->set_char_start(17);
-    field->set_char_end(17);
+    // A fieldmark sitting inside the paragraph's own text.
+    field->set_char_start(4);
+    field->set_char_end(12);
     mapper.consume(event);
   }
   mapper.consume(status_event(""));
@@ -1037,17 +1057,19 @@ void verify_marks_stream() {
           "marks: paragraph folded");
   require(paragraph->hyperlink() == "https://example.test/docs",
           "marks: first hyperlink lands in the docling slot");
-  const auto& link_fields = paragraph->meta().custom_fields();
-  require(link_fields.count("hyperlinks") == 1, "marks: hyperlinks recorded");
-  const auto& links = link_fields.at("hyperlinks").list_value();
-  require(links.values_size() == 1,
-          "marks: adjacent runs of one link merge into one entry");
-  const auto& link = links.values(0).struct_value().fields();
-  require(link.at("url").string_value() == "https://example.test/docs" &&
-              link.at("target").string_value() == "_blank" &&
-              link.at("char_start").number_value() == 4 &&
-              link.at("char_end").number_value() == 16,
-          "marks: the merged link spans both runs");
+  // Every link, not just the first, is an inline span with its own range.
+  // The link here is split by a bold boundary, so it tiles two spans.
+  std::vector<std::pair<int, int>> link_spans;
+  for (const docv1::InlineSpan& span : paragraph->spans()) {
+    if (span.hyperlink() != "https://example.test/docs") continue;
+    link_spans.emplace_back(span.range().start(), span.range().end());
+  }
+  require(link_spans.size() == 2 && link_spans[0].first == 4
+              && link_spans[0].second == 12 && link_spans[1].first == 12
+              && link_spans[1].second == 16,
+          "marks: a split link tiles the whole linked range in spans");
+  require(paragraph->meta().custom_fields().empty(),
+          "marks: links no longer need a value map");
 
   const docv1::GroupItem* comments = nullptr;
   for (const docv1::GroupItem& group : document.groups()) {
@@ -1109,11 +1131,25 @@ void verify_marks_stream() {
           "marks: a checked checkbox gets the selected label");
   require(checkbox->parent().ref() == "#/field_items/0",
           "marks: the value item hangs from its field item");
-  const auto& checkbox_fields =
-      document.field_items(0).meta().custom_fields();
-  require(checkbox_fields.at("name").string_value() == "check1" &&
-              checkbox_fields.at("param:Checkbox_Checked").bool_value(),
-          "marks: the attributes with no slot stay on the field item");
+  const docv1::FieldItem& checkbox_field = document.field_items(0);
+  require(checkbox_field.field_name() == "check1"
+              && checkbox_field.parameters().at("Checkbox_Checked") == "true",
+          "marks: a field names itself and keeps its stored parameters");
+  require(checkbox_field.meta().custom_fields().empty(),
+          "marks: nothing about a form field rides a value map");
+  const docv1::FieldItem& dropdown_field = document.field_items(1);
+  require(dropdown_field.options_size() == 2
+              && dropdown_field.options(1) == "beta"
+              && dropdown_field.has_selected_index()
+              && dropdown_field.selected_index() == 1,
+          "marks: a choice field keeps its entries and which one is chosen");
+  require(dropdown_field.has_span()
+              && dropdown_field.span().ref() == paragraph->self_ref()
+              && dropdown_field.span().range().start() == 4
+              && dropdown_field.span().range().end() == 12,
+          "marks: an in-text field resolves its span into the item space");
+  require(!checkbox_field.has_span(),
+          "marks: a field outside any emitted item keeps no span");
   bool dropdown_ok = false;
   for (const docv1::BaseTextItem& item : document.texts()) {
     if (item.item_case() != docv1::BaseTextItem::kFieldValue) continue;
@@ -1703,6 +1739,15 @@ void verify_typed_declarations() {
     mapper.consume(event);
   }
   {
+    // A name defined as a formula resolves to no rectangle at all.
+    officev1::StreamPagesResponse event;
+    officev1::SheetNamedRange* range = event.mutable_sheet_named_range();
+    range->set_name("Total");
+    range->set_content("=SUM($Data.$A$1:$A$9)");
+    range->set_sheet_index(-1);
+    mapper.consume(event);
+  }
+  {
     officev1::StreamPagesResponse event;
     officev1::EmbeddedObject* object = event.mutable_embedded_object();
     object->set_kind(officev1::EMBEDDED_OBJECT_KIND_OLE_OTHER);
@@ -1748,6 +1793,11 @@ void verify_typed_declarations() {
           "declarations: an embedded object is a registered attachment");
   require(document.pictures(0).meta().custom_fields().count("clsid") == 0,
           "declarations: the class id leaves the picture custom fields");
+  require(document.named_ranges_size() == 1
+              && !document.named_ranges(0).has_range()
+              && document.named_ranges(0).expression()
+                  == "=SUM($Data.$A$1:$A$9)",
+          "declarations: a formula-defined name keeps its expression");
 }
 
 // Character styling the office model exposes per run: the named character

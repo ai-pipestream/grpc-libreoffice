@@ -8,9 +8,9 @@ survives the fold, what only survives untyped, and what is not captured yet.
 It is a companion to the capture audit; the sections below follow the order
 the audit ranked the gaps in.
 
-The schema now has a typed field for almost everything this collector
-extracts. Where a value still rides `custom_fields`, that is recorded below
-as a gap in the schema, not as a choice.
+Every fact this collector extracts now has a typed field to land in. No
+value rides `custom_fields` any more; the one thing still unset is a limit
+of the office wire, recorded below.
 
 ## Captured in typed fields
 
@@ -18,6 +18,7 @@ as a gap in the schema, not as a choice.
 |---|---|
 | Resolved text of a field (page number, date, cross-reference, caption number, index or mail-merge result) | inline in `TextItemBase.text`, with an `InlineSpan.field_code` over its range |
 | A cross-reference's destination | `InlineSpan.target`, a `FineRef` into the item the named anchor sits in |
+| Every hyperlink, not just the first | one `InlineSpan.hyperlink` per run over its own range; `TextItemBase.hyperlink` still names the first |
 | Per-run character formatting | `TextItemBase.spans` / `TableCell.spans`: `formatting` (bold, italic, underline, strikethrough, monospace, small caps, overline, script), `font_family`, `font_size_pt`, `color`, `language`, `style_name`, `highlight_color` |
 | Uniform character formatting | `TextItemBase.formatting`, unchanged, now including `script` |
 | Paragraph style name | `TextItemBase.style_name`, verbatim |
@@ -71,6 +72,10 @@ now, and the map copies are gone.
 | Embedded object identity | `Document.attachments` (`SubDocumentRef`): id, name, media type, `class_id`, `kind`, and the item the payload became |
 | A picture's accessibility title | `PictureMeta.accessibility_title`, beside `description` |
 | Character style, highlight, overline | `InlineSpan.style_name`, `.highlight_color`, `Formatting.overline` |
+| Form field identity | `FieldItem.field_name`, `.options`, `.selected_index` (presence-tracked), `.span` (a `FineRef` into the item space), `.parameters` |
+| A permanently shown spreadsheet note | `CommentMeta.shown` |
+| A chart's data sources | `PictureItem.chart` (`ChartMeta`): source `GridSpan`s and the two header flags |
+| A name defined as a formula | `NamedRange.expression`, with `range` unset |
 | Form fields | the schema's own form subtree, below |
 
 ### The form subtree
@@ -96,24 +101,29 @@ resolves every one of those references like any other.
 
 ## Still without a typed home
 
-Four things have no slot anywhere in the schema and stay on
-`custom_fields`, which is now the exception rather than the rule:
+Nothing, with one exception that is a limit of the office wire rather than
+of the schema:
 
-- **A form field's programmatic name, a dropdown's entries and selected
-  index, and the parameters a fieldmark stores.** They sit on the
-  `FieldItem`. The label and the value are typed; these are not.
-- **A form field's span in the annotation text space.** Every other anchor
-  resolves to a `FineRef`; a field has no slot to hold one.
-- **Whether a spreadsheet note is permanently shown.** A display state, on
-  the note item.
-- **A sheet chart's source ranges and header flags.** The same chart also
-  arrives through the embedded-object path with its data, and nothing links
-  the two; the audit's `ChartSourceAnnotation` is the shape that would fix
-  both at once.
-- **Which page style a furniture item belongs to.** `PageItem.style_name`
-  exists, but the office wire says which style a *header block* belongs to,
-  not which style each page uses, so the fold has nothing to resolve it
-  with and leaves it unset.
+- **Which page style applies where.** `PageItem.style_name` exists, but the
+  office wire reports the page style a *header or footer block* belongs to,
+  not the style in force on each page, so the fold has nothing to resolve it
+  with and leaves it unset; the block's own style name stays on that item's
+  `custom_fields` because there is no page to attach it to. Closing this
+  means extracting a per-page style name, not a schema change.
+
+Three shapes are worth naming because they are not losses but choices:
+
+- A `FieldItem.parameters` value is a string. Fieldmark parameters are an
+  open per-field vocabulary and the schema types the map that way; the wire
+  carries them typed, and a stored list keeps one entry per key
+  (`Entries[0]`, `Entries[1]`) rather than a joined string, so nothing has
+  to be split back apart.
+- A draw-page form control and an in-text fieldmark are told apart by
+  whether the field carries a `span`: a fieldmark anchors in the annotation
+  text space, a control has only its box. The office wire's own boolean for
+  the distinction is not kept separately.
+- A shape group's own shape type is not recorded. It is always the office
+  core's group shape, which `GROUP_LABEL_PICTURE_AREA` already says.
 
 ## Dates and times
 
@@ -147,9 +157,6 @@ Extraction side:
 - **Calc cell styling**, hidden rows and columns, row heights, frozen panes,
   conditional formatting, data validation, sheet protection.
 - **Cell hyperlinks**, image hyperlinks, and image maps.
-- **A named range holding an expression rather than a range.** `NamedRange`
-  has a `GridSpan` and no expression slot, so a name defined as a formula
-  keeps its name and loses its definition.
 - **What a cross-reference points at.** `InlineSpan.reference_kind` exists,
   but a text document's cross-reference names a bookmark, a reference mark,
   or a sequence, and none of those maps onto citation, footnote, claim, or
@@ -165,7 +172,8 @@ Fold side:
 - **Chart series beyond the first** for bar, column, and pie charts. The
   tabular projection keeps them all; the typed annotation keeps one.
 - **A spreadsheet chart still mints two pictures**, one carrying the source
-  ranges and one carrying the data, and nothing links them.
+  ranges in `ChartMeta` and one carrying the typed chart data, and nothing
+  links them.
 - **List markers and nesting depth.** `ListItem.marker`, `.enumerated`, and
   the nesting level are unset, so nested lists flatten.
 - **Printed page numbering restarts.** `Paragraph.page_number_offset` is on
