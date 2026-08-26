@@ -51,9 +51,9 @@ at STANDARD plus COMMENTS):
   The client streams the document as chunks, marking the last one `complete`.
   The server responds with `DocumentInfo` (resolved format, page count,
   document class), then one `PageImage` per page in page order (PNG, with
-  pixel dimensions and effective DPI), then typed content events, then one
-  final `RenderStatus`. Spreadsheets emit one image per sheet, presentations
-  one per slide.
+  pixel dimensions, effective DPI, and the name of the page style in force
+  on that page), then typed content events, then one final `RenderStatus`.
+  Spreadsheets emit one image per sheet, presentations one per slide.
 
   Typed content comes from the same loaded document the pages were painted
   from, in one pass with no second conversion: `DocumentMetadata` (title,

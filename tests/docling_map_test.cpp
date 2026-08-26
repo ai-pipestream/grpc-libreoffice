@@ -1627,6 +1627,94 @@ void verify_page_units_and_format() {
           "pages: the page image reports the encoding it carries");
 }
 
+// The page style each page carries lands on that page and resolves into
+// the style catalogue, which streams in after the page images do.
+void verify_per_page_style() {
+  auto page_event = [](int index, const std::string& style) {
+    officev1::StreamPagesResponse event;
+    officev1::PageImage* image = event.mutable_page_image();
+    image->set_index(index);
+    image->set_width_px(816);
+    image->set_height_px(1056);
+    image->set_dpi(96);
+    image->set_png("pngbytes");
+    image->set_format(officev1::PAGE_IMAGE_FORMAT_PNG);
+    image->set_page_style(style);
+    return event;
+  };
+  auto style_event = [](const std::string& name) {
+    officev1::StreamPagesResponse event;
+    officev1::PageStyleInfo* style = event.mutable_page_style();
+    style->set_name(name);
+    style->set_width_twips(11906);
+    style->set_height_twips(16838);
+    style->set_columns(1);
+    return event;
+  };
+
+  {
+    // Two pages, two styles, both declared: each page names its own.
+    grlibre::DoclingMapper mapper;
+    mapper.consume(info_event("text", 3, 15840));
+    mapper.consume(page_event(0, "First Page"));
+    mapper.consume(page_event(1, "Standard"));
+    // A page the office core named nothing for stays unnamed rather than
+    // inheriting its neighbour.
+    mapper.consume(page_event(2, ""));
+    mapper.consume(style_event("First Page"));
+    mapper.consume(style_event("Standard"));
+    mapper.consume(status_event(""));
+    require_integrity(mapper, "page styles");
+    const docv1::Document& document = mapper.document();
+    require(document.pages().at(1).style_name() == "First Page",
+            "page styles: the first page names the style in force on it");
+    require(document.pages().at(2).style_name() == "Standard",
+            "page styles: the style change lands on the page it starts");
+    require(!document.pages().at(3).has_style_name(),
+            "page styles: an unnamed page stays unnamed");
+    for (int page = 1; page <= 2; page++) {
+      bool declared = false;
+      for (const docv1::PageStyle& style : document.page_styles()) {
+        if (style.name() == document.pages().at(page).style_name()) {
+          declared = true;
+        }
+      }
+      require(declared, "page styles: page " + std::to_string(page)
+                            + " resolves into the catalogue");
+    }
+    require(mapper.warnings().empty(),
+            "page styles: a resolved catalogue warns about nothing");
+  }
+  {
+    // A name the catalogue does not declare is kept, because it is still
+    // what the layout reported, and the divergence is named in a warning.
+    grlibre::DoclingMapper mapper;
+    mapper.consume(info_event("text", 1, 15840));
+    mapper.consume(page_event(0, "Envelope"));
+    mapper.consume(style_event("Standard"));
+    mapper.consume(status_event(""));
+    const docv1::Document& document = mapper.document();
+    require(document.pages().at(1).style_name() == "Envelope",
+            "page styles: an undeclared name is kept, not dropped");
+    require(mapper.warnings().size() == 1
+                && mapper.warnings()[0].contains("Envelope")
+                && mapper.warnings()[0].contains("does not declare"),
+            "page styles: an undeclared name is reported once");
+  }
+  {
+    // Without the catalogue there is nothing to resolve against, so the
+    // name rides through unchecked and unremarked.
+    grlibre::DoclingMapper mapper;
+    mapper.consume(info_event("text", 1, 15840));
+    mapper.consume(page_event(0, "Envelope"));
+    mapper.consume(status_event(""));
+    require(mapper.document().pages().at(1).style_name() == "Envelope",
+            "page styles: no catalogue still keeps the name");
+    require(mapper.warnings().empty(),
+            "page styles: no catalogue means no divergence to report");
+  }
+}
+
 // The document's own properties reach the schema's metadata slot.
 void verify_document_meta() {
   grlibre::DoclingMapper mapper;
@@ -1845,6 +1933,7 @@ int main() {
   verify_typed_cells();
   verify_slide_content();
   verify_page_units_and_format();
+  verify_per_page_style();
   verify_document_meta();
   verify_typed_declarations();
   verify_run_styling();

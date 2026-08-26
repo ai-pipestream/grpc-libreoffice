@@ -9,8 +9,7 @@ It is a companion to the capture audit; the sections below follow the order
 the audit ranked the gaps in.
 
 Every fact this collector extracts now has a typed field to land in. No
-value rides `custom_fields` any more; the one thing still unset is a limit
-of the office wire, recorded below.
+value rides `custom_fields` any more.
 
 ## Captured in typed fields
 
@@ -35,6 +34,7 @@ of the office wire, recorded below.
 | Image alt text | `PictureMeta.description.text` |
 | Document properties | `Document.source_meta`: title, author, created and modified instants, language, generator, keywords (also `BaseMeta.keywords`) |
 | Coordinate unit | `PageItem.unit` = `"twip"` on every page |
+| The page style in force on a page | `PageItem.style_name`, resolving into `Document.page_styles` |
 
 ## The document-absolute character space
 
@@ -99,19 +99,42 @@ is a `GRAPH_CELL_LABEL_CHECKBOX`, and its item carries
 `DOC_ITEM_LABEL_CHECKBOX_SELECTED` or `_UNSELECTED`. The integrity walk
 resolves every one of those references like any other.
 
+## Which page style applies where
+
+Every page names its own style. The wire carries it on `PageImage.page_style`
+and the fold puts it on `PageItem.style_name`, where it resolves by name into
+the `PageStyle` declarations `Document.page_styles` already collected.
+
+The name is read off the laid-out document, not inferred from the style
+declarations: extraction walks the view cursor's page cursor one page at a
+time and reads the cursor's own `PageStyleName`, which is the style the
+layout put on the page the cursor is standing on. A document that switches
+styles mid-flow therefore reports the switch on the page it happens, and a
+style carrying many pages names all of them. Spreadsheets answer per sheet
+(the sheet's `PageStyle` property) and presentations and drawings per page
+(the page's master), both indexed by part; a presentation's notes pages have
+no style of their own and carry none. Only text documents emit the
+`PageStyleInfo` catalogue, so on the other classes the name arrives with
+nothing declared to resolve it against.
+
+Because the name rides the page image, it is present exactly when page
+images are: a request that deselects the pages part gets `PageItem`s with
+sizes and no style name.
+
+The style catalogue arrives after the page images do, so the fold checks the
+names against it when the stream closes. A name that matches no declaration
+is kept, because it is still what the layout reported, and named in a
+warning rather than silently dropped.
+
+A header or footer block still reports the page style it belongs to, which
+is a different fact: it says which pages the block repeats on, not which
+style a page uses. That name stays on the block item's `custom_fields`,
+where it was.
+
 ## Still without a typed home
 
-Nothing, with one exception that is a limit of the office wire rather than
-of the schema:
-
-- **Which page style applies where.** `PageItem.style_name` exists, but the
-  office wire reports the page style a *header or footer block* belongs to,
-  not the style in force on each page, so the fold has nothing to resolve it
-  with and leaves it unset; the block's own style name stays on that item's
-  `custom_fields` because there is no page to attach it to. Closing this
-  means extracting a per-page style name, not a schema change.
-
-Three shapes are worth naming because they are not losses but choices:
+Nothing. Three shapes are worth naming because they are not losses but
+choices:
 
 - A `FieldItem.parameters` value is a string. Fieldmark parameters are an
   open per-field vocabulary and the schema types the map that way; the wire

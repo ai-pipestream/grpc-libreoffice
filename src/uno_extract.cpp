@@ -5161,4 +5161,107 @@ void describe_parts(std::vector<PartLayout>* parts,
   }
 }
 
+void describe_page_styles(std::vector<std::string>* styles,
+                          std::vector<std::string>* warnings) {
+  if (styles == nullptr) return;
+  styles->clear();
+  Warner warner(warnings);
+  try {
+    Reference<css::uno::XComponentContext> context = process_context();
+    if (!context.is()) return;
+    Reference<css::frame::XModel> model = find_loaded_model(context);
+    if (!model.is()) return;
+
+    Reference<css::sheet::XSpreadsheetDocument> calc(model, UNO_QUERY);
+    if (calc.is()) {
+      // A sheet's page style is a sheet property, so no cursor walk is
+      // needed; the part ordinal is the page ordinal.
+      Reference<css::container::XIndexAccess> sheets(calc->getSheets(),
+                                                     UNO_QUERY);
+      if (!sheets.is()) return;
+      for (sal_Int32 i = 0; i < sheets->getCount(); i++) {
+        std::string name;
+        try {
+          Reference<css::beans::XPropertySet> props(sheets->getByIndex(i),
+                                                    UNO_QUERY);
+          rtl::OUString style;
+          if (props.is()) props->getPropertyValue("PageStyle") >>= style;
+          name = utf8(style);
+        } catch (const css::uno::Exception& error) {
+          warner.warn("page style of sheet " + std::to_string(i), error);
+        }
+        styles->push_back(name);
+      }
+      return;
+    }
+
+    Reference<css::text::XTextViewCursorSupplier> supplier(
+        model->getCurrentController(), UNO_QUERY);
+    Reference<css::text::XTextDocument> writer(model, UNO_QUERY);
+    if (writer.is() && supplier.is()) {
+      // The view cursor is the only thing that knows which style the layout
+      // put on a page: a page style is a property of the laid-out page, not
+      // of the style declaration, and the same declaration can carry any
+      // number of pages. Walking the page cursor page by page and reading
+      // the cursor's own PageStyleName reports each page's style directly.
+      Reference<css::text::XTextViewCursor> cursor = supplier->getViewCursor();
+      Reference<css::text::XPageCursor> pages(cursor, UNO_QUERY);
+      Reference<css::beans::XPropertySet> props(cursor, UNO_QUERY);
+      if (!pages.is() || !props.is()) return;
+      // The cursor is shared with the caret and line measurements that run
+      // later, so the walk restores where it started.
+      Reference<css::text::XTextRange> resume = cursor->getStart();
+      int count = 0;
+      try {
+        if (pages->jumpToLastPage()) count = pages->getPage();
+      } catch (const css::uno::Exception& error) {
+        warner.warn("page count of the laid-out document", error);
+      }
+      for (int page = 1; page <= count; page++) {
+        std::string name;
+        try {
+          if (pages->jumpToPage(static_cast<sal_Int16>(page))) {
+            rtl::OUString style;
+            props->getPropertyValue("PageStyleName") >>= style;
+            name = utf8(style);
+          }
+        } catch (const css::uno::Exception& error) {
+          warner.warn("page style of page " + std::to_string(page), error);
+        }
+        styles->push_back(name);
+      }
+      if (resume.is()) {
+        try {
+          cursor->gotoRange(resume, false);
+        } catch (const css::uno::Exception& error) {
+          warner.warn("view cursor restore after the page style walk", error);
+        }
+      }
+      return;
+    }
+
+    Reference<css::drawing::XDrawPagesSupplier> draw(model, UNO_QUERY);
+    if (!draw.is()) return;
+    Reference<css::drawing::XDrawPages> list = draw->getDrawPages();
+    if (!list.is()) return;
+    for (sal_Int32 i = 0; i < list->getCount(); i++) {
+      std::string name;
+      try {
+        Reference<css::drawing::XMasterPageTarget> target(list->getByIndex(i),
+                                                          UNO_QUERY);
+        Reference<css::container::XNamed> master(
+            target.is() ? target->getMasterPage()
+                        : Reference<css::drawing::XDrawPage>(),
+            UNO_QUERY);
+        if (master.is()) name = utf8(master->getName());
+      } catch (const css::uno::Exception& error) {
+        warner.warn("master of page " + std::to_string(i), error);
+      }
+      styles->push_back(name);
+    }
+  } catch (const css::uno::Exception& error) {
+    warner.warn("describe page styles", error);
+  }
+}
+
 }  // namespace grlibre

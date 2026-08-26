@@ -186,8 +186,9 @@ std::string export_page_svg(lok::Document* document, const PageRect& page,
 // single encoder keeps emission in page order. Adds the emitted PNG bytes to
 // *output_bytes; on failure sets *error and returns false.
 bool paint_pages(lok::Document* document, const RenderOptions& options,
-                 const std::vector<PageRect>& pages, bool bgra, int out_fd,
-                 long* output_bytes, std::string* error,
+                 const std::vector<PageRect>& pages,
+                 const std::vector<std::string>& page_styles, bool bgra,
+                 int out_fd, long* output_bytes, std::string* error,
                  const std::vector<RedactBox>& redact,
                  std::vector<std::string>* warnings) {
   struct RawPage {
@@ -195,6 +196,7 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
     int width_px;
     int height_px;
     int dpi;
+    std::string style;
     std::vector<unsigned char> pixels;
   };
   std::mutex queue_mutex;
@@ -232,6 +234,7 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
       image->set_height_px(raw.height_px);
       image->set_dpi(raw.dpi);
       image->set_png(std::move(encoded));
+      if (!raw.style.empty()) image->set_page_style(raw.style);
       switch (options.image_format) {
         case ImageFormat::kPng:
           image->set_format(officev1::PAGE_IMAGE_FORMAT_PNG);
@@ -249,6 +252,12 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
       }
     }
   });
+
+  // page_styles runs parallel to pages when the office core named one for
+  // every page, and is empty when it named none at all.
+  auto style_of = [&](size_t index) -> std::string {
+    return index < page_styles.size() ? page_styles[index] : std::string();
+  };
 
   bool svg_fallback_warned = false;
   for (size_t index = 0; encoder_ok && index < pages.size(); index++) {
@@ -304,6 +313,9 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
       image->set_dpi(0);
       image->set_png(std::move(svg));
       image->set_format(officev1::PAGE_IMAGE_FORMAT_SVG);
+      if (std::string style = style_of(index); !style.empty()) {
+        image->set_page_style(std::move(style));
+      }
       if (!emit(out_fd, page_event)) {
         encoder_ok = false;
         break;
@@ -327,6 +339,7 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
                 .width_px = width_px,
                 .height_px = height_px,
                 .dpi = effective_dpi,
+                .style = style_of(index),
                 .pixels = {}};
     raw.pixels.resize(static_cast<size_t>(width_px) * height_px * 4);
     document->paintTile(raw.pixels.data(), width_px, height_px,
@@ -518,6 +531,29 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     return kExitRenderFailure;
   }
 
+  // Which page style each page carries, read off the laid-out document the
+  // pages above were measured in. A text document names one per page (the
+  // page cursor's own reading, so a style change mid-document shows up); the
+  // other classes name one per part, so the page ordinal is not the index.
+  // A presentation's notes pages are appended after the slides and carry no
+  // style of their own, which leaves their entry empty.
+  std::vector<std::string> style_by_part;
+  if (options.mode == "pages"
+      && options.parts.wants(officev1::DOCUMENT_PART_PAGES)) {
+    describe_page_styles(&style_by_part, &option_warnings);
+  }
+  std::vector<std::string> page_styles;
+  if (!style_by_part.empty()) {
+    for (const PageRect& page : pages) {
+      const size_t slot = type == LOK_DOCTYPE_TEXT
+          ? page_styles.size()
+          : static_cast<size_t>(std::max(0, page.part));
+      page_styles.push_back(!page.notes && slot < style_by_part.size()
+                                ? style_by_part[slot]
+                                : std::string());
+    }
+  }
+
   bool bgra = document->getTileMode() == LOK_TILEMODE_BGRA;
   officev1::DocumentInfo info;
   info.set_source_format(options.extension);
@@ -589,8 +625,8 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     // must stay correct either way.
     std::vector<std::string> typed_warnings = option_warnings;
     if (ok && options.parts.wants(officev1::DOCUMENT_PART_PAGES)) {
-      if (!paint_pages(document, options, pages, bgra, out_fd, &output_bytes,
-                       error, redact, &typed_warnings)) {
+      if (!paint_pages(document, options, pages, page_styles, bgra, out_fd,
+                       &output_bytes, error, redact, &typed_warnings)) {
         delete document;
         return kExitRenderFailure;
       }

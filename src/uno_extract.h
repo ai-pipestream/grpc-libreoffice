@@ -187,6 +187,19 @@ struct PartLayout {
 void describe_parts(std::vector<PartLayout>* parts,
                     std::vector<std::string>* warnings);
 
+// Names the page style in force on each page of the loaded document, in
+// page order, reading the laid-out document the page images are painted
+// from. A text document is walked with the view cursor's page cursor, one
+// jump per page, reading the cursor's own PageStyleName: that is the style
+// the layout put on that page, not the style a header block belongs to. A
+// spreadsheet names each sheet's page style and a presentation or drawing
+// each page's master, both indexed by part ordinal, so the caller indexes
+// those by part rather than by emitted page. Entries are empty where the
+// office core names nothing. Problems append to warnings and leave the
+// remaining pages unnamed rather than failing the render.
+void describe_page_styles(std::vector<std::string>* styles,
+                          std::vector<std::string>* warnings);
+
 // Exports one page of the loaded document as SVG through the UNO graphic
 // export filter. page_number is 1-based. Returns empty on failure, silently:
 // document classes without an SVG store filter fail on every page, and the

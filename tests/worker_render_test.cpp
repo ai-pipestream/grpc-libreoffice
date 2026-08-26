@@ -115,6 +115,7 @@ struct PagesRun {
   officev1::DocumentInfo info;
   std::vector<officev1::PageImage> pages;
   std::vector<officev1::Paragraph> paragraphs;
+  std::vector<officev1::PageStyleInfo> page_styles;
   officev1::RenderStatus status;
   bool got_status = false;
 };
@@ -127,6 +128,7 @@ PagesRun fold_pages(const std::vector<std::string>& payloads) {
     if (event.has_document_info()) run.info = event.document_info();
     if (event.has_page_image()) run.pages.push_back(event.page_image());
     if (event.has_paragraph()) run.paragraphs.push_back(event.paragraph());
+    if (event.has_page_style()) run.page_styles.push_back(event.page_style());
     if (event.has_status()) {
       run.status = event.status();
       run.got_status = true;
@@ -303,6 +305,42 @@ constexpr char kTrackedChangeFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
     </text:changed-region>
    </text:tracked-changes>
    <text:p>Alpha <text:change-start text:change-id="ct1"/>INSERTED <text:change-end text:change-id="ct1"/>omega.</text:p>
+  </office:text>
+ </office:body>
+</office:document>
+)";
+
+// Two pages under two different page styles: the first paragraph opens
+// "First Page", the second forces a page break onto "Standard". The two
+// styles share one page layout, so nothing but the style name tells the
+// pages apart.
+constexpr char kTwoPageStyleFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
+ office:version="1.2"
+ office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:automatic-styles>
+  <style:page-layout style:name="pm1">
+   <style:page-layout-properties fo:page-width="21cm" fo:page-height="29.7cm"
+    fo:margin-left="2cm" fo:margin-right="2cm" fo:margin-top="2cm"
+    fo:margin-bottom="2cm"/>
+  </style:page-layout>
+  <style:style style:name="P1" style:family="paragraph"
+   style:master-page-name="First_20_Page"/>
+  <style:style style:name="P2" style:family="paragraph"
+   style:master-page-name="Standard"/>
+ </office:automatic-styles>
+ <office:master-styles>
+  <style:master-page style:name="First_20_Page" style:display-name="First Page"
+   style:page-layout-name="pm1" style:next-style-name="Standard"/>
+  <style:master-page style:name="Standard" style:page-layout-name="pm1"/>
+ </office:master-styles>
+ <office:body>
+  <office:text>
+   <text:p text:style-name="P1">Front matter on the first page style.</text:p>
+   <text:p text:style-name="P2">Body matter on the default page style.</text:p>
   </office:text>
  </office:body>
 </office:document>
@@ -2564,6 +2602,88 @@ void verify_tracked_change_display() {
   }
 }
 
+// Each page names the page style the layout put on it, not the style a
+// header block belongs to: a two-style document reports two different names
+// on its two pages, both of them declared in the page style catalogue, and
+// the fold lands them on the pages.
+void verify_per_page_style() {
+  std::vector<std::string> payloads;
+  auto outcome = run("pages", "fodt", kTwoPageStyleFodt, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "two-style document renders ok: " + outcome.detail);
+  PagesRun pages_run = fold_pages(payloads);
+  require(pages_run.pages.size() == 2, "the style change opened a second page");
+  require(pages_run.pages[0].page_style() == "First Page",
+          "the first page is on the first-page style, not "
+          + pages_run.pages[0].page_style());
+  require(pages_run.pages[0].page_style() != pages_run.pages[1].page_style(),
+          "the two pages name different page styles");
+  require(pages_run.pages[1].page_style() == "Standard",
+          "the page after the break is on the default page style, not "
+          + pages_run.pages[1].page_style());
+  // Every name a page carries has to be one of the declarations, or nothing
+  // downstream can resolve it into a geometry.
+  for (const officev1::PageImage& page : pages_run.pages) {
+    bool declared = false;
+    for (const officev1::PageStyleInfo& style : pages_run.page_styles) {
+      if (style.name() == page.page_style()) declared = true;
+    }
+    require(declared, "page " + std::to_string(page.index() + 1)
+                          + " names a declared page style");
+  }
+
+  grlibre::DoclingMapper mapper;
+  for (const std::string& payload : payloads) {
+    officev1::StreamPagesResponse event;
+    require(event.ParseFromString(payload), "page style event parses");
+    mapper.consume(event);
+  }
+  require(mapper.finished(), "mapper consumed the terminal status");
+  const auto& document = mapper.document();
+  require(document.pages().contains(1) && document.pages().contains(2),
+          "both pages folded");
+  require(document.pages().at(1).style_name() == pages_run.pages[0].page_style(),
+          "the first page keeps its style name through the fold");
+  require(document.pages().at(2).style_name() == "Standard",
+          "the second page keeps its style name through the fold");
+  for (const std::string& warning : mapper.warnings()) {
+    require(!warning.contains("style catalogue does not declare"),
+            "every folded page style resolves into the catalogue: " + warning);
+  }
+
+  // The other document classes answer per part, not per page: a sheet names
+  // its own page style, a slide names its master, and a notes page has
+  // neither.
+  {
+    std::vector<std::string> sheets;
+    auto sheet_outcome = run("pages", "fods", kTwoSheetFods, &sheets);
+    require(sheet_outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "sheets render ok: " + sheet_outcome.detail);
+    PagesRun sheet_run = fold_pages(sheets);
+    require(sheet_run.pages.size() == 2, "one page image per sheet");
+    for (const officev1::PageImage& page : sheet_run.pages) {
+      require(page.page_style() == "Default",
+              "a sheet names its own page style, not "
+              + page.page_style());
+    }
+  }
+  {
+    officev1::StreamOptions extras;
+    extras.set_include_notes_pages(true);
+    std::vector<std::string> slides;
+    auto slide_outcome =
+        run_with_extras("pages", "fodp", kNotesFodp, extras, &slides);
+    require(slide_outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "slides render ok: " + slide_outcome.detail);
+    PagesRun slide_run = fold_pages(slides);
+    require(slide_run.pages.size() == 2, "the slide and its notes page");
+    require(slide_run.pages[0].page_style() == "Default",
+            "a slide names its master, not " + slide_run.pages[0].page_style());
+    require(slide_run.pages[1].page_style().empty(),
+            "a notes page has no page style of its own");
+  }
+}
+
 // Form values naming no existing field must degrade to nothing: same
 // render, no crash, status still OK.
 void verify_unknown_form_value_is_harmless() {
@@ -2753,6 +2873,7 @@ int main() {
   verify_sheet_visibility_and_used_range();
   verify_notes_pages();
   verify_tracked_change_display();
+  verify_per_page_style();
   verify_unknown_form_value_is_harmless();
   verify_death_before_status_is_crash();
   verify_hung_worker_is_killed_at_deadline();
