@@ -124,6 +124,7 @@
 #include <com/sun/star/table/XTable.hpp>
 #include <com/sun/star/table/XTableColumns.hpp>
 #include <com/sun/star/table/XTableRows.hpp>
+#include <com/sun/star/text/TableColumnSeparator.hpp>
 #include <com/sun/star/util/NumberFormat.hpp>
 #include <com/sun/star/text/XSimpleText.hpp>
 #include <com/sun/star/util/XMergeable.hpp>
@@ -1851,6 +1852,87 @@ void fill_column_spans(officev1::TableData* table) {
   }
 }
 
+// Lays a text table's cells onto the column grid its rows share. A Writer
+// table names cells per row (a row of three cells is A, B, C whatever the
+// row above holds), so names alone cannot say that a three-cell header sits
+// over five columns; the rows' column separators can. Every row's
+// separators, in the table's relative width space, merge into one ordered
+// edge set; a cell's column and span are its left and right edges' places
+// in that set. False when the separators are unavailable, leaving the
+// name-derived positions in place.
+bool fill_grid_from_separators(const Reference<css::text::XTextTable>& table,
+                               officev1::TableData* out) {
+  Reference<css::container::XIndexAccess> rows(table->getRows(), UNO_QUERY);
+  Reference<css::beans::XPropertySet> table_props(table, UNO_QUERY);
+  if (!rows.is() || !table_props.is()) return false;
+  sal_Int16 relative_sum = 0;
+  try {
+    table_props->getPropertyValue("TableColumnRelativeSum") >>= relative_sum;
+  } catch (const css::uno::Exception&) {
+    return false;
+  }
+  if (relative_sum <= 0) return false;
+  std::vector<std::vector<sal_Int32>> row_edges(rows->getCount());
+  std::vector<sal_Int32> all_edges;
+  for (sal_Int32 r = 0; r < rows->getCount(); r++) {
+    css::uno::Sequence<css::text::TableColumnSeparator> separators;
+    try {
+      Reference<css::beans::XPropertySet> row_props(rows->getByIndex(r), UNO_QUERY);
+      if (!row_props.is()) return false;
+      row_props->getPropertyValue("TableColumnSeparators") >>= separators;
+    } catch (const css::uno::Exception&) {
+      return false;
+    }
+    std::vector<sal_Int32>& edges = row_edges[r];
+    edges.push_back(0);
+    for (const css::text::TableColumnSeparator& separator : separators) {
+      edges.push_back(separator.Position);
+    }
+    edges.push_back(relative_sum);
+    std::ranges::sort(edges);
+    all_edges.insert(all_edges.end(), edges.begin(), edges.end());
+  }
+  // Edges within half a percent of each other are one edge: the importers
+  // round separator positions per row.
+  std::ranges::sort(all_edges);
+  const sal_Int32 tolerance = std::max<sal_Int32>(1, relative_sum / 200);
+  std::vector<sal_Int32> grid;
+  for (sal_Int32 edge : all_edges) {
+    if (grid.empty() || edge - grid.back() > tolerance) grid.push_back(edge);
+  }
+  if (grid.size() < 2) return false;
+  auto grid_index = [&grid](sal_Int32 position) {
+    size_t best = 0;
+    for (size_t i = 1; i < grid.size(); i++) {
+      if (std::abs(grid[i] - position) < std::abs(grid[best] - position)) best = i;
+    }
+    return static_cast<int32_t>(best);
+  };
+  std::map<int32_t, std::vector<officev1::TableCellData*>> by_row;
+  for (officev1::TableCellData& cell : *out->mutable_cells()) {
+    if (cell.row() < 0 || cell.column() < 0) continue;
+    by_row[cell.row()].push_back(&cell);
+  }
+  for (auto& [row, cells] : by_row) {
+    if (row < 0 || static_cast<size_t>(row) >= row_edges.size()) continue;
+    const std::vector<sal_Int32>& edges = row_edges[row];
+    // A row whose boxes and separators disagree (split cells) keeps its
+    // name-derived positions.
+    if (edges.size() != cells.size() + 1) continue;
+    std::ranges::sort(cells, {}, [](const officev1::TableCellData* cell) {
+      return cell->column();
+    });
+    for (size_t i = 0; i < cells.size(); i++) {
+      const int32_t left = grid_index(edges[i]);
+      const int32_t right = grid_index(edges[i + 1]);
+      cells[i]->set_column(left);
+      cells[i]->set_column_span(std::max<int32_t>(1, right - left));
+    }
+  }
+  out->set_columns(static_cast<int32_t>(grid.size()) - 1);
+  return true;
+}
+
 bool emit_table(const Reference<css::text::XTextTable>& table, int32_t index,
                 const Reference<css::text::XTextViewCursor>& cursor,
                 CaretSpace* space, const PartSelection& parts,
@@ -1921,7 +2003,7 @@ bool emit_table(const Reference<css::text::XTextTable>& table, int32_t index,
         }
       }
     }
-    fill_column_spans(out);
+    if (!fill_grid_from_separators(table, out)) fill_column_spans(out);
     if (names.hasElements()) {
       Reference<css::text::XText> first(table->getCellByName(names[0]), UNO_QUERY);
       Reference<css::text::XText> last(
@@ -2033,6 +2115,21 @@ Reference<css::graphic::XGraphicProvider> graphic_provider(
 // Re-encodes a graphic through the provider entirely in memory, preferring
 // the graphic's source format and falling back to PNG. Leaves mime_type and
 // data empty when no encoding succeeds or no provider is available.
+// True for a graphic format a consumer outside the office core can decode:
+// the web rasters and SVG. The office core's own metafile spellings
+// (image/x-vclgraphic, image/x-svm, image/x-wmf, image/x-emf) and anything
+// else round-trip through the graphic provider but decode nowhere else, so
+// they are re-encoded as PNG rather than shipped verbatim.
+bool portable_graphic_mime(const rtl::OUString& mime) {
+  static const char* const kPortable[] = {
+      "image/png",  "image/jpeg", "image/gif",    "image/bmp",
+      "image/tiff", "image/webp", "image/svg+xml"};
+  for (const char* candidate : kPortable) {
+    if (mime.equalsAscii(candidate)) return true;
+  }
+  return false;
+}
+
 void encode_graphic(const Reference<css::graphic::XGraphic>& graphic,
                     const Reference<css::graphic::XGraphicProvider>& provider,
                     const std::string& label, std::string* mime_type,
@@ -2047,7 +2144,7 @@ void encode_graphic(const Reference<css::graphic::XGraphic>& graphic,
   } catch (const css::uno::Exception& error) {
     warner.warn(label + " mime type query failed", error);
   }
-  if (mime.isEmpty()) mime = "image/png";
+  if (!portable_graphic_mime(mime)) mime = "image/png";
   rtl::Reference<MemoryStream> sink(new MemoryStream);
   css::uno::Sequence<css::beans::PropertyValue> store_args(2);
   css::beans::PropertyValue* args = store_args.getArray();

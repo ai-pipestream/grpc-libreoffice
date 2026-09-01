@@ -1702,10 +1702,16 @@ void verify_embedded_objects() {
       bool tabular_ok = chart.tabular().rows() == 4 &&
                         chart.tabular().columns() == 3 &&
                         chart.tabular().cells_size() > 0;
+      // The replacement graphic of a chart is a metafile inside the office
+      // core; on the wire it is a PNG or nothing, never a metafile.
+      bool replacement_ok =
+          object.replacement_image().empty() ||
+          (object.replacement_mime_type() == "image/png" &&
+           object.replacement_image().starts_with("\x89PNG"));
       chart_ok = !chart.chart_type_service().empty() &&
                  chart.kind() != officev1::EMBEDDED_CHART_KIND_UNSPECIFIED &&
                  chart.title() == "Sales" && series_ok && categories_ok &&
-                 tabular_ok;
+                 tabular_ok && replacement_ok;
     }
     if (object.kind() == officev1::EMBEDDED_OBJECT_KIND_SPREADSHEET) {
       const officev1::TableData& table = object.inner_table();
@@ -2755,6 +2761,76 @@ const char kFieldsFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
 </office:document>
 )";
 
+// A flat ODT whose table has a three-cell header over five columns: the
+// docx shape whose cell names count per row.
+const char kGridFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+ office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:body><office:text>
+  <text:p>Complex table.</text:p>
+  <table:table table:name="Grid">
+   <table:table-column table:number-columns-repeated="5"/>
+   <table:table-row>
+    <table:table-cell><text:p></text:p></table:table-cell>
+    <table:table-cell table:number-columns-spanned="2"><text:p>May 2012</text:p></table:table-cell>
+    <table:covered-table-cell/>
+    <table:table-cell table:number-columns-spanned="2"><text:p>September 2010</text:p></table:table-cell>
+    <table:covered-table-cell/>
+   </table:table-row>
+   <table:table-row>
+    <table:table-cell><text:p>Screen Reader</text:p></table:table-cell>
+    <table:table-cell><text:p>Responses</text:p></table:table-cell>
+    <table:table-cell><text:p>Share</text:p></table:table-cell>
+    <table:table-cell><text:p>Responses</text:p></table:table-cell>
+    <table:table-cell><text:p>Share</text:p></table:table-cell>
+   </table:table-row>
+   <table:table-row>
+    <table:table-cell><text:p>JAWS</text:p></table:table-cell>
+    <table:table-cell><text:p>853</text:p></table:table-cell>
+    <table:table-cell><text:p>49%</text:p></table:table-cell>
+    <table:table-cell><text:p>727</text:p></table:table-cell>
+    <table:table-cell><text:p>59%</text:p></table:table-cell>
+   </table:table-row>
+  </table:table>
+ </office:text></office:body>
+</office:document>
+)";
+
+void verify_table_grid_from_column_separators() {
+  std::vector<std::string> payloads;
+  auto outcome = run("pages", "fodt", kGridFodt, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "grid fodt renders ok: " + outcome.detail);
+  bool seen = false;
+  officev1::StreamPagesResponse event;
+  for (const std::string& payload : payloads) {
+    require(event.ParseFromString(payload), "grid event parses");
+    if (!event.has_table()) continue;
+    seen = true;
+    const officev1::TableData& table = event.table();
+    require(table.rows() == 3 && table.columns() == 5,
+            "the grid is 3x5, got " + std::to_string(table.rows()) + "x" +
+                std::to_string(table.columns()));
+    std::map<std::string, const officev1::TableCellData*> by_name;
+    for (const officev1::TableCellData& cell : table.cells()) by_name[cell.name()] = &cell;
+    require(by_name.count("B1") && by_name["B1"]->column() == 1 &&
+                by_name["B1"]->column_span() == 2 && by_name["B1"]->text() == "May 2012",
+            "the first header cell spans columns 1-2");
+    require(by_name.count("C1") && by_name["C1"]->column() == 3 &&
+                by_name["C1"]->column_span() == 2,
+            "the second header cell spans columns 3-4");
+    require(by_name.count("E2") && by_name["E2"]->column() == 4 &&
+                by_name["E2"]->column_span() == 1 && by_name["E2"]->text() == "Share",
+            "a full row keeps one cell per column");
+    require(by_name.count("A1") && by_name["A1"]->column() == 0 &&
+                by_name["A1"]->column_span() == 1,
+            "the empty corner cell stays one column wide");
+  }
+  require(seen, "the grid table was emitted");
+}
+
 void verify_field_and_structure_content() {
   std::vector<std::string> payloads;
   auto outcome = run("pages", "fodt", kFieldsFodt, &payloads);
@@ -2851,6 +2927,7 @@ int main() {
   verify_pdf_chunk_streaming();
   verify_typed_content();
   verify_field_and_structure_content();
+  verify_table_grid_from_column_separators();
   verify_typed_spreadsheet();
   verify_draw_shapes();
   verify_typed_presentation();
