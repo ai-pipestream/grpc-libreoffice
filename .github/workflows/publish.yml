@@ -1,14 +1,32 @@
 name: Publish Image
 
-# Builds the image (the build stage runs the full test suite, real LibreOffice
-# renders included, so the push is gated on green) and pushes it to
-# docker.io/pipestreamai and our Forgejo container registry. The CICD_TOKEN
-# org secret only exists on Forgejo (git.rokkon.com); on the GitHub mirror it
-# is absent, so the Forgejo login and its tags are skipped there and the run
-# pushes to docker.io only.
+# Builds both images for linux/amd64 and linux/arm64 and pushes them to
+# docker.io/pipestreamai and our Forgejo container registry. The service
+# image's build stage runs the full test suite, real LibreOffice renders
+# included, so the push is gated on green. The CICD_TOKEN org secret only
+# exists on Forgejo (git.rokkon.com); on the GitHub mirror it is absent, so
+# the Forgejo login and its tags are skipped there and the run pushes to
+# docker.io only.
 #
-# amd64 only for now; LibreOffice exists on arm64 and a matrix build on the
-# arm64 runners can follow if a consumer needs it.
+# Build once, gate, then name. Every leg is built once with provenance
+# (mode=max) and SBOM attestations and pushed BY DIGEST ONLY: no tag points
+# at it, it is invisible under any public name. The leg then pulls that
+# digest back and boot-proofs it on its own architecture (the service with
+# scripts/smoke-test.sh under the compose stack's hardened run flags, the
+# UI through its own HEALTHCHECK); only a digest that passed is recorded as
+# an artifact. The `publish` job assembles the recorded digests into the
+# tagged manifest lists with `docker buildx imagetools create`
+# (scripts/publish-manifests.sh) and inspects the result: each index must
+# list exactly linux/amd64 and linux/arm64 with one attestation manifest
+# per platform, or the job fails. So the smoke gate always runs before any
+# tag exists, and the attestations on the published images are the ones the
+# builds produced.
+#
+# The arm64 legs build natively on GitHub's hosted ubuntu-24.04-arm
+# runner (free for this public repository); no QEMU anywhere. The amd64
+# legs are unchanged on ubuntu-latest. UNO is only flaky under QEMU
+# emulation; these legs build natively, and the in-build ctest battery
+# stays on for the service image on both architectures.
 on:
   push:
     branches: [main]
@@ -19,45 +37,60 @@ on:
         required: false
         type: string
 
+permissions:
+  contents: read
+
+env:
+  HUB_REPO: docker.io/pipestreamai/grpc-libreoffice
+  FORGEJO_REPO: git.rokkon.com/ai-pipestream/grpc-libreoffice
+  HUB_UI_REPO: docker.io/pipestreamai/grpc-libreoffice-ui
+  FORGEJO_UI_REPO: git.rokkon.com/ai-pipestream/grpc-libreoffice-ui
+
 jobs:
-  publish:
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{ matrix.image }} ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    # The LibreOfficeKit apt install and the ctest renders make these
+    # long builds; give the legs room rather than fail a healthy native
+    # build on a cold cache.
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: service
+            dockerfile: Dockerfile
+            hub: docker.io/pipestreamai/grpc-libreoffice
+            forgejo: git.rokkon.com/ai-pipestream/grpc-libreoffice
+            smoke: ./scripts/smoke-test.sh
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - image: service
+            dockerfile: Dockerfile
+            hub: docker.io/pipestreamai/grpc-libreoffice
+            forgejo: git.rokkon.com/ai-pipestream/grpc-libreoffice
+            smoke: ./scripts/smoke-test.sh
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          - image: ui
+            dockerfile: frontend/Dockerfile
+            hub: docker.io/pipestreamai/grpc-libreoffice-ui
+            forgejo: git.rokkon.com/ai-pipestream/grpc-libreoffice-ui
+            smoke: ./scripts/smoke-test-ui.sh
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - image: ui
+            dockerfile: frontend/Dockerfile
+            hub: docker.io/pipestreamai/grpc-libreoffice-ui
+            forgejo: git.rokkon.com/ai-pipestream/grpc-libreoffice-ui
+            smoke: ./scripts/smoke-test-ui.sh
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
     env:
       # Empty on the GitHub mirror; set on Forgejo.
       CICD_TOKEN: ${{ secrets.CICD_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-      - name: Compute image tags
-        id: tags
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          {
-            echo "service-tags<<EOF"
-            echo "docker.io/pipestreamai/grpc-libreoffice:latest"
-            if [ -n "$CICD_TOKEN" ]; then
-              echo "git.rokkon.com/ai-pipestream/grpc-libreoffice:latest"
-            fi
-            if [ -n "$VERSION" ]; then
-              echo "docker.io/pipestreamai/grpc-libreoffice:$VERSION"
-              if [ -n "$CICD_TOKEN" ]; then
-                echo "git.rokkon.com/ai-pipestream/grpc-libreoffice:$VERSION"
-              fi
-            fi
-            echo "EOF"
-            echo "ui-tags<<EOF"
-            echo "docker.io/pipestreamai/grpc-libreoffice-ui:latest"
-            if [ -n "$CICD_TOKEN" ]; then
-              echo "git.rokkon.com/ai-pipestream/grpc-libreoffice-ui:latest"
-            fi
-            if [ -n "$VERSION" ]; then
-              echo "docker.io/pipestreamai/grpc-libreoffice-ui:$VERSION"
-              if [ -n "$CICD_TOKEN" ]; then
-                echo "git.rokkon.com/ai-pipestream/grpc-libreoffice-ui:$VERSION"
-              fi
-            fi
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Log in to Docker Hub (docker.io)
@@ -81,22 +114,110 @@ jobs:
           registry: git.rokkon.com
           username: ${{ github.actor }}
           password: ${{ secrets.CICD_TOKEN }}
-      - name: Build and push
+      - name: Name the repositories this leg pushes to by digest
+        id: names
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          names="${{ matrix.hub }}"
+          if [ -n "$CICD_TOKEN" ]; then
+            names="$names,${{ matrix.forgejo }}"
+          fi
+          echo "names=$names" >> "$GITHUB_OUTPUT"
+          echo "platform_pair=${PLATFORM//\//-}" >> "$GITHUB_OUTPUT"
+      - name: Build (runs the test suite in the build stage) and push by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64
-          push: true
-          provenance: false
-          sbom: false
-          tags: ${{ steps.tags.outputs.service-tags }}
-      - name: Build and push frontend UI
-        uses: docker/build-push-action@v6
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          provenance: mode=max
+          sbom: true
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=image,"name=${{ steps.names.outputs.names }}",push-by-digest=true,name-canonical=true,push=true
+      - name: Boot-proof the pushed digest before it gets a name
+        # The image under test is the exact digest that was pushed, pulled
+        # back from the registry, so what passes here is what gets tagged.
+        env:
+          IMAGE: ${{ matrix.hub }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE"
+          ${{ matrix.smoke }} "$IMAGE"
+      - name: Record the digest that passed
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - name: Upload the digest for the publish job
+        uses: actions/upload-artifact@v4
         with:
-          context: .
-          file: frontend/Dockerfile
-          platforms: linux/amd64
-          push: true
-          provenance: false
-          sbom: false
-          tags: ${{ steps.tags.outputs.ui-tags }}
+          name: digest-${{ matrix.image }}-${{ steps.names.outputs.platform_pair }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish ${{ matrix.image }} manifest list
+    needs: build
+    # Runs even when a build leg failed, so one image's failure does not
+    # hold the other back: an image whose legs are missing has fewer
+    # digests than platforms and scripts/publish-manifests.sh refuses it.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: service
+            hub: docker.io/pipestreamai/grpc-libreoffice
+            forgejo: git.rokkon.com/ai-pipestream/grpc-libreoffice
+          - image: ui
+            hub: docker.io/pipestreamai/grpc-libreoffice-ui
+            forgejo: git.rokkon.com/ai-pipestream/grpc-libreoffice-ui
+    env:
+      CICD_TOKEN: ${{ secrets.CICD_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the digests that passed their smoke gate
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-${{ matrix.image }}-*
+          merge-multiple: true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to Docker Hub (docker.io)
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+      - name: Log in to Forgejo container registry
+        if: ${{ env.CICD_TOKEN != '' }}
+        uses: docker/login-action@v3
+        with:
+          registry: git.rokkon.com
+          username: ${{ github.actor }}
+          password: ${{ secrets.CICD_TOKEN }}
+      - name: Create the manifest lists and prove them
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          repos=(--repo "${{ matrix.hub }}")
+          if [ -n "$CICD_TOKEN" ]; then
+            repos+=(--repo "${{ matrix.forgejo }}")
+          fi
+          digests=()
+          for file in "$RUNNER_TEMP"/digests/*; do
+            [ -e "$file" ] && digests+=("$(basename "$file")")
+          done
+          ./scripts/publish-manifests.sh --version "$VERSION" \
+            --platforms linux/amd64,linux/arm64 "${repos[@]}" "${digests[@]}"
