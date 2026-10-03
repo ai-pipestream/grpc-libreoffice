@@ -124,44 +124,57 @@ bool export_pdf_stream(const std::string& filter_name, size_t chunk_limit,
 // bytes, and for damage beyond repair.
 bool is_repairable_broken_package(const std::string& bytes);
 
-// Applies tracked-change display, form fills, and PDF redaction shapes to
-// the document currently loaded in this process. Problems append to
-// warnings and never fail the render.
+// Applies tracked-change display and form fills to the document currently
+// loaded in this process. Problems append to warnings and never fail the
+// render.
 void apply_document_options(const RenderOptions& options,
                             std::vector<std::string>* warnings);
 
-// One line box in document-absolute twips, used to black out redacted
-// text on a painted page.
-struct RedactBox {
-  // Zero-based page index matching PageImage.index.
-  int page_index = -1;
-  // Left edge in document-absolute twips.
-  std::int64_t x_twips = 0;
-  // Top edge in document-absolute twips.
-  std::int64_t y_twips = 0;
-  // Width in twips.
-  std::int64_t width_twips = 0;
-  // Height in twips.
-  std::int64_t height_twips = 0;
+// Outcome of applying a request's redaction to the loaded document.
+struct RedactionResult {
+  // False when the redaction was refused; nothing may then be painted,
+  // exported, or extracted.
+  bool ok = true;
+  // Why the redaction was refused, for the caller's status. It names
+  // regions and offsets, never document text.
+  std::string refusal;
+  // The redacted strings, UTF-8, for guarding everything emitted later.
+  std::vector<std::string> redacted;
 };
 
-// Collects line boxes that overlap the request's redact spans, by running
-// a paragraphs+line-rects extraction against the loaded document. probe
-// may be null, in which case each overlapped paragraph degrades to
-// full-page-width bands over its start..end anchor extent on every page
-// it touches (conservative over-coverage, with a warning), using the
-// laid-out page rectangles in pages.
-void collect_redact_boxes(const RenderOptions& options, SelectionProbe* probe,
-                          const std::vector<PageBox>& pages,
-                          std::vector<RedactBox>* boxes,
-                          std::vector<std::string>* warnings);
+// Redacts the request's spans in the model of the document currently
+// loaded in this process, before anything is laid out, painted, exported,
+// or extracted. Each span resolves, through the same portion walk the
+// Paragraph events come from, to the text it covers in the annotation text
+// space (split per paragraph and trimmed of surrounding whitespace). That
+// text, and every other occurrence of it anywhere in the document, is
+// replaced with U+2588 FULL BLOCK glyphs, one per code point, drawn black
+// on black: body, tables, headers and footers of every page style,
+// footnotes and endnotes, text frames, drawing shapes and alt text,
+// comments, fields (turned into literal text), content controls, hyperlink
+// targets, index entries, user-defined style names, and the document
+// properties; tracked-change recording is switched off first so nothing
+// survives as a deletion, and generated indexes are rebuilt from the
+// rewritten headings. The model is then walked again, and the document is
+// extracted once more the way the typed events would carry it. The
+// redaction is refused, fail closed, when a span does not resolve (only
+// text documents carry an annotation text space), when the document embeds
+// an object the service cannot inspect or one that carries the text, or
+// when the text survives anywhere those checks can see. Matching is exact
+// and case-sensitive.
+RedactionResult apply_redaction(const RenderOptions& options,
+                                std::vector<std::string>* warnings);
 
-// Draws opaque black rectangles on the loaded document for PDF export.
-// Boxes are document-absolute twips; pages are the laid-out page
-// rectangles, used to anchor each rectangle to its page.
-void apply_redact_shapes(const std::vector<RedactBox>& boxes,
-                         const std::vector<PageBox>& pages,
-                         std::vector<std::string>* warnings);
+// True when any string of message, or the joined text of any of its run
+// lists, carries one of the redacted strings; *where names the field.
+bool carries_redacted_text(const google::protobuf::MessageLite& message,
+                           const std::vector<std::string>& redacted,
+                           std::string* where);
+
+// text with every occurrence of a redacted string replaced by redaction
+// glyphs.
+std::string mask_redacted(const std::string& text,
+                          const std::vector<std::string>& redacted);
 
 // Per-part visibility and used-range size for spreadsheet/presentation
 // page filtering. Index matches LibreOfficeKit part ordinal.

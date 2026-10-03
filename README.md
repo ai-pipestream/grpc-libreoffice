@@ -137,8 +137,8 @@ at STANDARD plus COMMENTS):
   from page images; `paint_used_range` crops spreadsheet pages to the
   used cell range; `include_notes_pages` appends each slide's notes page.
   `form_values` writes named form fields before paint or export;
-  `redact_spans` blacks out annotation-space character ranges on rasters
-  and draws matching rectangles on PDF export.
+  `redact_spans` removes text from the document before anything is
+  painted, exported, or extracted (see Redaction below).
   `DocumentInfo` and `RenderStatus` are always sent.
   `DocumentInfo` also carries the layout rectangle of every page in the
   same twips space the typed positions use, so a consumer can map any
@@ -168,11 +168,14 @@ legacy), the OpenDocument families, RTF, CSV, HTML, and plain text.
 
 Errors are gRPC status codes: `INVALID_ARGUMENT` (no bytes, missing complete
 flag, unresolvable format, out-of-range options, or the core cannot load
-the document), `RESOURCE_EXHAUSTED` (over the byte cap),
+the document), `RESOURCE_EXHAUSTED` (over the byte cap, or the server-wide
+upload buffer is full), `UNIMPLEMENTED` (PDF input, see below),
 `FAILED_PRECONDITION` (broken package needing repair without the
-`allow_package_repair` opt-in), `DEADLINE_EXCEEDED` (per-document timeout,
-worker killed), `INTERNAL` (worker crash). Health checking and reflection
-are registered.
+`allow_package_repair` opt-in, or a redaction that cannot be applied to the
+whole document), `DEADLINE_EXCEEDED` (per-document timeout or the caller's
+deadline, worker killed), `CANCELLED` (the caller cancelled; a running
+worker is killed), `INTERNAL` (worker crash). Health checking and
+reflection are registered.
 
 A document whose zip package is broken but repairable is a special case:
 LibreOffice can only open it through its repair path, which rebuilds the
@@ -184,9 +187,45 @@ the opt-in the worker retries the load with `RepairPackage=true`. A
 package that still will not open fails as `INVALID_ARGUMENT`. A broken
 package is never repaired silently.
 
-Accepted formats also include PDF, which the core imports through Draw;
-PDF pages rasterize like any other document and, because the import
-produces a drawing model, emit `DrawingShape` typed content.
+Redaction (`redact_spans`, on `StreamOptions` and on `ConvertToPdfRequest`)
+removes text, not pixels. Before anything is laid out, painted, exported,
+or extracted, each span resolves to the text it covers in the annotation
+text space, and that text leaves the document model wherever it occurs:
+body, tables, headers and footers, footnotes and endnotes, text frames,
+drawing shapes and their alt text, comments, fields, content controls,
+hyperlink targets (on text, images, shapes, and frames, image maps
+included), form controls and their forms, index entries, user-defined
+style names, and the document properties. Each character becomes one U+2588 FULL BLOCK drawn
+black on black, so the page shows a solid bar. Page images, SVG pages, the
+PDF (its text layer and document information included), and every typed
+event of the response come from that rewritten model. A span's text splits
+per paragraph and is trimmed of surrounding whitespace; matching is exact
+and case-sensitive.
+Redaction fails closed with `FAILED_PRECONDITION`, and nothing streams,
+when a span ends past the annotation text space (spreadsheets,
+presentations, and drawings have none, so any span on them is refused),
+when the document embeds an object the service cannot inspect (a foreign
+OLE object) or one whose content carries the text (every sheet of an
+embedded spreadsheet, every title, label, and category of an embedded
+chart, and objects nested inside them are inspected), when the text
+survives the rewrite anywhere the service can see, such as a tracked
+change's author (accept or reject the changes through `tracked_changes` to
+redact such a document), or when any of these checks fails to read part
+of the document. The reason names the region and the check, never
+document text. The pixels of embedded images are not inspected. Every
+typed event is checked again on its way out; in pages mode, should that
+last guard ever find the text the checks above missed, page images may
+already have streamed before the call ends `FAILED_PRECONDITION`.
+
+PDF input is refused with `UNIMPLEMENTED`, before any worker spawns:
+LibreOffice reads PDFs through its PDF import (`xpdfimport`), which runs
+GPL Poppler, and PDFs belong to the dedicated PDF backends. A PDF is
+recognized by a `.pdf` filename extension, by an `application/pdf`
+content type when the filename has no known extension, and by a `%PDF-`
+signature on the first bytes whatever the filename says. The service
+image ships without the PDF import component and without Poppler, which
+`scripts/smoke-test.sh` checks on every published image; `pdf` is not in
+`GetServiceInfo.supported_formats`.
 
 The repo also carries `ai.pipestream.document.v1`, the pipestream document
 structure schema, and a consumer-side mapper (built into the server
@@ -203,13 +242,20 @@ captures, what still rides untyped, and what is not captured yet.
 
 ## Process model
 
-The server buffers each upload under a hard byte cap, then spawns
-`grlibre-worker` with the document on stdin. The worker initializes
-LibreOfficeKit with its own user profile, loads the document, and writes
-length-prefixed response events to stdout, which the server relays to the
-gRPC stream as they arrive. A concurrency gate bounds simultaneous workers;
-a deadline kills workers that hang. Worker exit codes distinguish "could not
-load the document" (client error) from crashes (server error).
+The server buffers each upload under a hard byte cap, and every buffered
+byte also counts against a server-wide upload buffer cap until its request
+ends, so concurrent uploads cannot pile up in memory without bound before
+they are admitted. It then spawns `grlibre-worker` with the document on
+stdin. The worker initializes LibreOfficeKit with its own user profile,
+loads the document, and writes length-prefixed response events to stdout,
+which the server relays to the gRPC stream as they arrive. A concurrency
+gate bounds simultaneous workers; a deadline kills workers that hang, and
+it covers the whole worker run, the upload copy into the worker included.
+The caller's own deadline caps that deadline, and a caller that cancels or
+runs out of time while queued for the gate stops waiting (`CANCELLED` or
+`DEADLINE_EXCEEDED`); once its worker runs, cancellation kills it, for
+`ToDocument` too. Worker exit codes distinguish "could not load the
+document" (client error) from crashes (server error).
 
 Uploaded document bytes never touch disk. Each worker gets a private 0700
 work dir on a RAM-backed tmpfs (`GRLIBRE_TMPFS_DIR`, default `/dev/shm`);
@@ -219,8 +265,7 @@ way. The document is staged there just long enough for the office core to
 open it and is unlinked the moment the load returns (the core keeps its own
 descriptors, so lazy reads of embedded media keep working). The core's own
 temp spills (`TMPDIR`) are pinned inside the same tmpfs: an ODF load keeps
-a full package copy there for the document's lifetime, a PDF upload is
-staged in full by the office core's PDF import, and embedded media
+a full package copy there for the document's lifetime, and embedded media
 spill their raw bytes plus derived bitmaps, so size the tmpfs for the
 document plus those spills, times the number of concurrent workers. In pdf
 mode the PDF streams straight from the export filter's output stream into
@@ -228,7 +273,11 @@ chunk events; the one remaining materialization is LibreOffice-internal
 (the pdf filter renders into a named temp file and copies it out, unlinking
 it right after), and it lives in the same tmpfs `TMPDIR`. File locking is
 disabled through the worker profile, so no `.~lock` siblings are written
-anywhere.
+anywhere. Document macros never run: every load passes LibreOfficeKit's
+`EnableMacrosExecution=false` and `MacroSecurityLevel=3`, and the worker
+profile switches macro execution off as well. The profile also blocks
+links from untrusted referers, so the office core does not fetch the
+pictures or other resources an uploaded document links to.
 
 ## Configuration
 
@@ -236,6 +285,7 @@ anywhere.
 |---|---|---|
 | `GRLIBRE_PORT` | `50053` | Listen port |
 | `GRLIBRE_MAX_DOCUMENT_MIB` | `500` | Per-document byte cap |
+| `GRLIBRE_MAX_UPLOAD_BUFFER_MIB` | per-document cap × concurrent documents | Upload bytes held in memory across all in-flight requests; a chunk that would exceed it fails the request with `RESOURCE_EXHAUSTED` (never below the per-document cap) |
 | `GRLIBRE_MAX_CONCURRENT_DOCUMENTS` | `2` | Worker processes in flight |
 | `GRLIBRE_TASK_TIMEOUT_SECONDS` | `120` | Per-document deadline |
 | `GRLIBRE_RENDER_DPI` | `144` | Default page render DPI; a request may override it via `StreamOptions.render_dpi` |
@@ -262,8 +312,10 @@ docker run --rm --read-only --tmpfs /tmp:rw,size=1g -p 50053:50053 grlibre
 ```
 
 The image build runs the full test suite, including real renders through a
-headless LibreOffice, before an image can exist. Tests author their fixtures
-in memory; the render tests skip cleanly on machines without LibreOffice.
+headless LibreOffice, before an image can exist. The image carries the
+license texts of everything statically linked into the two binaries in
+`/opt/grlibre/licenses/`. Tests author their fixtures in memory; the render
+tests skip cleanly on machines without LibreOffice.
 
 ## Demo kit
 
@@ -275,7 +327,7 @@ live stats show time to first page, pages per second, and typed-content
 counts.](docs/frontend.png)
 
 `fixtures/fetch.sh` downloads (or locally converts) a sample document set:
-docx, doc, xlsx, xls, pptx, odt, rtf, pdf, including a 224-page docx for
+docx, doc, xlsx, xls, pptx, odt, rtf, including a 224-page docx for
 stress runs.
 
 `frontend/` is a demo web UI: a small Node BFF speaks gRPC to the server

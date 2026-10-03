@@ -74,6 +74,40 @@ std::vector<PageRect> parse_page_rectangles(const char* rectangles) {
   return pages;
 }
 
+// The paint geometry of one page: the twips-to-pixels scale, the pixel size
+// it yields, and the DPI that scale amounts to.
+struct PaintSize {
+  double scale = 0;
+  int width_px = 1;
+  int height_px = 1;
+  int dpi = 0;
+};
+
+// Scales a page to the requested DPI, or to max_width_px when set, then
+// clamps its longer side to max_side_px. Every path that paints a page
+// sizes its pixel buffer from this, so no buffer is ever sized from a
+// page's twips extent alone: a spreadsheet page is the whole used sheet,
+// which a single far-away cell stretches to millions of twips.
+PaintSize paint_size(const PageRect& page, const RenderOptions& options) {
+  PaintSize size;
+  size.scale = options.dpi / kTwipsPerInch;
+  size.dpi = options.dpi;
+  if (options.max_width_px > 0 && page.width > 0) {
+    size.scale = static_cast<double>(options.max_width_px) / page.width;
+    size.dpi = std::max(1, static_cast<int>(size.scale * kTwipsPerInch));
+  }
+  long side = std::max(page.width, page.height);
+  if (side * size.scale > options.max_side_px) {
+    size.scale = static_cast<double>(options.max_side_px) / side;
+    size.dpi = std::max(1, static_cast<int>(size.scale * kTwipsPerInch));
+  }
+  size.width_px =
+      std::max(1, static_cast<int>(std::lround(page.width * size.scale)));
+  size.height_px =
+      std::max(1, static_cast<int>(std::lround(page.height * size.scale)));
+  return size;
+}
+
 bool emit(int fd, const google::protobuf::MessageLite& message) {
   std::string serialized;
   if (!message.SerializeToString(&serialized)) return false;
@@ -100,26 +134,6 @@ void selection_callback(int type, const char* payload, void* data) {
 bool (*resolve_reschedule())(bool) {
   return reinterpret_cast<bool (*)(bool)>(
       dlsym(RTLD_DEFAULT, "_ZN11Application10RescheduleEb"));
-}
-
-// Paints an opaque black rectangle onto a 32-bit pixel buffer, clamped to
-// the buffer bounds; alpha is left untouched.
-void blackout_rect(std::vector<unsigned char>* pixels, int width_px, int height_px,
-                   int x0, int y0, int x1, int y1) {
-  if (x0 < 0) x0 = 0;
-  if (y0 < 0) y0 = 0;
-  if (x1 > width_px) x1 = width_px;
-  if (y1 > height_px) y1 = height_px;
-  if (x1 <= x0 || y1 <= y0) return;
-  for (int y = y0; y < y1; y++) {
-    for (int x = x0; x < x1; x++) {
-      unsigned char* p =
-          pixels->data() + (static_cast<size_t>(y) * width_px + x) * 4;
-      p[0] = 0;
-      p[1] = 0;
-      p[2] = 0;
-    }
-  }
 }
 
 std::string base64_encode(const std::string& in) {
@@ -189,7 +203,6 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
                  const std::vector<PageRect>& pages,
                  const std::vector<std::string>& page_styles, bool bgra,
                  int out_fd, long* output_bytes, std::string* error,
-                 const std::vector<RedactBox>& redact,
                  std::vector<std::string>* warnings) {
   struct RawPage {
     int index;
@@ -284,20 +297,16 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
               "PNG wrapped in SVG");
           svg_fallback_warned = true;
         }
-        double scale = options.dpi / kTwipsPerInch;
-        if (options.max_width_px > 0 && page.width > 0) {
-          scale = static_cast<double>(options.max_width_px) / page.width;
-        }
-        int width_px = std::max(1, static_cast<int>(std::lround(page.width * scale)));
-        int height_px = std::max(1, static_cast<int>(std::lround(page.height * scale)));
+        const PaintSize size = paint_size(page, options);
         std::vector<unsigned char> pixels(
-            static_cast<size_t>(width_px) * height_px * 4);
-        document->paintTile(pixels.data(), width_px, height_px,
+            static_cast<size_t>(size.width_px) * size.height_px * 4);
+        document->paintTile(pixels.data(), size.width_px, size.height_px,
                             static_cast<int>(page.x), static_cast<int>(page.y),
                             static_cast<int>(page.width),
                             static_cast<int>(page.height));
-        std::string png = encode_png(pixels.data(), width_px, height_px, bgra);
-        svg = svg_from_png(png, width_px, height_px);
+        std::string png =
+            encode_png(pixels.data(), size.width_px, size.height_px, bgra);
+        svg = svg_from_png(png, size.width_px, size.height_px);
       }
       if (svg.empty() || !svg.contains("<svg")) {
         encoder_ok = false;
@@ -322,40 +331,19 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
       }
       continue;
     }
-    double scale = options.dpi / kTwipsPerInch;
-    int effective_dpi = options.dpi;
-    if (options.max_width_px > 0 && page.width > 0) {
-      scale = static_cast<double>(options.max_width_px) / page.width;
-      effective_dpi = std::max(1, static_cast<int>(scale * kTwipsPerInch));
-    }
-    long side = std::max(page.width, page.height);
-    if (side * scale > options.max_side_px) {
-      scale = static_cast<double>(options.max_side_px) / side;
-      effective_dpi = std::max(1, static_cast<int>(scale * kTwipsPerInch));
-    }
-    int width_px = std::max(1, static_cast<int>(std::lround(page.width * scale)));
-    int height_px = std::max(1, static_cast<int>(std::lround(page.height * scale)));
+    const PaintSize size = paint_size(page, options);
+    const int width_px = size.width_px;
+    const int height_px = size.height_px;
     RawPage raw{.index = static_cast<int>(index),
                 .width_px = width_px,
                 .height_px = height_px,
-                .dpi = effective_dpi,
+                .dpi = size.dpi,
                 .style = style_of(index),
                 .pixels = {}};
     raw.pixels.resize(static_cast<size_t>(width_px) * height_px * 4);
     document->paintTile(raw.pixels.data(), width_px, height_px,
                         static_cast<int>(page.x), static_cast<int>(page.y),
                         static_cast<int>(page.width), static_cast<int>(page.height));
-    for (const RedactBox& box : redact) {
-      if (box.page_index != raw.index) continue;
-      const double px = scale;
-      const int x0 = static_cast<int>((box.x_twips - page.x) * px);
-      const int y0 = static_cast<int>((box.y_twips - page.y) * px);
-      const int x1 = static_cast<int>(
-          (box.x_twips + box.width_twips - page.x) * px);
-      const int y1 = static_cast<int>(
-          (box.y_twips + box.height_twips - page.y) * px);
-      blackout_rect(&raw.pixels, width_px, height_px, x0, y0, x1, y1);
-    }
     if (options.grayscale) {
       grayscale_pixels(raw.pixels.data(), width_px, height_px, bgra);
     }
@@ -397,13 +385,24 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
   // Every load gets LOK's Batch option: it installs the non-interactive
   // handler, without which any import interaction (Calc's text-import
   // dialog, the corrupt-document repair prompt) parks the load on a condvar
-  // forever. Delimiter formats additionally preset the text-import filter
-  // (separator 44 comma / 9 tab, quote 34, charset 76 UTF-8, from row 1).
-  const char* filter_options = "Batch=true";
+  // forever. Document macros never run, and that is stated rather than
+  // inherited: EnableMacrosExecution=false keeps the load at
+  // MacroExecMode::NEVER_EXECUTE, and MacroSecurityLevel=3 pins the core's
+  // security level to its strictest setting (LOK resets the level on every
+  // load when the option is absent). Delimiter formats additionally preset
+  // the text-import filter (separator 44 comma / 9 tab, quote 34, charset
+  // 76 UTF-8, from row 1); LOK strips its own options before the filter
+  // sees the string.
+  const char* filter_options =
+      "Batch=true,EnableMacrosExecution=false,MacroSecurityLevel=3";
   if (options.extension == "csv") {
-    filter_options = "44,34,76,1,,0,false,true,true,false,false,false,Batch=true";
+    filter_options = "44,34,76,1,,0,false,true,true,false,false,false,"
+                     "Batch=true,EnableMacrosExecution=false,"
+                     "MacroSecurityLevel=3";
   } else if (options.extension == "tsv") {
-    filter_options = "9,34,76,1,,0,false,true,true,false,false,false,Batch=true";
+    filter_options = "9,34,76,1,,0,false,true,true,false,false,false,"
+                     "Batch=true,EnableMacrosExecution=false,"
+                     "MacroSecurityLevel=3";
   }
   lok::Document* document = office->documentLoad(url.c_str(), filter_options);
   if (document == nullptr && options.allow_package_repair) {
@@ -467,6 +466,16 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
   document->initializeForRendering(nullptr);
   std::vector<std::string> option_warnings;
   apply_document_options(options, &option_warnings);
+  // Redaction rewrites the document model before anything below lays it
+  // out, paints it, exports it, or extracts from it, and refuses the whole
+  // request when the text cannot be removed everywhere; nothing has been
+  // emitted at that point.
+  RedactionResult redaction = apply_redaction(options, &option_warnings);
+  if (!redaction.ok) {
+    *error = redaction.refusal;
+    delete document;
+    return kExitRedactionRefused;
+  }
 
   int type = document->getDocumentType();
   std::vector<PageRect> pages;
@@ -567,10 +576,9 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     rect->set_height_twips(page.height);
   }
 
-  // Per-line rectangles ride the selection callback. The probe registers
-  // before any painting or export: redaction needs the measured line boxes
-  // first, in both modes. The probe stays null when nothing needs line
-  // rectangles or the event flush is unresolvable.
+  // Per-line rectangles ride the selection callback, for pages mode only.
+  // The probe stays null when nothing needs line rectangles or the event
+  // flush is unresolvable.
   std::vector<PageBox> page_boxes;
   for (const PageRect& page : pages) {
     page_boxes.push_back({.x = page.x,
@@ -581,11 +589,10 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
   SelectionProbe probe;
   SelectionProbe* probe_ptr = nullptr;
   const bool want_line_rects =
-      (options.mode == "pages"
-       && (options.parts.wants(officev1::DOCUMENT_PART_LINE_RECTS)
-           || options.parts.explicit_wants(
-                  officev1::DOCUMENT_PART_CELL_LINE_RECTS)))
-      || !options.redact_spans.empty();
+      options.mode == "pages"
+      && (options.parts.wants(officev1::DOCUMENT_PART_LINE_RECTS)
+          || options.parts.explicit_wants(
+                 officev1::DOCUMENT_PART_CELL_LINE_RECTS));
   if (want_line_rects) {
     probe.reschedule = resolve_reschedule();
     probe.acquire_solar_mutex = reinterpret_cast<void (*)(unsigned int)>(
@@ -606,11 +613,6 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
           "typed content: event flush unavailable, line rectangles omitted");
     }
   }
-  std::vector<RedactBox> redact;
-  if (!options.redact_spans.empty()) {
-    collect_redact_boxes(options, probe_ptr, page_boxes, &redact,
-                         &option_warnings);
-  }
 
   long output_bytes = 0;
   bool ok = true;
@@ -626,30 +628,47 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     std::vector<std::string> typed_warnings = option_warnings;
     if (ok && options.parts.wants(officev1::DOCUMENT_PART_PAGES)) {
       if (!paint_pages(document, options, pages, page_styles, bgra, out_fd,
-                       &output_bytes, error, redact, &typed_warnings)) {
+                       &output_bytes, error, &typed_warnings)) {
         delete document;
         return kExitRenderFailure;
       }
     }
     // Pages have streamed; typed content follows from the same loaded
     // document, each event emitted the moment it is extracted. Extraction
-    // problems degrade to status warnings, never a failed render.
+    // problems degrade to status warnings, never a failed render. Under a
+    // redaction every event is checked once more on its way out, and one
+    // that still carries redacted text ends the render refused instead.
+    // apply_redaction already ran the same check over every part this can
+    // emit, before anything was painted, so this guard is a backstop; if
+    // it ever trips, the page images above have already gone out.
+    bool redaction_breached = false;
     if (ok) {
       ok = emit_typed_content(
           options.parts, probe_ptr,
           [&](const google::protobuf::MessageLite& event) {
+            std::string where;
+            if (carries_redacted_text(event, redaction.redacted, &where)) {
+              redaction_breached = true;
+              *error = "redaction refused: redacted text remains in typed "
+                       "content (" + where + ")";
+              return false;
+            }
             output_bytes += static_cast<long>(event.ByteSizeLong());
             return emit(out_fd, event);
           },
           &typed_warnings);
     }
     if (probe_ptr != nullptr) document->registerCallback(nullptr, nullptr);
+    if (redaction_breached) {
+      delete document;
+      return kExitRedactionRefused;
+    }
     if (ok) {
       officev1::StreamPagesResponse final_event;
       officev1::RenderStatus* status = final_event.mutable_status();
       status->set_state(officev1::RenderStatus::STATE_OK);
       for (const std::string& warning : typed_warnings) {
-        status->add_warnings(warning);
+        status->add_warnings(mask_redacted(warning, redaction.redacted));
       }
       status->set_input_bytes(options.input_bytes);
       status->set_output_bytes(output_bytes);
@@ -681,13 +700,6 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     // PdfChunk frames: no out.pdf staging file and no whole-PDF buffer
     // exist in the worker. A filter failure delivers no bytes first, so
     // the stream carries no partial chunks before the error status.
-    if (!options.redact_spans.empty()) {
-      apply_redact_shapes(redact, page_boxes, &option_warnings);
-    }
-    if (probe_ptr != nullptr) {
-      document->registerCallback(nullptr, nullptr);
-      probe_ptr = nullptr;
-    }
     PdfExportOptions pdf{.first_page = options.first_page,
                          .last_page = options.last_page,
                          .skip_hidden = options.skip_hidden};
@@ -707,7 +719,7 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
       officev1::RenderStatus* status = final_event.mutable_status();
       status->set_state(officev1::RenderStatus::STATE_OK);
       for (const std::string& warning : option_warnings) {
-        status->add_warnings(warning);
+        status->add_warnings(mask_redacted(warning, redaction.redacted));
       }
       status->set_input_bytes(options.input_bytes);
       status->set_output_bytes(output_bytes);

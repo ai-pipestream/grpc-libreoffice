@@ -13,6 +13,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <com/sun/star/awt/FontPitch.hpp>
@@ -25,6 +26,7 @@
 #include <com/sun/star/beans/UnknownPropertyException.hpp>
 #include <com/sun/star/beans/XPropertySet.hpp>
 #include <com/sun/star/beans/XPropertySetInfo.hpp>
+#include <com/sun/star/chart/XComplexDescriptionAccess.hpp>
 #include <com/sun/star/chart2/AxisType.hpp>
 #include <com/sun/star/chart2/ScaleData.hpp>
 #include <com/sun/star/chart2/XAxis.hpp>
@@ -35,8 +37,11 @@
 #include <com/sun/star/chart2/XCoordinateSystemContainer.hpp>
 #include <com/sun/star/chart2/XDataSeries.hpp>
 #include <com/sun/star/chart2/XDataSeriesContainer.hpp>
+#include <com/sun/star/chart2/XDataPointCustomLabelField.hpp>
 #include <com/sun/star/chart2/XDiagram.hpp>
 #include <com/sun/star/chart2/XFormattedString.hpp>
+#include <com/sun/star/chart2/XRegressionCurve.hpp>
+#include <com/sun/star/chart2/XRegressionCurveContainer.hpp>
 #include <com/sun/star/chart2/XTitle.hpp>
 #include <com/sun/star/chart2/XTitled.hpp>
 #include <com/sun/star/chart2/data/XDataSequence.hpp>
@@ -46,6 +51,7 @@
 #include <com/sun/star/chart2/data/XTextualDataSequence.hpp>
 #include <com/sun/star/awt/XControlModel.hpp>
 #include <com/sun/star/document/XEmbeddedObjectSupplier2.hpp>
+#include <com/sun/star/document/XEmbeddedObjectSupplier.hpp>
 #include <com/sun/star/document/XRedlinesSupplier.hpp>
 #include <com/sun/star/container/XEnumerationAccess.hpp>
 #include <com/sun/star/container/XNameAccess.hpp>
@@ -63,6 +69,7 @@
 #include <com/sun/star/drawing/XDrawPages.hpp>
 #include <com/sun/star/drawing/XDrawPagesSupplier.hpp>
 #include <com/sun/star/drawing/XMasterPageTarget.hpp>
+#include <com/sun/star/drawing/XMasterPagesSupplier.hpp>
 #include <com/sun/star/drawing/XShape.hpp>
 #include <com/sun/star/drawing/XShapes.hpp>
 #include <com/sun/star/embed/StorageFormats.hpp>
@@ -83,6 +90,7 @@
 #include <com/sun/star/style/XStyle.hpp>
 #include <com/sun/star/style/XStyleFamiliesSupplier.hpp>
 #include <com/sun/star/frame/XModel.hpp>
+#include <com/sun/star/form/XFormsSupplier2.hpp>
 #include <com/sun/star/graphic/XGraphic.hpp>
 #include <com/sun/star/graphic/XGraphicProvider.hpp>
 #include <com/sun/star/io/XInputStream.hpp>
@@ -93,6 +101,8 @@
 #include <com/sun/star/lang/XMultiServiceFactory.hpp>
 #include <com/sun/star/lang/XServiceInfo.hpp>
 #include <com/sun/star/sheet/XCellRangeAddressable.hpp>
+#include <com/sun/star/sheet/CellFlags.hpp>
+#include <com/sun/star/sheet/XCellRangesQuery.hpp>
 #include <com/sun/star/sheet/XCellRangeReferrer.hpp>
 #include <com/sun/star/sheet/XDataPilotDescriptor.hpp>
 #include <com/sun/star/sheet/XDataPilotTable.hpp>
@@ -106,6 +116,7 @@
 #include <com/sun/star/sheet/XSheetAnnotationsSupplier.hpp>
 #include <com/sun/star/sheet/XSheetCellCursor.hpp>
 #include <com/sun/star/sheet/XSheetCellRange.hpp>
+#include <com/sun/star/sheet/XSheetCellRanges.hpp>
 #include <com/sun/star/sheet/XSpreadsheet.hpp>
 #include <com/sun/star/sheet/XSpreadsheetDocument.hpp>
 #include <com/sun/star/sheet/XSpreadsheets.hpp>
@@ -147,7 +158,9 @@
 #include <com/sun/star/text/XTextEmbeddedObjectsSupplier.hpp>
 #include <com/sun/star/text/XTextFrame.hpp>
 #include <com/sun/star/text/XTextFramesSupplier.hpp>
+#include <com/sun/star/text/XTextCursor.hpp>
 #include <com/sun/star/text/XTextRange.hpp>
+#include <com/sun/star/text/XTextSectionsSupplier.hpp>
 #include <com/sun/star/text/XTextTable.hpp>
 #include <com/sun/star/text/XTextViewCursor.hpp>
 #include <com/sun/star/text/XTextViewCursorSupplier.hpp>
@@ -160,6 +173,10 @@
 #include <cppuhelper/implbase1.hxx>
 #include <cppuhelper/implbase4.hxx>
 #include <rtl/ref.hxx>
+#include <rtl/ustrbuf.hxx>
+
+#include <google/protobuf/descriptor.h>
+#include <google/protobuf/message.h>
 
 #include "ai/pipestream/office/v1/office_service.pb.h"
 
@@ -175,6 +192,11 @@ using EmitFn = std::function<bool(const google::protobuf::MessageLite&)>;
 
 // 1/100 mm to twips: 1 inch = 2540 * (1/100 mm) = 1440 twips.
 long hundredth_mm_to_twips(long value) { return value * 72 / 127; }
+
+// Draw-page groups nest recursively, and every walk over them recurses
+// with them; a crafted document can nest groups deep enough to exhaust the
+// worker's stack. Groups past this depth are reported and not descended.
+constexpr int kMaxShapeGroupDepth = 64;
 
 std::string utf8(const rtl::OUString& text) {
   rtl::OString bytes = rtl::OUStringToOString(text, RTL_TEXTENCODING_UTF8);
@@ -198,12 +220,35 @@ class Warner {
   }
 
   void warn(const std::string& message) {
+    count_++;
+    report(message);
+  }
+
+  // Problems reported so far. A walk that must read everything (the
+  // redaction checks) compares it before and after instead of reading the
+  // messages.
+  size_t count() const { return count_; }
+
+  // Reports a problem that loses no text (an image that will not
+  // re-encode), so count() does not include it.
+  void note(const std::string& context, const css::uno::Exception& error) {
+    report(context + ": " + utf8(error.Message));
+  }
+
+  // Warns about a condition once per walk, however often it recurs.
+  void warn_once(const std::string& message) {
+    if (warned_.insert(message).second) warn(message);
+  }
+
+ private:
+  void report(const std::string& message) {
     std::println(stderr, "grlibre-worker: typed content: {}", message);
     if (sink_ != nullptr) sink_->push_back("typed content: " + message);
   }
 
- private:
   std::vector<std::string>* sink_;
+  std::set<std::string> warned_;
+  size_t count_ = 0;
 };
 
 // The office core bootstrapped UNO in this process when LibreOfficeKit
@@ -2106,7 +2151,7 @@ Reference<css::graphic::XGraphicProvider> graphic_provider(
             "com.sun.star.graphic.GraphicProvider", context),
         UNO_QUERY);
   } catch (const css::uno::Exception& error) {
-    warner.warn("graphic provider unavailable, image bytes will be missing",
+    warner.note("graphic provider unavailable, image bytes will be missing",
                 error);
   }
   return provider;
@@ -2142,7 +2187,7 @@ void encode_graphic(const Reference<css::graphic::XGraphic>& graphic,
   } catch (const css::beans::UnknownPropertyException&) {
     // Expected probe result: not every graphic knows its source format.
   } catch (const css::uno::Exception& error) {
-    warner.warn(label + " mime type query failed", error);
+    warner.note(label + " mime type query failed", error);
   }
   if (!portable_graphic_mime(mime)) mime = "image/png";
   rtl::Reference<MemoryStream> sink(new MemoryStream);
@@ -2157,7 +2202,7 @@ void encode_graphic(const Reference<css::graphic::XGraphic>& graphic,
     *mime_type = utf8(mime);
     *data = sink->bytes();
   } catch (const css::uno::Exception& original_error) {
-    warner.warn(label + " does not round-trip as " + utf8(mime) +
+    warner.note(label + " does not round-trip as " + utf8(mime) +
                     ", re-encoding as image/png",
                 original_error);
     rtl::Reference<MemoryStream> png_sink(new MemoryStream);
@@ -2168,7 +2213,7 @@ void encode_graphic(const Reference<css::graphic::XGraphic>& graphic,
       *mime_type = "image/png";
       *data = png_sink->bytes();
     } catch (const css::uno::Exception& error) {
-      warner.warn(label + " could not be encoded at all", error);
+      warner.note(label + " could not be encoded at all", error);
     }
   }
 }
@@ -2315,10 +2360,12 @@ void emit_form_control(const Reference<css::beans::XPropertySet>& shape_props,
 // backing frame) emit Shape events (gated on SHAPES). Control shapes and
 // empty-text shapes are skipped silently. group_path names the ancestor
 // chain, empty at the top level; groups are recursed even when only IMAGES
-// is selected so nested image shapes are found.
+// is selected so nested image shapes are found. depth counts the enclosing
+// groups; children past kMaxShapeGroupDepth are not descended.
 bool emit_writer_shapes(const Reference<css::container::XIndexAccess>& shapes,
                         const std::string& group_path, WriterShapeWalk* walk,
-                        const EmitFn& emit_fn, Warner& warner) {
+                        const EmitFn& emit_fn, Warner& warner,
+                        int depth = 0) {
   for (sal_Int32 i = 0; i < shapes->getCount(); i++) {
     std::string slot = group_path.empty()
         ? std::to_string(i) : group_path + "/" + std::to_string(i);
@@ -2373,8 +2420,13 @@ bool emit_writer_shapes(const Reference<css::container::XIndexAccess>& shapes,
         walk->shape_index++;
       }
       Reference<css::container::XIndexAccess> children(props, UNO_QUERY);
-      if (children.is()) {
-        if (!emit_writer_shapes(children, slot, walk, emit_fn, warner)) {
+      if (children.is() && depth >= kMaxShapeGroupDepth) {
+        warner.warn_once("shape groups nested deeper than "
+                         + std::to_string(kMaxShapeGroupDepth)
+                         + " levels were not descended");
+      } else if (children.is()) {
+        if (!emit_writer_shapes(children, slot, walk, emit_fn, warner,
+                                depth + 1)) {
           return false;
         }
       }
@@ -2646,12 +2698,13 @@ bool emit_text_frames(const Reference<css::text::XTextDocument>& text_doc,
 // emitted for image shapes across the whole document. DrawingShape events
 // are gated on the SHAPES part and image bytes on the IMAGES part; groups
 // are still recursed when only IMAGES is selected so nested image shapes
-// are found.
+// are found. depth counts the enclosing groups; children past
+// kMaxShapeGroupDepth are not descended.
 bool emit_shapes(const Reference<css::drawing::XShapes>& shapes,
                  int32_t page_index, const std::string& group_path,
                  const Reference<css::graphic::XGraphicProvider>& provider,
                  int32_t* image_counter, const PartSelection& parts,
-                 const EmitFn& emit_fn, Warner& warner) {
+                 const EmitFn& emit_fn, Warner& warner, int depth = 0) {
   bool want_shapes = parts.wants(officev1::DOCUMENT_PART_SHAPES);
   bool want_images = parts.wants(officev1::DOCUMENT_PART_IMAGES);
   for (sal_Int32 i = 0; i < shapes->getCount(); i++) {
@@ -2718,8 +2771,13 @@ bool emit_shapes(const Reference<css::drawing::XShapes>& shapes,
     out->set_is_group(children.is());
     if (want_shapes && !emit_fn(event)) return false;
     if (children.is()) {
-      if (!emit_shapes(children, page_index, shape_path, provider,
-                       image_counter, parts, emit_fn, warner)) {
+      if (depth >= kMaxShapeGroupDepth) {
+        warner.warn_once("shape groups nested deeper than "
+                         + std::to_string(kMaxShapeGroupDepth)
+                         + " levels were not descended");
+      } else if (!emit_shapes(children, page_index, shape_path, provider,
+                              image_counter, parts, emit_fn, warner,
+                              depth + 1)) {
         return false;
       }
       continue;
@@ -2877,7 +2935,7 @@ bool emit_slide_shape(const Reference<css::drawing::XShape>& shape,
                       bool want_slides,
                       const Reference<css::graphic::XGraphicProvider>& provider,
                       int32_t* image_counter, const EmitFn& emit_fn,
-                      Warner& warner) {
+                      Warner& warner, int depth = 0) {
   std::string shape_type = utf8(shape->getShapeType());
   std::string label = "slide " + std::to_string(slide_index) +
                       (notes ? " notes shape " : " shape ") +
@@ -2993,6 +3051,12 @@ bool emit_slide_shape(const Reference<css::drawing::XShape>& shape,
   if (shape_type.ends_with(".GroupShape")) {
     children = Reference<css::drawing::XShapes>(shape, UNO_QUERY);
   }
+  if (children.is() && depth >= kMaxShapeGroupDepth) {
+    warner.warn_once("shape groups nested deeper than "
+                     + std::to_string(kMaxShapeGroupDepth)
+                     + " levels were not descended");
+    children.clear();
+  }
   if (children.is()) {
     for (sal_Int32 i = 0; i < children->getCount(); i++) {
       Reference<css::drawing::XShape> child;
@@ -3008,7 +3072,7 @@ bool emit_slide_shape(const Reference<css::drawing::XShape>& shape,
       if (!child.is()) continue;
       if (!emit_slide_shape(child, slide_index, static_cast<int32_t>(i), notes,
                             want_slides, provider, image_counter, emit_fn,
-                            warner)) {
+                            warner, depth + 1)) {
         return false;
       }
     }
@@ -4516,12 +4580,10 @@ bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
   return true;
 }
 
-}  // namespace
-
-bool emit_typed_content(const PartSelection& parts, SelectionProbe* probe,
-                        const EmitFn& emit_fn,
-                        std::vector<std::string>* warnings) {
-  Warner warner(warnings);
+// emit_typed_content over a caller's Warner, so the redaction check can
+// count what the walk failed to read.
+bool emit_typed_content_with(const PartSelection& parts, SelectionProbe* probe,
+                             const EmitFn& emit_fn, Warner& warner) {
   try {
     Reference<css::uno::XComponentContext> context = process_context();
     if (!context.is()) {
@@ -4607,6 +4669,15 @@ bool emit_typed_content(const PartSelection& parts, SelectionProbe* probe,
     warner.warn("extraction aborted", error);
     return true;
   }
+}
+
+}  // namespace
+
+bool emit_typed_content(const PartSelection& parts, SelectionProbe* probe,
+                        const EmitFn& emit_fn,
+                        std::vector<std::string>* warnings) {
+  Warner warner(warnings);
+  return emit_typed_content_with(parts, probe, emit_fn, warner);
 }
 
 bool export_pdf_stream(const std::string& filter_name, size_t chunk_limit,
@@ -4901,70 +4972,1324 @@ void apply_form_fills(const Reference<css::frame::XModel>& model,
   }
 }
 
-void paint_redact_shapes(const Reference<css::frame::XModel>& model,
-                         const std::vector<RedactBox>& boxes,
-                         const std::vector<PageBox>& pages, Warner& warner) {
-  if (boxes.empty()) return;
-  try {
-    Reference<css::lang::XMultiServiceFactory> factory(model, UNO_QUERY);
-    Reference<css::drawing::XDrawPageSupplier> supplier(model, UNO_QUERY);
-    if (!factory.is() || !supplier.is()) return;
-    Reference<css::drawing::XDrawPage> page = supplier->getDrawPage();
-    if (!page.is()) return;
-    for (const RedactBox& box : boxes) {
-      Reference<css::drawing::XShape> shape(
-          factory->createInstance("com.sun.star.drawing.RectangleShape"),
-          UNO_QUERY);
-      if (!shape.is()) continue;
-      // Anchor to the box's page and position page-locally: Writer resolves
-      // an API-added shape's position relative to its anchor, so the default
-      // at-paragraph anchor would drift on every page after the first.
-      std::int64_t x_twips = box.x_twips;
-      std::int64_t y_twips = box.y_twips;
-      if (box.page_index >= 0
-          && static_cast<size_t>(box.page_index) < pages.size()) {
-        x_twips -= pages[static_cast<size_t>(box.page_index)].x;
-        y_twips -= pages[static_cast<size_t>(box.page_index)].y;
-      }
-      const sal_Int32 x = static_cast<sal_Int32>(x_twips * 127 / 72);
-      const sal_Int32 y = static_cast<sal_Int32>(y_twips * 127 / 72);
-      const sal_Int32 w = static_cast<sal_Int32>(box.width_twips * 127 / 72);
-      const sal_Int32 h = static_cast<sal_Int32>(box.height_twips * 127 / 72);
-      shape->setSize(css::awt::Size(w, h));
-      Reference<css::beans::XPropertySet> props(shape, UNO_QUERY);
-      if (props.is()) {
-        props->setPropertyValue("FillStyle",
-                                css::uno::Any(css::drawing::FillStyle_SOLID));
-        props->setPropertyValue("FillColor", css::uno::Any(sal_Int32(0)));
-        props->setPropertyValue("LineStyle",
-                                css::uno::Any(css::drawing::LineStyle_NONE));
-        try {
-          props->setPropertyValue(
-              "AnchorType",
-              css::uno::Any(css::text::TextContentAnchorType_AT_PAGE));
-          props->setPropertyValue(
-              "AnchorPageNo",
-              css::uno::Any(static_cast<sal_Int16>(box.page_index + 1)));
-        } catch (const css::uno::Exception&) {
-          // Not a Writer shape; absolute positioning below is already right.
-        }
-      }
-      page->add(shape);
-      shape->setPosition(css::awt::Point(x, y));
+// ---- Redaction ------------------------------------------------------------
+//
+// The request's spans resolve to text, and that text leaves the document
+// model, everywhere it occurs, before anything is laid out, painted,
+// exported, or extracted. Spans and matching count code points, the unit
+// of the annotation text space.
+
+// Every redacted code point becomes one U+2588 FULL BLOCK.
+constexpr sal_Unicode kRedactionGlyph = 0x2588;
+
+// Nested tables, content controls, and groups past this depth are beyond
+// the walks, so a redaction that would have to reach into them is refused.
+constexpr int kMaxRedactionNesting = kMaxShapeGroupDepth;
+
+using CodePoints = std::u32string;
+using Intervals = std::vector<std::pair<size_t, size_t>>;
+
+CodePoints code_points(const rtl::OUString& text) {
+  CodePoints out;
+  out.reserve(static_cast<size_t>(text.getLength()));
+  for (sal_Int32 i = 0; i < text.getLength();) {
+    out.push_back(static_cast<char32_t>(text.iterateCodePoints(&i)));
+  }
+  return out;
+}
+
+rtl::OUString from_code_points(const CodePoints& text) {
+  rtl::OUStringBuffer buffer(static_cast<sal_Int32>(text.size()));
+  for (char32_t c : text) buffer.appendUtf32(static_cast<sal_uInt32>(c));
+  return buffer.makeStringAndClear();
+}
+
+bool redaction_space(char32_t c) {
+  return c == U' ' || c == U'\t' || c == U'\n' || c == U'\r' || c == U'\v'
+      || c == U'\f' || c == 0x00A0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200B)
+      || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F
+      || c == 0x3000 || c == 0xFEFF;
+}
+
+// The intervals of text any piece covers, overlapping occurrences
+// included, sorted and merged.
+Intervals covered_intervals(const CodePoints& text,
+                            const std::vector<CodePoints>& pieces) {
+  Intervals found;
+  for (const CodePoints& piece : pieces) {
+    if (piece.empty() || piece.size() > text.size()) continue;
+    for (size_t at = text.find(piece); at != CodePoints::npos;
+         at = text.find(piece, at + 1)) {
+      found.emplace_back(at, at + piece.size());
     }
+  }
+  std::sort(found.begin(), found.end());
+  Intervals merged;
+  for (const auto& interval : found) {
+    if (!merged.empty() && interval.first <= merged.back().second) {
+      merged.back().second = std::max(merged.back().second, interval.second);
+    } else {
+      merged.push_back(interval);
+    }
+  }
+  return merged;
+}
+
+CodePoints masked(CodePoints text, const Intervals& intervals) {
+  for (const auto& [first, last] : intervals) {
+    for (size_t i = first; i < last && i < text.size(); i++) {
+      text[i] = kRedactionGlyph;
+    }
+  }
+  return text;
+}
+
+// One walk over the loaded document's text. kReplace rewrites every
+// occurrence of a piece to glyphs; kVerify only looks, and its first find
+// is the refusal. A region a walk can neither rewrite nor see into
+// refuses in either mode.
+struct RedactWalk {
+  enum class Mode { kReplace, kVerify };
+  Mode mode = Mode::kReplace;
+  std::vector<CodePoints> pieces;
+  Warner* warner = nullptr;
+  // The first refusal; every walk unwinds once it is set. It names the
+  // region, never the text found there.
+  std::string refusal;
+  // The embedding depth of the content being walked, for the walks inside
+  // an embedded object, where an object nested on a draw page is inspected
+  // in turn. -1 for the host document, whose objects are checked through
+  // check_embedded_objects instead.
+  int ole_depth = -1;
+
+  bool replacing() const { return mode == Mode::kReplace; }
+  bool refused() const { return !refusal.empty(); }
+  void refuse(const std::string& why) {
+    if (refusal.empty()) refusal = "redaction refused: " + why;
+  }
+  void remains_in(const std::string& region) {
+    refuse("redacted text remains in " + region);
+  }
+};
+
+// Rewrites (or checks) one string; returns the rewritten value, or
+// nothing when it carries no piece or the walk only verifies.
+std::optional<rtl::OUString> redact_value(const rtl::OUString& value,
+                                          const std::string& region,
+                                          RedactWalk& walk) {
+  CodePoints text = code_points(value);
+  Intervals intervals = covered_intervals(text, walk.pieces);
+  if (intervals.empty()) return std::nullopt;
+  if (!walk.replacing()) {
+    walk.remains_in(region);
+    return std::nullopt;
+  }
+  return from_code_points(masked(std::move(text), intervals));
+}
+
+// Rewrites (or checks) one string property; absent properties and
+// non-string values are skipped.
+void redact_property(const Reference<css::beans::XPropertySet>& props,
+                     const rtl::OUString& property, const std::string& region,
+                     RedactWalk& walk) {
+  if (!props.is() || walk.refused()) return;
+  try {
+    Reference<css::beans::XPropertySetInfo> info = props->getPropertySetInfo();
+    if (info.is() && !info->hasPropertyByName(property)) return;
+    rtl::OUString value;
+    if (!(props->getPropertyValue(property) >>= value)) return;
+    if (std::optional<rtl::OUString> rewritten =
+            redact_value(value, region, walk)) {
+      props->setPropertyValue(property, css::uno::Any(*rewritten));
+    }
+  } catch (const css::beans::UnknownPropertyException&) {
+    // Expected probe result: not every object of a family has the property.
   } catch (const css::uno::Exception& error) {
-    warner.warn("pdf redaction shapes", error);
+    // A rewrite that failed is caught by the verify walk, which reads the
+    // value again; a value the verify walk cannot read is not verified.
+    if (!walk.replacing()) walk.refuse(region + " cannot be inspected");
+    walk.warner->warn("redaction of " + region + " failed", error);
   }
 }
 
-bool span_overlaps(std::int64_t start, std::int64_t end,
-                   const std::vector<std::pair<std::int64_t, std::int64_t>>& spans) {
-  if (start < 0 || end < 0 || end <= start) return false;
-  for (const auto& span : spans) {
-    if (span.second <= span.first) continue;
-    if (start < span.second && end > span.first) return true;
+void redact_property(const Reference<css::beans::XPropertySet>& props,
+                     const char* name, const std::string& region,
+                     RedactWalk& walk) {
+  redact_property(props, rtl::OUString::createFromAscii(name), region, walk);
+}
+
+// Property names whose string values are the office core's vocabulary
+// (service, font, and fill-style names), never authored text, and which
+// other objects look up by value.
+bool vocabulary_property(const rtl::OUString& name) {
+  return name == "DefaultControl" || name == "Role" || name.indexOf("Font") >= 0
+      || name.endsWith("GradientName") || name.endsWith("HatchName")
+      || name.endsWith("BitmapName") || name.endsWith("DashName")
+      || name == "LineStartName" || name == "LineEndName";
+}
+
+// Rewrites (or checks) every string and every list of strings a property
+// set carries, vocabulary aside: for objects whose strings all end up on
+// the page or in the PDF: form controls and their forms, and image map
+// areas. In verify mode a property that cannot be read refuses.
+void redact_all_strings(const Reference<css::beans::XPropertySet>& props,
+                        const std::string& region, RedactWalk& walk) {
+  if (!props.is() || walk.refused()) return;
+  Reference<css::beans::XPropertySetInfo> info = props->getPropertySetInfo();
+  if (!info.is()) {
+    walk.refuse(region + " cannot be inspected");
+    return;
+  }
+  for (const css::beans::Property& property : info->getProperties()) {
+    if (walk.refused()) return;
+    if (vocabulary_property(property.Name)) continue;
+    // Only properties that can hold text are read: reading the others
+    // (a form's connection among them) can have side effects.
+    const css::uno::TypeClass type = property.Type.getTypeClass();
+    if (type != css::uno::TypeClass_STRING && type != css::uno::TypeClass_ANY
+        && property.Type != cppu::UnoType<css::uno::Sequence<rtl::OUString>>::get()) {
+      continue;
+    }
+    try {
+      css::uno::Any value = props->getPropertyValue(property.Name);
+      rtl::OUString text;
+      css::uno::Sequence<rtl::OUString> list;
+      if (value >>= text) {
+        if (std::optional<rtl::OUString> rewritten =
+                redact_value(text, region, walk)) {
+          props->setPropertyValue(property.Name, css::uno::Any(*rewritten));
+        }
+      } else if (value >>= list) {
+        bool changed = false;
+        for (sal_Int32 i = 0; i < list.getLength(); i++) {
+          if (std::optional<rtl::OUString> rewritten =
+                  redact_value(list[i], region, walk)) {
+            list.getArray()[i] = *rewritten;
+            changed = true;
+          }
+        }
+        if (changed) props->setPropertyValue(property.Name, css::uno::Any(list));
+      }
+    } catch (const css::uno::Exception& error) {
+      // As in redact_property: the verify walk reads every value again,
+      // and one it cannot read, listed as it is, is not verified.
+      if (!walk.replacing()) walk.refuse(region + " cannot be inspected");
+      walk.warner->warn("redaction of " + region + " failed", error);
+    }
+  }
+}
+
+// A stretch of paragraph text a walk may rewrite: a text portion, or a
+// text field whose rendered result becomes literal text when rewritten.
+struct TextSegment {
+  Reference<css::text::XTextRange> range;
+  Reference<css::beans::XPropertySet> props;
+  bool field = false;
+  CodePoints text;
+};
+
+// Checks (or rewrites) the strings a content control carries beside its
+// text: list entries, alias, and tag. Its text is walked as segments.
+void redact_content_control(const Reference<css::beans::XPropertySet>& control,
+                            const std::string& region, RedactWalk& walk) {
+  redact_property(control, "Alias", region + " (content control alias)", walk);
+  redact_property(control, "Tag", region + " (content control tag)", walk);
+  if (!control.is() || walk.refused()) return;
+  try {
+    css::uno::Sequence<css::uno::Sequence<css::beans::PropertyValue>> items;
+    if (!(control->getPropertyValue("ListItems") >>= items)) return;
+    bool changed = false;
+    for (sal_Int32 i = 0; i < items.getLength(); i++) {
+      css::uno::Sequence<css::beans::PropertyValue>& item = items.getArray()[i];
+      for (sal_Int32 j = 0; j < item.getLength(); j++) {
+        css::beans::PropertyValue& entry = item.getArray()[j];
+        rtl::OUString value;
+        if (!(entry.Value >>= value)) continue;
+        if (std::optional<rtl::OUString> rewritten = redact_value(
+                value, region + " (content control list entry)", walk)) {
+          entry.Value <<= *rewritten;
+          changed = true;
+        }
+      }
+    }
+    if (changed) control->setPropertyValue("ListItems", css::uno::Any(items));
+  } catch (const css::beans::UnknownPropertyException&) {
+    // Expected probe result: only list content controls carry entries.
+  } catch (const css::uno::Exception& error) {
+    if (!walk.replacing()) {
+      walk.refuse(region + " (a content control's list entries) cannot be "
+                  "inspected");
+    }
+    walk.warner->warn("redaction of " + region + " content control failed",
+                      error);
+  }
+}
+
+// Flattens a paragraph's portions into text segments in reading order,
+// descending into content controls and in-content metadata, whose text
+// the portion enumeration nests instead of listing. Text and field
+// portions contribute exactly what fill_runs puts in the annotation text
+// space; the remaining portion kinds carry no text of their own, and one
+// that does and holds a piece is a region the walk cannot rewrite.
+void collect_segments(const Reference<css::container::XEnumerationAccess>& portions_access,
+                      const std::string& region, int depth, RedactWalk& walk,
+                      std::vector<TextSegment>* out) {
+  if (depth > kMaxRedactionNesting) {
+    walk.refuse(region + " nests content controls deeper than "
+                + std::to_string(kMaxRedactionNesting) + " levels");
+    return;
+  }
+  Reference<css::container::XEnumeration> portions =
+      portions_access->createEnumeration();
+  while (portions->hasMoreElements() && !walk.refused()) {
+    css::uno::Any element = portions->nextElement();
+    Reference<css::text::XTextRange> range(element, UNO_QUERY);
+    Reference<css::beans::XPropertySet> props(element, UNO_QUERY);
+    if (!range.is() || !props.is()) continue;
+    rtl::OUString type;
+    try {
+      props->getPropertyValue("TextPortionType") >>= type;
+    } catch (const css::beans::UnknownPropertyException&) {
+      // Expected probe result: a portion without a type is plain text.
+      type = "Text";
+    }
+    if (type == "Text") {
+      out->push_back({range, props, false, code_points(range->getString())});
+    } else if (type == "TextField") {
+      rtl::OUString shown = range->getString();
+      if (shown.isEmpty()) {
+        Reference<css::text::XTextField> field;
+        try {
+          props->getPropertyValue("TextField") >>= field;
+        } catch (const css::beans::UnknownPropertyException&) {
+          // Expected probe result: a field portion may not expose its field.
+        }
+        if (field.is()) shown = field->getPresentation(false);
+      }
+      out->push_back({range, props, true, code_points(shown)});
+    } else if (type == "ContentControl" || type == "InContentMetadata") {
+      Reference<css::uno::XInterface> nested;
+      props->getPropertyValue(type) >>= nested;
+      if (type == "ContentControl") {
+        redact_content_control(
+            Reference<css::beans::XPropertySet>(nested, UNO_QUERY), region,
+            walk);
+      }
+      Reference<css::container::XEnumerationAccess> inner(nested, UNO_QUERY);
+      if (inner.is()) {
+        collect_segments(inner, region, depth + 1, walk, out);
+      } else if (!covered_intervals(code_points(range->getString()),
+                                    walk.pieces)
+                      .empty()) {
+        walk.remains_in(region + " (a nested text that cannot be walked)");
+      }
+    } else if (type == "Ruby") {
+      redact_property(props, "RubyText", region + " (ruby text)", walk);
+    } else if (type == "DocumentIndexMark") {
+      Reference<css::beans::XPropertySet> mark;
+      props->getPropertyValue("DocumentIndexMark") >>= mark;
+      for (const char* name : {"AlternativeText", "PrimaryKey", "SecondaryKey"}) {
+        redact_property(mark, name, region + " (an index entry)", walk);
+      }
+    } else if (!covered_intervals(code_points(range->getString()), walk.pieces)
+                    .empty()) {
+      walk.remains_in(region + " (a " + utf8(type) + " portion)");
+    }
+  }
+}
+
+// Steps a cursor right by count characters; the UNO call takes a short.
+void step_right(const Reference<css::text::XTextCursor>& cursor, size_t count,
+                bool expand) {
+  while (count > 0) {
+    const sal_Int16 step = static_cast<sal_Int16>(std::min<size_t>(count, 32767));
+    cursor->goRight(step, expand);
+    count -= static_cast<size_t>(step);
+  }
+}
+
+rtl::OUString glyphs(size_t count) {
+  rtl::OUStringBuffer buffer(static_cast<sal_Int32>(count));
+  for (size_t i = 0; i < count; i++) buffer.append(kRedactionGlyph);
+  return buffer.makeStringAndClear();
+}
+
+// Draws rewritten text black on black, so the glyphs read as a solid bar
+// whatever color the text had. Best effort: the glyphs alone already
+// carry nothing of the original.
+void blacken(const Reference<css::beans::XPropertySet>& props) {
+  if (!props.is()) return;
+  for (const auto& [name, value] :
+       {std::pair<const char*, css::uno::Any>{"CharColor",
+                                              css::uno::Any(sal_Int32(0))},
+        {"CharBackColor", css::uno::Any(sal_Int32(0))},
+        {"CharBackTransparent", css::uno::Any(false)}}) {
+    try {
+      props->setPropertyValue(rtl::OUString::createFromAscii(name), value);
+    } catch (const css::uno::Exception&) {
+      // Not every text family carries every character property.
+    }
+  }
+}
+
+// Rewrites the covered code points of one segment to glyphs. A text
+// portion of BMP characters is edited in place through a cursor, which
+// keeps the formatting of the characters it leaves alone. A field, or a
+// portion holding characters outside the BMP (where Writer's cursors step
+// by code point and the drawing text's by UTF-16 unit), is replaced whole.
+void rewrite_segment(const TextSegment& segment, const Intervals& local,
+                     const std::string& region, RedactWalk& walk) {
+  try {
+    const bool bmp = std::ranges::all_of(
+        segment.text, [](char32_t c) { return c < 0x10000; });
+    if (!segment.field && bmp) {
+      Reference<css::text::XText> text = segment.range->getText();
+      for (auto it = local.rbegin(); it != local.rend(); ++it) {
+        Reference<css::text::XTextCursor> cursor =
+            text->createTextCursorByRange(segment.range->getStart());
+        step_right(cursor, it->first, false);
+        step_right(cursor, it->second - it->first, true);
+        cursor->setString(glyphs(it->second - it->first));
+        blacken(Reference<css::beans::XPropertySet>(cursor, UNO_QUERY));
+      }
+      return;
+    }
+    segment.range->setString(from_code_points(masked(segment.text, local)));
+  } catch (const css::uno::Exception& error) {
+    // The verify walk finds whatever this left behind and refuses.
+    walk.warner->warn("redaction rewrite in " + region + " failed", error);
+  }
+}
+
+// Rewrites (or checks) one paragraph: its hyperlink targets, then every
+// covered stretch of its text, the rightmost first so no rewrite moves a
+// range still to come.
+void redact_paragraph(const Reference<css::container::XEnumerationAccess>& paragraph,
+                      const std::string& region, RedactWalk& walk) {
+  std::vector<TextSegment> segments;
+  collect_segments(paragraph, region, 0, walk, &segments);
+  if (walk.refused() || segments.empty()) return;
+  for (const TextSegment& segment : segments) {
+    for (const char* name : {"HyperLinkURL", "HyperLinkName", "HyperLinkTarget"}) {
+      redact_property(segment.props, name, region + " (a hyperlink)", walk);
+    }
+  }
+  if (walk.refused()) return;
+  CodePoints joined;
+  std::vector<size_t> starts;
+  for (const TextSegment& segment : segments) {
+    starts.push_back(joined.size());
+    joined += segment.text;
+  }
+  Intervals intervals = covered_intervals(joined, walk.pieces);
+  if (intervals.empty()) return;
+  if (!walk.replacing()) {
+    walk.remains_in(region);
+    return;
+  }
+  for (size_t s = segments.size(); s-- > 0;) {
+    const size_t begin = starts[s];
+    const size_t end = begin + segments[s].text.size();
+    Intervals local;
+    for (const auto& [first, last] : intervals) {
+      const size_t lo = std::max(first, begin);
+      const size_t hi = std::min(last, end);
+      if (lo < hi) local.emplace_back(lo - begin, hi - begin);
+    }
+    if (!local.empty()) rewrite_segment(segments[s], local, region, walk);
+  }
+}
+
+// Walks every paragraph of a text, descending into its tables. Elements
+// are collected first, so rewriting never races the enumeration.
+void redact_text(const Reference<css::text::XText>& text,
+                 const std::string& region, int depth, RedactWalk& walk) {
+  if (!text.is() || walk.refused()) return;
+  if (depth > kMaxRedactionNesting) {
+    walk.refuse(region + " nests tables deeper than "
+                + std::to_string(kMaxRedactionNesting) + " levels");
+    return;
+  }
+  Reference<css::container::XEnumerationAccess> access(text, UNO_QUERY);
+  if (!access.is()) {
+    if (!covered_intervals(code_points(text->getString()), walk.pieces).empty()) {
+      walk.remains_in(region + " (a text that cannot be walked)");
+    }
+    return;
+  }
+  std::vector<css::uno::Any> elements;
+  Reference<css::container::XEnumeration> it = access->createEnumeration();
+  while (it->hasMoreElements()) elements.push_back(it->nextElement());
+  for (const css::uno::Any& element : elements) {
+    if (walk.refused()) return;
+    Reference<css::text::XTextTable> table(element, UNO_QUERY);
+    if (table.is()) {
+      for (const rtl::OUString& name : table->getCellNames()) {
+        Reference<css::text::XText> cell(table->getCellByName(name), UNO_QUERY);
+        redact_text(cell, region + " (a table cell)", depth + 1, walk);
+      }
+      continue;
+    }
+    Reference<css::container::XEnumerationAccess> paragraph(element, UNO_QUERY);
+    if (paragraph.is()) redact_paragraph(paragraph, region, walk);
+  }
+}
+
+// The alt text every shape, frame, image, and object can carry.
+void redact_alt_text(const Reference<css::beans::XPropertySet>& props,
+                     const std::string& region, RedactWalk& walk) {
+  redact_property(props, "Title", region + " (alt text title)", walk);
+  redact_property(props, "Description", region + " (alt text description)", walk);
+}
+
+// Object names ride the typed events, and other objects refer to them by
+// name (text-frame chains), so they are checked, never rewritten.
+void check_name(const Reference<css::container::XNamed>& named,
+                const std::string& region, RedactWalk& walk) {
+  if (!named.is() || walk.refused()) return;
+  if (!covered_intervals(code_points(named->getName()), walk.pieces).empty()) {
+    walk.remains_in(region + " (its name, which is not rewritten)");
+  }
+}
+
+// The links an object itself carries, beside any in its text: the
+// hyperlink on an image, shape, frame, or object (which the PDF export
+// writes as a link annotation), a drawing's click target, and the areas
+// of an image map.
+void redact_object_links(const Reference<css::beans::XPropertySet>& props,
+                         const std::string& region, RedactWalk& walk) {
+  for (const char* name : {"HyperLinkURL", "HyperLinkName", "HyperLinkTarget",
+                           "Hyperlink", "Bookmark"}) {
+    redact_property(props, name, region + " (its hyperlink)", walk);
+  }
+  if (!props.is() || walk.refused()) return;
+  try {
+    Reference<css::beans::XPropertySetInfo> info = props->getPropertySetInfo();
+    if (info.is() && !info->hasPropertyByName("ImageMap")) return;
+    Reference<css::container::XIndexAccess> areas;
+    props->getPropertyValue("ImageMap") >>= areas;
+    if (!areas.is() || areas->getCount() == 0) return;
+    for (sal_Int32 i = 0; i < areas->getCount(); i++) {
+      redact_all_strings(
+          Reference<css::beans::XPropertySet>(areas->getByIndex(i), UNO_QUERY),
+          region + " (an image map area)", walk);
+    }
+    // The property hands out a copy; the rewritten areas go back whole.
+    if (walk.replacing()) {
+      props->setPropertyValue("ImageMap", css::uno::Any(areas));
+    }
+  } catch (const css::beans::UnknownPropertyException&) {
+    // Expected probe result: not every object carries an image map.
+  } catch (const css::uno::Exception& error) {
+    if (!walk.replacing()) walk.refuse(region + " (its image map) cannot be inspected");
+    walk.warner->warn("redaction of " + region + " image map failed", error);
+  }
+}
+
+// Every form and control model under a container, nested forms and grid
+// columns included: control names, labels, values, help texts, list
+// entries, and submit or button URLs all reach the page or the PDF's form
+// fields.
+void redact_form_tree(const Reference<css::container::XIndexAccess>& container,
+                      int depth, RedactWalk& walk) {
+  if (depth > kMaxRedactionNesting) {
+    walk.refuse("forms nest deeper than " + std::to_string(kMaxRedactionNesting)
+                + " levels");
+    return;
+  }
+  for (sal_Int32 i = 0; container.is() && i < container->getCount(); i++) {
+    if (walk.refused()) return;
+    css::uno::Any element = container->getByIndex(i);
+    redact_all_strings(Reference<css::beans::XPropertySet>(element, UNO_QUERY),
+                       "a form control", walk);
+    redact_form_tree(Reference<css::container::XIndexAccess>(element, UNO_QUERY),
+                     depth + 1, walk);
+  }
+}
+
+void redact_forms(const Reference<css::uno::XInterface>& page, RedactWalk& walk) {
+  Reference<css::form::XFormsSupplier2> supplier(page, UNO_QUERY);
+  // hasForms first: getForms would create an empty collection.
+  if (!supplier.is() || !supplier->hasForms() || walk.refused()) return;
+  redact_form_tree(Reference<css::container::XIndexAccess>(supplier->getForms(),
+                                                           UNO_QUERY),
+                   0, walk);
+}
+
+// The cells of a drawing's table shape, each its own text.
+void redact_table_shape(const Reference<css::beans::XPropertySet>& props,
+                        RedactWalk& walk) {
+  css::uno::Any model = props->getPropertyValue("Model");
+  Reference<css::table::XCellRange> cells(model, UNO_QUERY);
+  Reference<css::table::XColumnRowRange> grid(model, UNO_QUERY);
+  if (!cells.is() || !grid.is()) {
+    walk.refuse("a table shape whose cells cannot be walked");
+    return;
+  }
+  const sal_Int32 rows = grid->getRows()->getCount();
+  const sal_Int32 columns = grid->getColumns()->getCount();
+  for (sal_Int32 r = 0; r < rows; r++) {
+    for (sal_Int32 c = 0; c < columns; c++) {
+      if (walk.refused()) return;
+      redact_text(Reference<css::text::XText>(cells->getCellByPosition(c, r),
+                                              UNO_QUERY),
+                  "a table shape cell", 1, walk);
+    }
+  }
+}
+
+void inspect_ole_shape(const Reference<css::beans::XPropertySet>& props,
+                       RedactWalk& walk);
+
+// Walks a draw page: shape text (imported textboxes resolve to their
+// backing frame's text), alt text, object links, table-shape cells, and
+// form control models, groups recursed. Text frames are walked through
+// the frame collection instead. Inside an embedded object (ole_depth set)
+// an object nested on the page is inspected in turn.
+void redact_shapes(const Reference<css::container::XIndexAccess>& shapes,
+                   int depth, RedactWalk& walk) {
+  for (sal_Int32 i = 0; shapes.is() && i < shapes->getCount(); i++) {
+    if (walk.refused()) return;
+    Reference<css::beans::XPropertySet> props(shapes->getByIndex(i), UNO_QUERY);
+    Reference<css::lang::XServiceInfo> services(props, UNO_QUERY);
+    if (!props.is() || !services.is()) continue;
+    if (services->supportsService("com.sun.star.text.TextFrame")) continue;
+    redact_alt_text(props, "a drawing shape", walk);
+    check_name(Reference<css::container::XNamed>(props, UNO_QUERY),
+               "a drawing shape", walk);
+    redact_object_links(props, "a drawing shape", walk);
+    if (walk.refused()) return;
+    if (services->supportsService("com.sun.star.drawing.ControlShape")) {
+      // The form walk reaches the same model; this covers a control whose
+      // model sits outside the page's forms.
+      Reference<css::drawing::XControlShape> control(props, UNO_QUERY);
+      redact_all_strings(
+          Reference<css::beans::XPropertySet>(
+              control.is() ? control->getControl()
+                           : Reference<css::awt::XControlModel>(),
+              UNO_QUERY),
+          "a form control", walk);
+      continue;
+    }
+    if (services->supportsService("com.sun.star.drawing.OLE2Shape")) {
+      if (walk.ole_depth >= 0) inspect_ole_shape(props, walk);
+      continue;
+    }
+    if (services->supportsService("com.sun.star.drawing.TableShape")) {
+      redact_table_shape(props, walk);
+      continue;
+    }
+    if (services->supportsService("com.sun.star.drawing.GroupShape")) {
+      if (depth >= kMaxShapeGroupDepth) {
+        walk.refuse("shape groups nested deeper than "
+                    + std::to_string(kMaxShapeGroupDepth)
+                    + " levels cannot be redacted");
+        return;
+      }
+      redact_shapes(Reference<css::container::XIndexAccess>(props, UNO_QUERY),
+                    depth + 1, walk);
+      continue;
+    }
+    redact_text(Reference<css::text::XText>(props, UNO_QUERY), "a drawing shape",
+                0, walk);
+  }
+}
+
+// Every header and footer text of every page style, first-page and
+// left-page variants included, used or not.
+void redact_headers_footers(const Reference<css::frame::XModel>& model,
+                            RedactWalk& walk) {
+  Reference<css::style::XStyleFamiliesSupplier> supplier(model, UNO_QUERY);
+  if (!supplier.is()) return;
+  Reference<css::container::XNameAccess> families = supplier->getStyleFamilies();
+  if (!families.is() || !families->hasByName("PageStyles")) return;
+  Reference<css::container::XIndexAccess> styles;
+  families->getByName("PageStyles") >>= styles;
+  for (sal_Int32 i = 0; styles.is() && i < styles->getCount(); i++) {
+    Reference<css::beans::XPropertySet> props(styles->getByIndex(i), UNO_QUERY);
+    if (!props.is()) continue;
+    for (const char* name :
+         {"HeaderText", "HeaderTextLeft", "HeaderTextRight", "HeaderTextFirst",
+          "FooterText", "FooterTextLeft", "FooterTextRight", "FooterTextFirst"}) {
+      Reference<css::text::XText> text;
+      try {
+        props->getPropertyValue(rtl::OUString::createFromAscii(name)) >>= text;
+      } catch (const css::beans::UnknownPropertyException&) {
+        // Expected probe result: not every core names every variant.
+        continue;
+      }
+      redact_text(text,
+                  std::string_view(name).starts_with("Header") ? "a page header"
+                                                               : "a page footer",
+                  0, walk);
+      if (walk.refused()) return;
+    }
+  }
+}
+
+void redact_notes(const Reference<css::text::XTextDocument>& text_doc,
+                  RedactWalk& walk) {
+  Reference<css::text::XFootnotesSupplier> footnotes(text_doc, UNO_QUERY);
+  Reference<css::text::XEndnotesSupplier> endnotes(text_doc, UNO_QUERY);
+  for (const auto& [notes, region] :
+       {std::pair<Reference<css::container::XIndexAccess>, const char*>{
+            footnotes.is() ? footnotes->getFootnotes()
+                           : Reference<css::container::XIndexAccess>(),
+            "a footnote"},
+        {endnotes.is() ? endnotes->getEndnotes()
+                       : Reference<css::container::XIndexAccess>(),
+         "an endnote"}}) {
+    for (sal_Int32 i = 0; notes.is() && i < notes->getCount(); i++) {
+      redact_text(Reference<css::text::XText>(notes->getByIndex(i), UNO_QUERY),
+                  region, 0, walk);
+    }
+  }
+}
+
+void redact_frames(const Reference<css::text::XTextDocument>& text_doc,
+                   RedactWalk& walk) {
+  Reference<css::text::XTextFramesSupplier> supplier(text_doc, UNO_QUERY);
+  if (!supplier.is()) return;
+  Reference<css::container::XIndexAccess> frames(supplier->getTextFrames(),
+                                                 UNO_QUERY);
+  for (sal_Int32 i = 0; frames.is() && i < frames->getCount(); i++) {
+    Reference<css::text::XTextFrame> frame(frames->getByIndex(i), UNO_QUERY);
+    if (!frame.is()) continue;
+    redact_alt_text(Reference<css::beans::XPropertySet>(frame, UNO_QUERY),
+                    "a text frame", walk);
+    redact_object_links(Reference<css::beans::XPropertySet>(frame, UNO_QUERY),
+                        "a text frame", walk);
+    check_name(Reference<css::container::XNamed>(frame, UNO_QUERY),
+               "a text frame", walk);
+    redact_text(frame->getText(), "a text frame", 0, walk);
+  }
+}
+
+// Comment content, author, and initials. The anchored text is body text.
+void redact_comments(const Reference<css::text::XTextDocument>& text_doc,
+                     RedactWalk& walk) {
+  Reference<css::text::XTextFieldsSupplier> supplier(text_doc, UNO_QUERY);
+  if (!supplier.is()) return;
+  Reference<css::container::XEnumerationAccess> access = supplier->getTextFields();
+  if (!access.is()) return;
+  std::vector<Reference<css::beans::XPropertySet>> comments;
+  Reference<css::container::XEnumeration> it = access->createEnumeration();
+  while (it->hasMoreElements()) {
+    Reference<css::lang::XServiceInfo> field(it->nextElement(), UNO_QUERY);
+    if (field.is() &&
+        (field->supportsService("com.sun.star.text.textfield.Annotation") ||
+         field->supportsService("com.sun.star.text.TextField.Annotation"))) {
+      comments.emplace_back(field, UNO_QUERY);
+    }
+  }
+  for (const Reference<css::beans::XPropertySet>& comment : comments) {
+    redact_property(comment, "Content", "a comment", walk);
+    redact_property(comment, "Author", "a comment's author", walk);
+    redact_property(comment, "Initials", "a comment's initials", walk);
+  }
+}
+
+// The stored document properties, which also become the PDF's document
+// information. Custom property names cannot be rewritten; the typed check
+// refuses when one carries a piece.
+void redact_document_properties(const Reference<css::frame::XModel>& model,
+                                RedactWalk& walk) {
+  Reference<css::document::XDocumentPropertiesSupplier> supplier(model, UNO_QUERY);
+  if (!supplier.is()) return;
+  Reference<css::document::XDocumentProperties> props =
+      supplier->getDocumentProperties();
+  if (!props.is()) return;
+  auto rewrite = [&](const rtl::OUString& value, const char* what,
+                     const std::function<void(const rtl::OUString&)>& set) {
+    if (std::optional<rtl::OUString> rewritten = redact_value(
+            value, std::string("the document's ") + what, walk)) {
+      set(*rewritten);
+    }
+  };
+  rewrite(props->getTitle(), "title", [&](auto& v) { props->setTitle(v); });
+  rewrite(props->getSubject(), "subject", [&](auto& v) { props->setSubject(v); });
+  rewrite(props->getDescription(), "description",
+          [&](auto& v) { props->setDescription(v); });
+  rewrite(props->getAuthor(), "author", [&](auto& v) { props->setAuthor(v); });
+  rewrite(props->getModifiedBy(), "last editor",
+          [&](auto& v) { props->setModifiedBy(v); });
+  rewrite(props->getPrintedBy(), "last printer",
+          [&](auto& v) { props->setPrintedBy(v); });
+  rewrite(props->getTemplateName(), "template name",
+          [&](auto& v) { props->setTemplateName(v); });
+  css::uno::Sequence<rtl::OUString> keywords = props->getKeywords();
+  bool keywords_changed = false;
+  for (sal_Int32 i = 0; i < keywords.getLength(); i++) {
+    if (std::optional<rtl::OUString> rewritten =
+            redact_value(keywords[i], "the document's keywords", walk)) {
+      keywords.getArray()[i] = *rewritten;
+      keywords_changed = true;
+    }
+  }
+  if (keywords_changed) props->setKeywords(keywords);
+  Reference<css::beans::XPropertySet> custom(props->getUserDefinedProperties(),
+                                             UNO_QUERY);
+  if (custom.is()) {
+    for (const css::beans::Property& property :
+         custom->getPropertySetInfo()->getProperties()) {
+      redact_property(custom, property.Name, "a custom document property",
+                      walk);
+    }
+  }
+}
+
+// Style names ride the typed events (paragraph and character styles on
+// paragraphs and runs, page styles on pages and headers). A user-defined
+// style named after the redacted text is renamed; built-in names are the
+// office core's vocabulary and stay, and the typed check skips them.
+void redact_style_names(const Reference<css::frame::XModel>& model,
+                        RedactWalk& walk) {
+  Reference<css::style::XStyleFamiliesSupplier> supplier(model, UNO_QUERY);
+  if (!supplier.is()) return;
+  Reference<css::container::XNameAccess> families = supplier->getStyleFamilies();
+  if (!families.is()) return;
+  for (const char* family_name :
+       {"ParagraphStyles", "CharacterStyles", "PageStyles"}) {
+    const rtl::OUString family_key = rtl::OUString::createFromAscii(family_name);
+    if (!families->hasByName(family_key)) continue;
+    Reference<css::container::XNameAccess> family;
+    families->getByName(family_key) >>= family;
+    if (!family.is()) continue;
+    for (const rtl::OUString& name : family->getElementNames()) {
+      if (walk.refused()) return;
+      Reference<css::style::XStyle> style;
+      family->getByName(name) >>= style;
+      if (!style.is() || !style->isUserDefined()) continue;
+      if (std::optional<rtl::OUString> rewritten =
+              redact_value(style->getName(), "a style name", walk)) {
+        try {
+          style->setName(*rewritten);
+        } catch (const css::uno::Exception& error) {
+          // The verify walk reads the name again and refuses if it stayed.
+          walk.warner->warn("redaction of a style name failed", error);
+        }
+      }
+    }
+  }
+}
+
+// One full rewrite (or check) pass over a text document's text-bearing
+// regions. In replace mode the document indexes are regenerated last, from
+// headings that are already rewritten.
+void redact_text_document(const Reference<css::text::XTextDocument>& text_doc,
+                          const Reference<css::frame::XModel>& model,
+                          RedactWalk& walk) {
+  redact_document_properties(model, walk);
+  redact_style_names(model, walk);
+  redact_comments(text_doc, walk);
+  redact_text(text_doc->getText(), "the document body", 0, walk);
+  redact_headers_footers(model, walk);
+  redact_notes(text_doc, walk);
+  redact_frames(text_doc, walk);
+  Reference<css::drawing::XDrawPageSupplier> page(text_doc, UNO_QUERY);
+  if (page.is()) {
+    Reference<css::drawing::XDrawPage> draw_page = page->getDrawPage();
+    redact_shapes(Reference<css::container::XIndexAccess>(draw_page, UNO_QUERY),
+                  0, walk);
+    redact_forms(draw_page, walk);
+  }
+  Reference<css::text::XDocumentIndexesSupplier> indexes_supplier(text_doc,
+                                                                  UNO_QUERY);
+  Reference<css::container::XIndexAccess> indexes(
+      indexes_supplier.is() ? indexes_supplier->getDocumentIndexes()
+                            : Reference<css::container::XIndexAccess>(),
+      UNO_QUERY);
+  for (sal_Int32 i = 0; indexes.is() && i < indexes->getCount(); i++) {
+    if (walk.refused()) return;
+    Reference<css::text::XDocumentIndex> index(indexes->getByIndex(i), UNO_QUERY);
+    if (!index.is()) continue;
+    redact_property(Reference<css::beans::XPropertySet>(index, UNO_QUERY),
+                    "Title", "a document index title", walk);
+    if (walk.replacing()) {
+      try {
+        index->update();
+      } catch (const css::uno::Exception& error) {
+        walk.warner->warn("redaction: index regeneration failed", error);
+      }
+    }
+  }
+}
+
+// Fields whose values are the office core's vocabulary rather than
+// anything authored: font names, the names of built-in styles (user-defined
+// style names are rewritten by redact_style_names and checked there),
+// language tags, field and shape service names, media types, class ids,
+// change kinds, and cell addresses. A redacted word that happens to name a
+// built-in style ("Heading", "Strong") or a field ("Page") reveals nothing
+// through them, so they do not count as the text surviving.
+const std::set<std::string>& vocabulary_fields() {
+  static const std::set<std::string> fields = [] {
+    std::set<std::string> names;
+    const std::string package = "ai.pipestream.office.v1.";
+    for (const char* field :
+         {"TextRun.font", "TextRun.language", "TextRun.field_code",
+          "TextRun.char_style", "Paragraph.style", "PageStyleInfo.name",
+          "HeaderFooter.page_style", "Shape.shape_type", "DrawingShape.shape_type",
+          "SlideShape.shape_type", "EmbeddedImage.mime_type",
+          "EmbeddedObject.clsid", "EmbeddedObject.replacement_mime_type",
+          "EmbeddedChart.chart_type_service", "TrackedChange.kind_name",
+          "TrackedChange.identifier", "TrackedChangeSuccessor.kind_name",
+          "FormField.field_type", "DocumentIndex.type",
+          "DocumentMetadata.generator", "DocumentMetadata.language",
+          "DocumentMetadata.StatisticsEntry.key", "TableCellData.name"}) {
+      names.insert(package + field);
+    }
+    return names;
+  }();
+  return fields;
+}
+
+// Finds the first string field of message, depth first, that carries a
+// redacted string, the joined text of every run list included, and names
+// it as a dotted field path. Vocabulary fields are not searched.
+bool find_redacted(const google::protobuf::Message& message,
+                   const std::vector<std::string>& redacted,
+                   const std::string& path, std::string* where) {
+  auto carries = [&](const std::string& value) {
+    for (const std::string& piece : redacted) {
+      if (!piece.empty() && value.find(piece) != std::string::npos) return true;
+    }
+    return false;
+  };
+  const google::protobuf::Reflection* reflection = message.GetReflection();
+  std::vector<const google::protobuf::FieldDescriptor*> fields;
+  reflection->ListFields(message, &fields);
+  for (const google::protobuf::FieldDescriptor* field : fields) {
+    const std::string name =
+        path.empty() ? std::string(field->name())
+                     : path + "." + std::string(field->name());
+    if (field->type() == google::protobuf::FieldDescriptor::TYPE_STRING) {
+      if (vocabulary_fields().contains(std::string(field->full_name()))) continue;
+      const int count = field->is_repeated() ? reflection->FieldSize(message, field) : 1;
+      for (int i = 0; i < count; i++) {
+        const std::string value =
+            field->is_repeated() ? reflection->GetRepeatedString(message, field, i)
+                                 : reflection->GetString(message, field);
+        if (carries(value)) {
+          *where = name;
+          return true;
+        }
+      }
+    } else if (field->cpp_type() ==
+               google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE) {
+      if (!field->is_repeated()) {
+        if (find_redacted(reflection->GetMessage(message, field), redacted, name,
+                          where)) {
+          return true;
+        }
+        continue;
+      }
+      const int count = reflection->FieldSize(message, field);
+      if (field->message_type() == officev1::TextRun::descriptor()) {
+        std::string joined;
+        for (int i = 0; i < count; i++) {
+          joined += static_cast<const officev1::TextRun&>(
+                        reflection->GetRepeatedMessage(message, field, i))
+                        .text();
+        }
+        if (carries(joined)) {
+          *where = name;
+          return true;
+        }
+      }
+      for (int i = 0; i < count; i++) {
+        if (find_redacted(reflection->GetRepeatedMessage(message, field, i),
+                          redacted, name, where)) {
+          return true;
+        }
+      }
+    }
   }
   return false;
+}
+
+void check_embedded_objects(const Reference<css::text::XTextDocument>& text_doc,
+                            RedactWalk& walk, int depth = 0);
+void inspect_model(const Reference<css::frame::XModel>& inner, RedactWalk& look,
+                   int depth);
+
+// The text of a chart title (the main title, the subtitle, an axis title).
+void check_chart_title(const Reference<css::chart2::XTitled>& titled,
+                       const std::string& region, RedactWalk& look) {
+  if (!titled.is()) return;
+  Reference<css::chart2::XTitle> title = titled->getTitleObject();
+  if (!title.is()) return;
+  for (const Reference<css::chart2::XFormattedString>& part : title->getText()) {
+    if (part.is()) redact_value(part->getString(), region, look);
+  }
+}
+
+// The text a data sequence shows: a label, a category, or a value as
+// text.
+void check_chart_sequence(const Reference<css::chart2::data::XDataSequence>& data,
+                          const std::string& region, RedactWalk& look) {
+  Reference<css::chart2::data::XTextualDataSequence> texts(data, UNO_QUERY);
+  if (!texts.is()) return;
+  for (const rtl::OUString& text : texts->getTextualData()) {
+    redact_value(text, region, look);
+  }
+}
+
+// The text a data series or data point adds to its data labels: custom
+// label fields and the label separator.
+void check_chart_points(const Reference<css::beans::XPropertySet>& props,
+                        const std::string& region, RedactWalk& look) {
+  if (!props.is() || look.refused()) return;
+  redact_property(props, "LabelSeparator", region + " (a data label)", look);
+  Reference<css::beans::XPropertySetInfo> info = props->getPropertySetInfo();
+  if (!info.is() || !info->hasPropertyByName("CustomLabelFields")) return;
+  css::uno::Sequence<Reference<css::chart2::XDataPointCustomLabelField>> fields;
+  props->getPropertyValue("CustomLabelFields") >>= fields;
+  for (const Reference<css::chart2::XDataPointCustomLabelField>& field : fields) {
+    if (field.is()) redact_value(field->getString(), region + " (a data label)", look);
+  }
+}
+
+// Looks at every text an embedded chart can draw: the title and subtitle,
+// every axis title and category on every axis of every dimension, series
+// names (which the legend shows) and their values as text, custom data
+// labels on the series and on each formatted point, trend line names,
+// the internal data table's row and column labels, and shapes drawn on
+// the chart. Every UNO failure propagates, so the inspection refuses.
+void inspect_chart(const Reference<css::chart2::XChartDocument>& chart,
+                   RedactWalk& look) {
+  check_chart_title(Reference<css::chart2::XTitled>(chart, UNO_QUERY),
+                    "the chart title", look);
+  Reference<css::chart2::XDiagram> diagram = chart->getFirstDiagram();
+  if (diagram.is()) {
+    check_chart_title(Reference<css::chart2::XTitled>(diagram, UNO_QUERY),
+                      "the chart subtitle", look);
+    Reference<css::chart2::XCoordinateSystemContainer> systems(diagram, UNO_QUERY);
+    for (const Reference<css::chart2::XCoordinateSystem>& coord :
+         systems.is() ? systems->getCoordinateSystems()
+                      : css::uno::Sequence<Reference<css::chart2::XCoordinateSystem>>()) {
+      if (!coord.is() || look.refused()) continue;
+      for (sal_Int32 dimension = 0; dimension < coord->getDimension(); dimension++) {
+        const sal_Int32 last = coord->getMaximumAxisIndexByDimension(dimension);
+        for (sal_Int32 index = 0; index <= last; index++) {
+          Reference<css::chart2::XAxis> axis =
+              coord->getAxisByDimension(dimension, index);
+          if (!axis.is()) continue;
+          check_chart_title(Reference<css::chart2::XTitled>(axis, UNO_QUERY),
+                            "a chart axis title", look);
+          css::chart2::ScaleData scale = axis->getScaleData();
+          if (scale.Categories.is()) {
+            check_chart_sequence(scale.Categories->getLabel(),
+                                 "a chart category label", look);
+            check_chart_sequence(scale.Categories->getValues(),
+                                 "a chart category", look);
+          }
+        }
+      }
+      Reference<css::chart2::XChartTypeContainer> types(coord, UNO_QUERY);
+      if (!types.is()) continue;
+      for (const Reference<css::chart2::XChartType>& type : types->getChartTypes()) {
+        Reference<css::chart2::XDataSeriesContainer> container(type, UNO_QUERY);
+        if (!container.is()) continue;
+        for (const Reference<css::chart2::XDataSeries>& series :
+             container->getDataSeries()) {
+          if (!series.is() || look.refused()) continue;
+          Reference<css::beans::XPropertySet> series_props(series, UNO_QUERY);
+          check_chart_points(series_props, "a chart series", look);
+          css::uno::Sequence<sal_Int32> points;
+          if (series_props.is()) {
+            series_props->getPropertyValue("AttributedDataPoints") >>= points;
+          }
+          for (sal_Int32 point : points) {
+            check_chart_points(series->getDataPointByIndex(point),
+                               "a chart data point", look);
+          }
+          Reference<css::chart2::data::XDataSource> source(series, UNO_QUERY);
+          if (source.is()) {
+            for (const Reference<css::chart2::data::XLabeledDataSequence>& labeled :
+                 source->getDataSequences()) {
+              if (!labeled.is()) continue;
+              check_chart_sequence(labeled->getLabel(), "a chart series name",
+                                   look);
+              check_chart_sequence(labeled->getValues(), "a chart value", look);
+            }
+          }
+          Reference<css::chart2::XRegressionCurveContainer> curves(series,
+                                                                   UNO_QUERY);
+          if (!curves.is()) continue;
+          for (const Reference<css::chart2::XRegressionCurve>& curve :
+               curves->getRegressionCurves()) {
+            if (!curve.is()) continue;
+            redact_property(Reference<css::beans::XPropertySet>(curve, UNO_QUERY),
+                            "CurveName", "a chart trend line", look);
+          }
+        }
+      }
+    }
+  }
+  // Row and column labels of the chart's own data table, used or not.
+  Reference<css::chart::XComplexDescriptionAccess> data(chart->getDataProvider(),
+                                                        UNO_QUERY);
+  if (data.is()) {
+    for (const auto& labels : {data->getComplexRowDescriptions(),
+                               data->getComplexColumnDescriptions()}) {
+      for (const css::uno::Sequence<rtl::OUString>& label : labels) {
+        for (const rtl::OUString& part : label) {
+          redact_value(part, "the chart's data table", look);
+        }
+      }
+    }
+  }
+  Reference<css::drawing::XDrawPageSupplier> page(chart, UNO_QUERY);
+  if (page.is()) {
+    redact_shapes(Reference<css::container::XIndexAccess>(page->getDrawPage(),
+                                                          UNO_QUERY),
+                  0, look);
+  }
+}
+
+// Looks at every sheet of an embedded spreadsheet, whichever one the
+// object shows: sheet names, every non-empty cell's shown text and
+// formula, cell comments, and each sheet's draw page (shapes, controls,
+// and objects nested there).
+void inspect_spreadsheet(const Reference<css::sheet::XSpreadsheetDocument>& doc,
+                         RedactWalk& look) {
+  Reference<css::container::XIndexAccess> sheets(doc->getSheets(), UNO_QUERY);
+  if (!sheets.is()) {
+    look.refuse("a spreadsheet whose sheets cannot be walked");
+    return;
+  }
+  for (sal_Int32 s = 0; s < sheets->getCount() && !look.refused(); s++) {
+    css::uno::Any element = sheets->getByIndex(s);
+    check_name(Reference<css::container::XNamed>(element, UNO_QUERY), "a sheet",
+               look);
+    Reference<css::sheet::XCellRangesQuery> query(element, UNO_QUERY);
+    if (!query.is()) {
+      look.refuse("a sheet whose cells cannot be walked");
+      return;
+    }
+    Reference<css::sheet::XSheetCellRanges> filled = query->queryContentCells(
+        static_cast<sal_Int16>(
+            css::sheet::CellFlags::VALUE | css::sheet::CellFlags::DATETIME
+            | css::sheet::CellFlags::STRING | css::sheet::CellFlags::FORMULA));
+    Reference<css::container::XEnumerationAccess> cells(
+        filled.is() ? filled->getCells()
+                    : Reference<css::container::XEnumerationAccess>());
+    Reference<css::container::XEnumeration> it =
+        cells.is() ? cells->createEnumeration()
+                   : Reference<css::container::XEnumeration>();
+    while (it.is() && it->hasMoreElements() && !look.refused()) {
+      css::uno::Any cell_element = it->nextElement();
+      Reference<css::table::XCell> cell(cell_element, UNO_QUERY);
+      if (cell.is()) redact_value(cell->getFormula(), "a sheet cell", look);
+      redact_text(Reference<css::text::XText>(cell_element, UNO_QUERY),
+                  "a sheet cell", 1, look);
+    }
+    Reference<css::sheet::XSheetAnnotationsSupplier> notes(element, UNO_QUERY);
+    Reference<css::container::XIndexAccess> annotations(
+        notes.is() ? notes->getAnnotations()
+                   : Reference<css::sheet::XSheetAnnotations>(),
+        UNO_QUERY);
+    for (sal_Int32 i = 0; annotations.is() && i < annotations->getCount(); i++) {
+      Reference<css::sheet::XSheetAnnotation> note(annotations->getByIndex(i),
+                                                   UNO_QUERY);
+      if (!note.is()) continue;
+      Reference<css::text::XSimpleText> note_text(note, UNO_QUERY);
+      if (!note_text.is()) {
+        look.refuse("a cell comment whose text cannot be read");
+        return;
+      }
+      redact_value(note_text->getString(), "a cell comment", look);
+      redact_value(note->getAuthor(), "a cell comment's author", look);
+    }
+    Reference<css::drawing::XDrawPageSupplier> page(element, UNO_QUERY);
+    if (page.is()) {
+      Reference<css::drawing::XDrawPage> draw_page = page->getDrawPage();
+      redact_shapes(Reference<css::container::XIndexAccess>(draw_page, UNO_QUERY),
+                    0, look);
+      redact_forms(draw_page, look);
+    }
+  }
+}
+
+// Looks into one embedded model for the redacted text, by what it is: a
+// chart or spreadsheet through inspect_chart and inspect_spreadsheet, a
+// formula through its source text, a text document through the full text
+// walk (its own embedded objects included), and a drawing or
+// presentation through the shapes and forms of its pages and master
+// pages. An object with no office model (a foreign OLE object) or of any
+// other kind cannot be inspected and refuses. Never rewrites: look is a
+// verify walk.
+void inspect_model(const Reference<css::frame::XModel>& inner, RedactWalk& look,
+                   int depth) {
+  if (depth > kMaxRedactionNesting) {
+    look.refuse("embedded objects nest deeper than "
+                + std::to_string(kMaxRedactionNesting) + " levels");
+    return;
+  }
+  if (!inner.is()) {
+    look.refuse("a foreign object, whose content cannot be inspected");
+    return;
+  }
+  const int outer_depth = look.ole_depth;
+  look.ole_depth = depth;
+  Reference<css::chart2::XChartDocument> chart(inner, UNO_QUERY);
+  Reference<css::sheet::XSpreadsheetDocument> sheet(inner, UNO_QUERY);
+  Reference<css::text::XTextDocument> text_doc(inner, UNO_QUERY);
+  Reference<css::drawing::XDrawPagesSupplier> drawing(inner, UNO_QUERY);
+  Reference<css::lang::XServiceInfo> info(inner, UNO_QUERY);
+  if (chart.is()) {
+    inspect_chart(chart, look);
+  } else if (sheet.is()) {
+    inspect_spreadsheet(sheet, look);
+  } else if (info.is()
+             && info->supportsService("com.sun.star.formula.FormulaProperties")) {
+    Reference<css::beans::XPropertySet> props(inner, UNO_QUERY);
+    rtl::OUString formula;
+    if (!props.is() || !(props->getPropertyValue("Formula") >>= formula)) {
+      look.refuse("a formula whose source cannot be read");
+    } else {
+      redact_value(formula, "a formula", look);
+    }
+  } else if (text_doc.is()) {
+    // The text walk reaches its objects through check_embedded_objects.
+    look.ole_depth = -1;
+    redact_text_document(text_doc, inner, look);
+    check_embedded_objects(text_doc, look, depth + 1);
+  } else if (drawing.is()) {
+    Reference<css::container::XIndexAccess> pages(drawing->getDrawPages(),
+                                                  UNO_QUERY);
+    Reference<css::drawing::XMasterPagesSupplier> masters(inner, UNO_QUERY);
+    Reference<css::container::XIndexAccess> master_pages(
+        masters.is() ? masters->getMasterPages()
+                     : Reference<css::drawing::XDrawPages>(),
+        UNO_QUERY);
+    for (const Reference<css::container::XIndexAccess>& set : {pages, master_pages}) {
+      for (sal_Int32 i = 0; set.is() && i < set->getCount(); i++) {
+        css::uno::Any page = set->getByIndex(i);
+        redact_shapes(Reference<css::container::XIndexAccess>(page, UNO_QUERY),
+                      0, look);
+        redact_forms(Reference<css::uno::XInterface>(page, UNO_QUERY), look);
+      }
+    }
+  } else {
+    look.refuse("an object of a kind the service cannot inspect");
+  }
+  look.ole_depth = outer_depth;
+}
+
+// An object nested on a draw page inside an embedded object.
+void inspect_ole_shape(const Reference<css::beans::XPropertySet>& props,
+                       RedactWalk& walk) {
+  Reference<css::frame::XModel> inner;
+  try {
+    props->getPropertyValue("Model") >>= inner;
+  } catch (const css::beans::UnknownPropertyException&) {
+    // Expected probe result: a foreign OLE shape has no inner model;
+    // inspect_model refuses it.
+  }
+  inspect_model(inner, walk, walk.ole_depth + 1);
+}
+
+// Inspects one embedded object of the host. The object's picture on the
+// host page is drawn from its content, which the service does not
+// rewrite, so any occurrence, and any failure to look, refuses.
+void inspect_embedded_model(const Reference<css::frame::XModel>& inner,
+                            const std::string& label, RedactWalk& host,
+                            int depth) {
+  RedactWalk look{.mode = RedactWalk::Mode::kVerify,
+                  .pieces = host.pieces,
+                  .warner = host.warner,
+                  .refusal = {},
+                  .ole_depth = -1};
+  const size_t warnings_before = host.warner->count();
+  try {
+    inspect_model(inner, look, depth);
+  } catch (const css::uno::Exception&) {
+    host.refuse(label + " cannot be inspected for the redacted text");
+    return;
+  }
+  if (look.refused()) {
+    // The inner walk's reason, without its own "redaction refused: ".
+    const std::string prefix = "redaction refused: ";
+    std::string inner_reason = look.refusal;
+    if (inner_reason.starts_with(prefix)) inner_reason.erase(0, prefix.size());
+    host.refuse(label + ", which the service cannot rewrite, fails the "
+                "check: " + inner_reason);
+    return;
+  }
+  // A walk that reported a problem did not read everything it looked at.
+  if (host.warner->count() != warnings_before) {
+    host.refuse(label + " cannot be inspected for the redacted text");
+  }
+}
+
+// Embedded objects render their own content, which the text walks cannot
+// reach and the service does not rewrite. Each is inspected through
+// inspect_embedded_model; one that cannot be opened refuses.
+void check_embedded_objects(const Reference<css::text::XTextDocument>& text_doc,
+                            RedactWalk& walk, int depth) {
+  if (depth > kMaxRedactionNesting) {
+    walk.refuse("embedded objects nest deeper than "
+                + std::to_string(kMaxRedactionNesting) + " levels");
+    return;
+  }
+  Reference<css::text::XTextEmbeddedObjectsSupplier> supplier(text_doc, UNO_QUERY);
+  if (!supplier.is()) return;
+  Reference<css::container::XIndexAccess> objects(supplier->getEmbeddedObjects(),
+                                                  UNO_QUERY);
+  for (sal_Int32 i = 0; objects.is() && i < objects->getCount(); i++) {
+    if (walk.refused()) return;
+    const std::string label = "embedded object " + std::to_string(i);
+    Reference<css::document::XEmbeddedObjectSupplier> object(
+        objects->getByIndex(i), UNO_QUERY);
+    check_name(Reference<css::container::XNamed>(object, UNO_QUERY), label,
+               walk);
+    Reference<css::frame::XModel> inner;
+    try {
+      if (object.is()) inner.set(object->getEmbeddedObject(), UNO_QUERY);
+    } catch (const css::uno::Exception&) {
+      walk.refuse(label + " cannot be opened for the redaction check");
+      return;
+    }
+    inspect_embedded_model(inner, label, walk, depth);
+  }
+}
+
+// The annotation text space of a text document: each body paragraph's
+// start offset and text, built by the same fill_runs portion walk the
+// Paragraph events come from.
+struct AnnotationParagraph {
+  std::int64_t start = 0;
+  CodePoints text;
+};
+
+std::int64_t annotation_space(const Reference<css::text::XTextDocument>& text_doc,
+                              std::vector<AnnotationParagraph>* paragraphs,
+                              Warner& warner) {
+  Reference<css::container::XEnumerationAccess> body(text_doc->getText(),
+                                                     UNO_QUERY);
+  if (!body.is()) return 0;
+  std::int64_t offset = 0;
+  Reference<css::container::XEnumeration> elements = body->createEnumeration();
+  while (elements->hasMoreElements()) {
+    css::uno::Any element = elements->nextElement();
+    if (Reference<css::text::XTextTable>(element, UNO_QUERY).is()) continue;
+    Reference<css::container::XEnumerationAccess> paragraph(element, UNO_QUERY);
+    if (!paragraph.is() || !Reference<css::text::XTextRange>(element, UNO_QUERY).is()) {
+      continue;
+    }
+    AnnotationParagraph out;
+    out.start = offset;
+    google::protobuf::RepeatedPtrField<officev1::TextRun> runs;
+    fill_runs(paragraph, "redaction paragraph", &runs, &offset, nullptr, warner);
+    for (const officev1::TextRun& run : runs) {
+      out.text += code_points(oustring(run.text()));
+    }
+    paragraphs->push_back(std::move(out));
+    offset += 1;  // The newline after each body paragraph.
+  }
+  return offset;
 }
 
 }  // namespace
@@ -4984,120 +6309,197 @@ void apply_document_options(const RenderOptions& options,
   }
 }
 
-void collect_redact_boxes(const RenderOptions& options, SelectionProbe* probe,
-                          const std::vector<PageBox>& pages,
-                          std::vector<RedactBox>* boxes,
-                          std::vector<std::string>* warnings) {
-  if (options.redact_spans.empty() || boxes == nullptr) return;
-  PartSelection parts;
-  parts.all = false;
-  parts.mask = (1u << officev1::DOCUMENT_PART_PARAGRAPHS) |
-               (1u << officev1::DOCUMENT_PART_LINE_RECTS);
-  // A caret line has no measured height; pad the fallback band below the
-  // end anchor by a generous line so descenders and the last line stay
-  // covered.
-  constexpr std::int64_t kFallbackLineTwips = 400;
-  bool warned_fallback = false;
-  emit_typed_content(
-      parts, probe,
-      [&](const google::protobuf::MessageLite& message) {
-        officev1::StreamPagesResponse event;
-        if (!event.ParseFromString(message.SerializeAsString())) return true;
-        if (!event.has_paragraph()) return true;
-        const officev1::Paragraph& paragraph = event.paragraph();
-        // TextSpan lives in the annotation text space; a paragraph outside
-        // the body flow (char_offset -1) cannot be addressed by it.
-        if (paragraph.char_offset() < 0) return true;
-        std::int64_t length = 0;
-        for (const officev1::TextRun& run : paragraph.runs()) {
-          length += run.char_length();
-        }
-        if (length <= 0) length = 1;
-        const bool paragraph_overlaps =
-            span_overlaps(paragraph.char_offset(),
-                          paragraph.char_offset() + length,
-                          options.redact_spans);
-        if (paragraph.line_rects_size() > 0) {
-          for (const officev1::LineBox& line : paragraph.line_rects()) {
-            // Line offsets are paragraph-local; shift them into the
-            // annotation space before testing. Unmeasured boundaries
-            // (-1) degrade to redacting every line of an overlapped
-            // paragraph rather than missing the span.
-            const bool covered =
-                line.char_start() >= 0 && line.char_end() >= 0
-                    ? span_overlaps(paragraph.char_offset() + line.char_start(),
-                                    paragraph.char_offset() + line.char_end(),
-                                    options.redact_spans)
-                    : paragraph_overlaps;
-            if (!covered) continue;
-            RedactBox box;
-            box.page_index = line.page_index();
-            box.x_twips = line.x_twips();
-            box.y_twips = line.y_twips();
-            box.width_twips = line.width_twips();
-            box.height_twips = line.height_twips();
-            boxes->push_back(box);
-          }
-          return true;
-        }
-        // No measured lines: cover the paragraph's start..end anchor
-        // extent with full-page-width bands. Over-covering is the only
-        // safe degradation for a redaction.
-        if (!paragraph_overlaps) return true;
-        if (!warned_fallback && warnings != nullptr) {
-          warned_fallback = true;
-          warnings->push_back(
-              "redaction: line rectangles unavailable; redacting full-width "
-              "paragraph bands instead of exact line boxes");
-        }
-        const std::int64_t y0 =
-            std::min<std::int64_t>(paragraph.start().y(), paragraph.end().y());
-        const std::int64_t y1 =
-            std::max<std::int64_t>(paragraph.start().y(), paragraph.end().y())
-            + kFallbackLineTwips;
-        bool on_a_page = false;
-        for (size_t index = 0; index < pages.size(); index++) {
-          const PageBox& page = pages[index];
-          const std::int64_t top = std::max<std::int64_t>(y0, page.y);
-          const std::int64_t bottom =
-              std::min<std::int64_t>(y1, page.y + page.height);
-          if (bottom <= top) continue;
-          on_a_page = true;
-          RedactBox box;
-          box.page_index = static_cast<int>(index);
-          box.x_twips = page.x;
-          box.y_twips = top;
-          box.width_twips = page.width;
-          box.height_twips = bottom - top;
-          boxes->push_back(box);
-        }
-        if (!on_a_page) {
-          // Page geometry unknown; band the anchors with a width far wider
-          // than any page so the raster clamp trims it.
-          RedactBox box;
-          box.page_index = paragraph.page_index();
-          box.x_twips = 0;
-          box.y_twips = y0;
-          box.width_twips = 200000;
-          box.height_twips = y1 - y0;
-          boxes->push_back(box);
-        }
-        return true;
-      },
-      warnings);
-}
-
-void apply_redact_shapes(const std::vector<RedactBox>& boxes,
-                         const std::vector<PageBox>& pages,
-                         std::vector<std::string>* warnings) {
+RedactionResult apply_redaction(const RenderOptions& options,
+                                std::vector<std::string>* warnings) {
+  RedactionResult result;
+  std::vector<std::pair<std::int64_t, std::int64_t>> spans;
+  for (const auto& span : options.redact_spans) {
+    // Zero-length spans are ignored by contract.
+    if (span.second > span.first) spans.push_back(span);
+  }
+  if (spans.empty()) return result;
+  auto refuse = [&](const std::string& why) {
+    result.ok = false;
+    result.refusal = why;
+    return result;
+  };
   Warner warner(warnings);
+  // The step under way, for a refusal when the office core throws: the
+  // exception's own message may quote document text, so it is not used.
+  const char* stage = "finding the loaded document";
   try {
     Reference<css::uno::XComponentContext> context = process_context();
-    if (!context.is()) return;
-    paint_redact_shapes(find_loaded_model(context), boxes, pages, warner);
-  } catch (const css::uno::Exception& error) {
-    warner.warn("apply redact shapes", error);
+    Reference<css::frame::XModel> model =
+        context.is() ? find_loaded_model(context) : Reference<css::frame::XModel>();
+    if (!model.is()) {
+      return refuse("redaction refused: the loaded document is not reachable");
+    }
+    Reference<css::text::XTextDocument> text_doc(model, UNO_QUERY);
+    if (!text_doc.is()) {
+      return refuse(
+          "redaction refused: redact_spans address the annotation text space, "
+          "which only text documents carry; this document has none");
+    }
+
+    // Resolve the spans against the document as loaded, before anything
+    // is rewritten. A span may cross paragraphs; its text splits into one
+    // piece per paragraph, trimmed of surrounding whitespace, so the same
+    // name is found again where punctuation or a line end follows it.
+    stage = "reading the annotation text space";
+    std::vector<AnnotationParagraph> paragraphs;
+    const size_t warnings_before = warner.count();
+    const std::int64_t length = annotation_space(text_doc, &paragraphs, warner);
+    // A portion the walk lost would shift every later offset, so a span
+    // could land on other text than the caller addressed.
+    if (warner.count() != warnings_before) {
+      return refuse("redaction refused: the annotation text space could not "
+                    "be read in full, so the spans cannot be placed");
+    }
+    std::vector<CodePoints> pieces;
+    for (const auto& [first, last] : spans) {
+      if (last > length) {
+        return refuse("redaction refused: span [" + std::to_string(first) + ", "
+                      + std::to_string(last) + ") ends past the document's "
+                      "annotation text space (" + std::to_string(length)
+                      + " code points)");
+      }
+      for (const AnnotationParagraph& paragraph : paragraphs) {
+        const std::int64_t end =
+            paragraph.start + static_cast<std::int64_t>(paragraph.text.size());
+        const std::int64_t lo = std::max(first, paragraph.start);
+        const std::int64_t hi = std::min(last, end);
+        if (lo >= hi) continue;
+        CodePoints piece = paragraph.text.substr(
+            static_cast<size_t>(lo - paragraph.start), static_cast<size_t>(hi - lo));
+        while (!piece.empty() && redaction_space(piece.front())) piece.erase(0, 1);
+        while (!piece.empty() && redaction_space(piece.back())) piece.pop_back();
+        const bool glyphs_only = std::ranges::all_of(
+            piece, [](char32_t c) { return c == kRedactionGlyph; });
+        if (piece.empty() || glyphs_only || std::ranges::contains(pieces, piece)) {
+          continue;
+        }
+        pieces.push_back(std::move(piece));
+      }
+    }
+    if (pieces.empty()) return result;
+    for (const CodePoints& piece : pieces) {
+      result.redacted.push_back(utf8(from_code_points(piece)));
+    }
+
+    stage = "preparing the document for the rewrite";
+    // Rewrites must not leave the original behind as tracked deletions,
+    // and protected sections (generated indexes among them) must yield.
+    Reference<css::beans::XPropertySet> document_props(model, UNO_QUERY);
+    if (document_props.is()) {
+      document_props->setPropertyValue("RecordChanges", css::uno::Any(false));
+    }
+    Reference<css::text::XTextSectionsSupplier> sections_supplier(text_doc,
+                                                                  UNO_QUERY);
+    if (sections_supplier.is()) {
+      Reference<css::container::XNameAccess> sections =
+          sections_supplier->getTextSections();
+      for (const rtl::OUString& name : sections->getElementNames()) {
+        Reference<css::beans::XPropertySet> section(sections->getByName(name),
+                                                    UNO_QUERY);
+        try {
+          if (section.is()) {
+            section->setPropertyValue("IsProtected", css::uno::Any(false));
+          }
+        } catch (const css::uno::Exception& error) {
+          warner.warn("redaction: a protected section stayed protected", error);
+        }
+      }
+    }
+
+    stage = "the rewrite";
+    RedactWalk rewrite{.mode = RedactWalk::Mode::kReplace,
+                       .pieces = pieces,
+                       .warner = &warner,
+                       .refusal = {},
+                       .ole_depth = -1};
+    check_embedded_objects(text_doc, rewrite);
+    if (!rewrite.refused()) redact_text_document(text_doc, model, rewrite);
+    if (rewrite.refused()) return refuse(rewrite.refusal);
+
+    stage = "the verify walk";
+    RedactWalk verify{.mode = RedactWalk::Mode::kVerify,
+                      .pieces = pieces,
+                      .warner = &warner,
+                      .refusal = {},
+                      .ole_depth = -1};
+    const size_t verify_warnings = warner.count();
+    redact_text_document(text_doc, model, verify);
+    if (verify.refused()) return refuse(verify.refusal);
+    if (warner.count() != verify_warnings) {
+      return refuse("redaction refused: the verify walk could not read the "
+                    "whole redacted document");
+    }
+
+    // Last, the document as every typed event would carry it, every part
+    // a response can carry except page images and line rectangles, which
+    // hold no text; image events too, so the guard on outgoing events
+    // should never find what this missed after pages have streamed.
+    stage = "the typed-content check";
+    PartSelection scan;
+    scan.all = false;
+    scan.mask = ~0u & ~1u;
+    for (int part : {officev1::DOCUMENT_PART_PAGES, officev1::DOCUMENT_PART_LINE_RECTS,
+                     officev1::DOCUMENT_PART_CELL_LINE_RECTS}) {
+      scan.mask &= ~(1u << part);
+    }
+    std::string where;
+    // Its own warnings stay out of the response; only their count matters.
+    std::vector<std::string> scan_warnings;
+    Warner scan_warner(&scan_warnings);
+    const bool finished = emit_typed_content_with(
+        scan, nullptr,
+        [&](const google::protobuf::MessageLite& event) {
+          return !carries_redacted_text(event, result.redacted, &where);
+        },
+        scan_warner);
+    if (!where.empty()) {
+      return refuse("redaction refused: redacted text remains in typed content ("
+                    + where + ") that the office core does not let the service "
+                    "rewrite");
+    }
+    // A walk that stopped early or reported any problem checked only part
+    // of the document.
+    if (!finished || scan_warner.count() > 0) {
+      return refuse("redaction refused: the typed-content check of the "
+                    "redacted document could not complete");
+    }
+  } catch (const css::uno::Exception&) {
+    return refuse(std::string("redaction refused: the office core failed during ")
+                  + stage);
   }
+  return result;
+}
+
+bool carries_redacted_text(const google::protobuf::MessageLite& message,
+                           const std::vector<std::string>& redacted,
+                           std::string* where) {
+  if (redacted.empty()) return false;
+  const auto* full = dynamic_cast<const google::protobuf::Message*>(&message);
+  if (full == nullptr) {
+    // Every event this worker emits is a full message; one that is not
+    // cannot be checked and does not go out.
+    *where = "an event the check cannot read";
+    return true;
+  }
+  return find_redacted(*full, redacted, "", where);
+}
+
+std::string mask_redacted(const std::string& text,
+                          const std::vector<std::string>& redacted) {
+  if (redacted.empty()) return text;
+  std::vector<CodePoints> pieces;
+  for (const std::string& piece : redacted) {
+    pieces.push_back(code_points(oustring(piece)));
+  }
+  CodePoints points = code_points(oustring(text));
+  Intervals intervals = covered_intervals(points, pieces);
+  if (intervals.empty()) return text;
+  return utf8(from_code_points(masked(std::move(points), intervals)));
 }
 
 std::string export_page_svg_uno(int page_number) {

@@ -26,6 +26,11 @@ struct ServiceConfig {
   std::string worker_path;
   std::string install_path;
   long max_document_bytes = 100L * 1024 * 1024;
+  // Upload bytes the server holds in memory across every request at once,
+  // from the first chunk until the request ends. Zero means
+  // max_concurrent_documents times max_document_bytes. Never below
+  // max_document_bytes, so one maximal document always fits when idle.
+  long max_buffered_upload_bytes = 0;
   int max_concurrent_documents = 2;
   std::chrono::milliseconds task_deadline{120000};
   int render_dpi = 144;
@@ -38,8 +43,10 @@ struct ServiceConfig {
 };
 
 // The gRPC face over the worker processes. Uploads accumulate in memory
-// under the byte cap; each completed upload renders in its own worker
-// process, bounded by a concurrency gate.
+// under the per-document cap and a server-wide buffer cap; each completed
+// upload renders in its own worker process, bounded by a concurrency gate.
+// A caller that cancels, or whose deadline passes, stops costing anything:
+// the slot wait gives up and a running worker is killed.
 class RenderServiceImpl final
     : public ai::pipestream::office::v1::OfficeRenderService::Service {
  public:
@@ -69,17 +76,23 @@ class RenderServiceImpl final
   std::atomic<long> rendered{0};
   std::atomic<long> rejected{0};
   std::atomic<long> failed{0};
+  // Upload bytes in-flight requests hold right now, counted against
+  // ServiceConfig::max_buffered_upload_bytes.
+  std::atomic<long> buffered_upload_bytes{0};
 
  private:
-  // Blocks until a render slot frees up; RAII-released.
+  // Waits for a render slot, giving up when the call is cancelled or its
+  // deadline passes; RAII-released.
   class SlotGuard;
+  // Reserves upload bytes against the server-wide buffer cap; RAII-released.
+  class UploadReservation;
 
   // default_parts is the worker parts token used when no request in the
   // upload stream selected parts: "all" for the streaming RPCs,
   // "all-but-pages" for ToDocument (page images are omitted from the mapped
   // document unless explicitly selected).
   template <typename Response, typename Request, typename In>
-  grpc::Status render(const char* mode, In* in,
+  grpc::Status render(const char* mode, grpc::ServerContext* context, In* in,
                       const std::function<bool(Response&&)>& write,
                       const char* default_parts = "all");
 

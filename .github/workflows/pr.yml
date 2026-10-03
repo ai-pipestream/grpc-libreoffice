@@ -1,0 +1,40 @@
+name: Pull Request Build
+
+# Publish Image only runs on pushes to main, so pull requests merged with
+# no automated check at all. This builds the service image the way publish
+# does, where the Dockerfile's build stage runs the full test suite with
+# real LibreOffice renders, pushes nothing, and runs the same image gate,
+# scripts/smoke-test.sh, that publish runs before a digest gets a tag.
+# Renovate opens its pull requests against development, the GitHub default
+# branch, so those are built too.
+on:
+  pull_request:
+    branches: [main, development]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-build-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  service:
+    name: Build and smoke-test the service image
+    runs-on: ubuntu-latest
+    # Same room as the publish legs: the LibreOfficeKit install and the
+    # ctest renders make for a long build on a cold cache.
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build (runs the test suite in the build stage)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          tags: grpc-libreoffice:pr
+      - name: Smoke-test the image
+        run: ./scripts/smoke-test.sh grpc-libreoffice:pr

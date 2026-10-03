@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(grpc-libreoffice VERSION 0.2.0 LANGUAGES CXX)
+project(grpc-libreoffice VERSION 0.5.0 LANGUAGES CXX)
 
 include(CTest)
 
@@ -146,6 +146,9 @@ add_library(grlibre_core
   src/render_service.cpp
   src/docling_map.cpp)
 target_include_directories(grlibre_core PUBLIC src)
+# The one version source: GetServiceInfo reports the project version.
+target_compile_definitions(grlibre_core PUBLIC
+  GRLIBRE_VERSION="${PROJECT_VERSION}")
 target_link_libraries(grlibre_core
   PUBLIC office_proto Threads::Threads
   PRIVATE grlibre_flags)

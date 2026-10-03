@@ -13,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <print>
 #include <string>
 
@@ -51,14 +52,20 @@ grlibre::PartSelection parse_parts(const std::string& token) {
   return parts;
 }
 
-std::string read_all_stdin() {
+// Empty when stdin fails: a read error must not pass a truncated upload off
+// as the whole document.
+std::optional<std::string> read_all_stdin() {
   std::string bytes;
   char buffer[1 << 16];
-  ssize_t got;
-  while ((got = ::read(STDIN_FILENO, buffer, sizeof buffer)) > 0) {
+  for (;;) {
+    ssize_t got = ::read(STDIN_FILENO, buffer, sizeof buffer);
+    if (got == 0) return bytes;
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      return std::nullopt;
+    }
     bytes.append(buffer, static_cast<size_t>(got));
   }
-  return bytes;
 }
 
 // The uploaded document must never reach disk. Everything the worker or the
@@ -77,11 +84,19 @@ bool on_tmpfs(const std::string& path) {
 // document and a failed lock write aborts a batch-mode load outright. The
 // officecfg setting is the only working off switch in this core: the
 // SAL_ENABLE_FILE_LOCKING env var ENABLES advisory locking when set to any
-// value, "0" included (sal/osl/unx/file.cxx).
+// value, "0" included (sal/osl/unx/file.cxx). The scripting settings switch
+// document macros off at the profile level too, so they stay off even for
+// a load path that does not pass the engine's explicit load options, and
+// keep the core from fetching resources an uploaded document links to (a
+// document loaded from the work dir is never a trusted referer), so an
+// upload cannot make the worker issue requests from inside the network.
 constexpr char kProfileSeed[] =
     R"(<?xml version="1.0" encoding="UTF-8"?>
 <oor:items xmlns:oor="http://openoffice.org/2001/registry" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
 <item oor:path="/org.openoffice.Office.Common/Misc"><prop oor:name="UseLocking" oor:op="fuse"><value>false</value></prop></item>
+<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="DisableMacrosExecution" oor:op="fuse"><value>true</value></prop></item>
+<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop></item>
+<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="BlockUntrustedRefererLinks" oor:op="fuse"><value>true</value></prop></item>
 </oor:items>
 )";
 
@@ -177,7 +192,14 @@ int main(int argc, char** argv) {
   {
     std::ifstream extras_in(options.work_dir + "/options.pb", std::ios::binary);
     ai::pipestream::office::v1::StreamOptions extras;
-    if (extras_in && extras.ParseFromIstream(&extras_in)) {
+    // The service always writes this file, and it can carry redact_spans:
+    // rendering without it would emit text the caller asked to remove.
+    if (!extras_in || !extras.ParseFromIstream(&extras_in)) {
+      std::println(stderr, "grlibre-worker: cannot read {}/options.pb",
+                   options.work_dir);
+      return grlibre::kExitRenderFailure;
+    }
+    {
       if (extras.max_width_px() > 0) options.max_width_px = extras.max_width_px();
       options.grayscale = options.grayscale || extras.grayscale();
       if (extras.tracked_changes() != 0) {
@@ -218,7 +240,13 @@ int main(int argc, char** argv) {
     }
   }
 
-  std::string document = read_all_stdin();
+  std::optional<std::string> upload = read_all_stdin();
+  if (!upload) {
+    std::println(stderr, "grlibre-worker: reading the document from stdin "
+                         "failed: {}", std::strerror(errno));
+    return grlibre::kExitRenderFailure;
+  }
+  std::string document = std::move(*upload);
   if (document.empty()) {
     std::println(stderr, "grlibre-worker: no document bytes on stdin");
     return grlibre::kExitLoadFailure;
@@ -300,6 +328,13 @@ int main(int argc, char** argv) {
   int code = grlibre::run_render(options, STDOUT_FILENO, &error);
   if (code != grlibre::kExitOk) {
     std::println(stderr, "grlibre-worker: {}", error);
+  }
+  if (code == grlibre::kExitRedactionRefused) {
+    // The parent reads the reason back into the call's status; a refusal
+    // names regions and offsets, never document text.
+    std::ofstream refusal(options.work_dir + "/" + grlibre::kRefusalFile,
+                          std::ios::binary);
+    refusal << error;
   }
   // End the process here, skipping exit-time teardown. This worker never
   // runs DeInitVCL, and letting exit() walk LibreOffice's atexit handlers

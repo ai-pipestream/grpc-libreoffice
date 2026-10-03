@@ -8,8 +8,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <print>
 #include <string>
 #include <thread>
@@ -181,6 +185,235 @@ grpc::Status to_document(const std::shared_ptr<grpc::Channel>& channel,
   return writer->Finish();
 }
 
+// A stand-in worker for the admission and cancellation tests: it marks
+// that it started (the script's path plus ".started"), drains its upload,
+// then hangs the way a wedged office core would, for longer than any of
+// those tests may take. Written next to the test binaries, the one place
+// sure to allow exec (container tmpfs mounts are noexec).
+std::string write_hanging_worker() {
+  std::string path = (std::filesystem::current_path()
+                      / ("grlibre-test-hanging-worker-"
+                         + std::to_string(::getpid())))
+                         .string();
+  {
+    std::ofstream out(path);
+    out << "#!/bin/sh\n: > \"$0.started\"\ncat >/dev/null\nexec sleep 60\n";
+  }
+  std::filesystem::permissions(path, std::filesystem::perms::owner_all);
+  return path;
+}
+
+// Waits until the stand-in worker at path has started, for at most ten
+// seconds, then clears its marker for the next run.
+bool hanging_worker_started(const std::string& path) {
+  const std::string marker = path + ".started";
+  const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (std::chrono::steady_clock::now() < end) {
+    if (std::filesystem::exists(marker)) {
+      std::filesystem::remove(marker);
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  return false;
+}
+
+// Starts an in-process server for service on an ephemeral port.
+std::unique_ptr<grpc::Server> start_server(grlibre::RenderServiceImpl* service,
+                                           std::shared_ptr<grpc::Channel>* channel) {
+  int port = 0;
+  grpc::ServerBuilder builder;
+  builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+  builder.RegisterService(service);
+  auto server = builder.BuildAndStart();
+  require(server != nullptr, "server starts");
+  *channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(port),
+                                 grpc::InsecureChannelCredentials());
+  return server;
+}
+
+// Sends one complete small upload on an already created context.
+grpc::Status upload_with(const std::shared_ptr<grpc::Channel>& channel,
+                         grpc::ClientContext* context) {
+  auto stub = officev1::OfficeRenderService::NewStub(channel);
+  auto stream = stub->StreamPages(context);
+  officev1::StreamPagesRequest request;
+  request.mutable_chunk()->set_filename("hang.txt");
+  request.mutable_chunk()->set_data("hang");
+  request.mutable_chunk()->set_complete(true);
+  stream->Write(request);
+  stream->WritesDone();
+  officev1::StreamPagesResponse response;
+  while (stream->Read(&response)) {}
+  return stream->Finish();
+}
+
+// Polls counter until it exceeds before, for at most the given time.
+bool counter_moves(const std::atomic<long>& counter, long before,
+                   std::chrono::milliseconds within) {
+  const auto end = std::chrono::steady_clock::now() + within;
+  while (std::chrono::steady_clock::now() < end) {
+    if (counter.load() > before) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  return counter.load() > before;
+}
+
+// A caller that goes away stops costing anything: its deadline caps the
+// worker's, a queued call gives up at its deadline instead of waiting for
+// the slot, and cancelling a running call (ToDocument included, which
+// writes nothing until the end) kills its worker. The stand-in worker
+// would otherwise hold the single slot for a minute; the server's own
+// counters show each request end within seconds.
+void verify_callers_that_leave_stop_costing() {
+  grlibre::ServiceConfig config;
+  config.worker_path = write_hanging_worker();
+  config.install_path = "/nonexistent";
+  config.max_document_bytes = 1 << 20;
+  config.max_concurrent_documents = 1;
+  config.task_deadline = std::chrono::milliseconds(60000);
+  grlibre::RenderServiceImpl service(config);
+  std::shared_ptr<grpc::Channel> channel;
+  auto server = start_server(&service, &channel);
+
+  require(channel->WaitForConnected(std::chrono::system_clock::now()
+                                    + std::chrono::seconds(10)),
+          "the admission test server accepts connections");
+
+  // The caller's deadline caps the worker's.
+  {
+    long before = service.failed.load();
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now()
+                         + std::chrono::milliseconds(3000));
+    grpc::Status status = upload_with(channel, &context);
+    require(status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED,
+            "a short client deadline ends the call");
+    require(hanging_worker_started(config.worker_path),
+            "the call got as far as its worker");
+    require(counter_moves(service.failed, before, std::chrono::seconds(10)),
+            "the worker died at the caller's deadline, not the task deadline");
+  }
+
+  // A queued caller gives up at its deadline; cancelling the running call
+  // kills its worker and frees the slot.
+  {
+    long failed_before = service.failed.load();
+    grpc::ClientContext running;
+    grpc::Status running_status;
+    std::thread holder([&] { running_status = upload_with(channel, &running); });
+    require(hanging_worker_started(config.worker_path),
+            "the running call holds the only slot");
+    long rejected_before = service.rejected.load();
+    grpc::ClientContext queued;
+    queued.set_deadline(std::chrono::system_clock::now()
+                        + std::chrono::milliseconds(1000));
+    grpc::Status queued_status = upload_with(channel, &queued);
+    require(queued_status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED,
+            "the queued call ends at its deadline");
+    require(counter_moves(service.rejected, rejected_before,
+                          std::chrono::seconds(10)),
+            "the slot wait gave up at the queued caller's deadline");
+    running.TryCancel();
+    holder.join();
+    require(running_status.error_code() == grpc::StatusCode::CANCELLED,
+            "the cancelled call ends cancelled");
+    require(counter_moves(service.failed, failed_before,
+                          std::chrono::seconds(10)),
+            "cancelling the running call killed its worker");
+  }
+
+  // ToDocument only writes at the end, so only the run's cancellation
+  // probe can notice the caller leaving.
+  {
+    long before = service.failed.load();
+    grpc::ClientContext context;
+    officev1::ToDocumentResponse mapped;
+    grpc::Status status;
+    std::thread caller([&] {
+      auto stub = officev1::OfficeRenderService::NewStub(channel);
+      auto writer = stub->ToDocument(&context, &mapped);
+      officev1::StreamPagesRequest request;
+      request.mutable_chunk()->set_filename("hang.txt");
+      request.mutable_chunk()->set_data("hang");
+      request.mutable_chunk()->set_complete(true);
+      writer->Write(request);
+      writer->WritesDone();
+      status = writer->Finish();
+    });
+    require(hanging_worker_started(config.worker_path),
+            "the ToDocument call got as far as its worker");
+    const auto cancelled_at = std::chrono::steady_clock::now();
+    context.TryCancel();
+    caller.join();
+    require(status.error_code() == grpc::StatusCode::CANCELLED,
+            "the cancelled ToDocument call ends cancelled");
+    require(counter_moves(service.failed, before, std::chrono::seconds(10)),
+            "cancelling ToDocument killed its worker");
+    require(std::chrono::steady_clock::now() - cancelled_at
+                < std::chrono::seconds(10),
+            "ToDocument's worker died promptly after the cancel");
+  }
+  server->Shutdown();
+  std::filesystem::remove(config.worker_path);
+  std::filesystem::remove(config.worker_path + ".started");
+}
+
+// Upload bytes held by in-flight requests count against one server-wide
+// buffer: while one upload holds most of it, another is refused with
+// RESOURCE_EXHAUSTED before it is buffered, and the bytes come back when
+// the holder's request ends.
+void verify_upload_buffer_is_capped() {
+  grlibre::ServiceConfig config;
+  config.worker_path = "/nonexistent/grlibre-worker";
+  config.install_path = "/nonexistent";
+  config.max_document_bytes = 1 << 20;
+  config.max_buffered_upload_bytes = 1 << 20;
+  config.max_concurrent_documents = 2;
+  grlibre::RenderServiceImpl service(config);
+  std::shared_ptr<grpc::Channel> channel;
+  auto server = start_server(&service, &channel);
+  const std::string chunk(700 * 1024, 'x');
+
+  auto stub = officev1::OfficeRenderService::NewStub(channel);
+  grpc::ClientContext holder_context;
+  auto holder = stub->StreamPages(&holder_context);
+  officev1::StreamPagesRequest first;
+  first.mutable_chunk()->set_filename("held.zzz");
+  first.mutable_chunk()->set_data(chunk);
+  require(holder->Write(first), "the holder's first chunk is sent");
+  const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (service.buffered_upload_bytes.load() < static_cast<long>(chunk.size())
+         && std::chrono::steady_clock::now() < end) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  require(service.buffered_upload_bytes.load() == static_cast<long>(chunk.size()),
+          "the holder's chunk counts against the buffer");
+
+  auto refused = stream_pages(channel, chunk, "second.zzz", true);
+  require(refused.status.error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED,
+          "an upload past the shared buffer is RESOURCE_EXHAUSTED");
+  require(refused.status.error_message().contains("upload buffer"),
+          "the refusal names the upload buffer, got: "
+              + refused.status.error_message());
+
+  officev1::StreamPagesRequest last;
+  last.mutable_chunk()->set_complete(true);
+  holder->Write(last);
+  holder->WritesDone();
+  officev1::StreamPagesResponse ignored;
+  while (holder->Read(&ignored)) {}
+  require(holder->Finish().error_code() == grpc::StatusCode::INVALID_ARGUMENT,
+          "the holder ends on its unresolvable format");
+
+  require(service.buffered_upload_bytes.load() == 0,
+          "every request returned its buffered bytes");
+  auto after = stream_pages(channel, chunk, "third.zzz", true);
+  require(after.status.error_code() == grpc::StatusCode::INVALID_ARGUMENT,
+          "the buffer is released when the holder's request ends");
+  server->Shutdown();
+}
+
 }  // namespace
 
 int main() {
@@ -216,24 +449,54 @@ int main() {
     require(info.render_dpi() == 96, "dpi reported");
     require(info.supported_formats_size() > 20, "formats reported");
     require(info.diskless_documents(), "diskless posture advertised");
-    require(info.internal_temp_artifacts_size() == 4,
+    require(info.internal_temp_artifacts_size() == 3,
             "every LibreOffice-internal temp artifact class named");
     require(info.internal_temp_artifacts(0).contains("odf-load"),
             "ODF load residual named");
-    require(info.internal_temp_artifacts(1).contains("pdf-import"),
-            "PDF import residual named");
-    require(info.internal_temp_artifacts(2).contains("embedded-media"),
+    require(info.internal_temp_artifacts(1).contains("embedded-media"),
             "embedded media residual named");
-    require(info.internal_temp_artifacts(3).contains("pdf-export"),
+    require(info.internal_temp_artifacts(2).contains("pdf-export"),
             "PDF export residual named");
+    require(!std::ranges::contains(info.supported_formats(), std::string("pdf")),
+            "PDF is not advertised as a source format");
     require(info.document_mapping(), "ToDocument advertised");
     require(info.package_repair(), "package repair advertised");
-    require(info.service_version() == "0.4.0", "service version");
+    require(info.service_version() == GRLIBRE_VERSION,
+            "service version is the build version");
     require(info.ui().title() == "LibreOffice", "ui title advertised");
     require(info.ui().path() == "/ui/libreoffice", "ui path advertised");
     require(info.ui().description() ==
                 "Renders office documents via LibreOfficeKit; pages out as PNG",
             "ui description advertised");
+  }
+
+  // PDF input is refused before any worker spawns, recognized by the
+  // filename extension, by the content type when the filename has no
+  // known extension, and by the %PDF- signature whatever the name says.
+  {
+    const std::string pdf_bytes = "%PDF-1.7\n%fake body\n";
+    auto by_name = stream_pages(channel, "not really a pdf", "report.PDF", true);
+    require(by_name.status.error_code() == grpc::StatusCode::UNIMPLEMENTED,
+            "a .pdf filename is UNIMPLEMENTED");
+    require(by_name.status.error_message().contains("PDF input is not supported"),
+            "the refusal says PDF input is not supported");
+    auto by_signature = stream_pages(channel, pdf_bytes, "disguised.docx", true);
+    require(by_signature.status.error_code() == grpc::StatusCode::UNIMPLEMENTED,
+            "PDF bytes behind an office extension are UNIMPLEMENTED");
+    auto stub = officev1::OfficeRenderService::NewStub(channel);
+    grpc::ClientContext context;
+    auto stream = stub->ConvertToPdf(&context);
+    officev1::ConvertToPdfRequest request;
+    request.mutable_chunk()->set_filename("upload");
+    request.mutable_chunk()->set_content_type("application/pdf; charset=binary");
+    request.mutable_chunk()->set_data("not really a pdf");
+    request.mutable_chunk()->set_complete(true);
+    stream->Write(request);
+    stream->WritesDone();
+    officev1::ConvertToPdfResponse ignored;
+    while (stream->Read(&ignored)) {}
+    require(stream->Finish().error_code() == grpc::StatusCode::UNIMPLEMENTED,
+            "an application/pdf content type is UNIMPLEMENTED");
   }
 
   // Protocol error paths, no office core involved.
@@ -314,6 +577,9 @@ int main() {
     require(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT,
             "ConvertToPdf timeout_seconds over 600 is INVALID_ARGUMENT");
   }
+
+  verify_callers_that_leave_stop_costing();
+  verify_upload_buffer_is_capped();
 
   if (!std::filesystem::exists(config.install_path)) {
     std::println(stderr, "SKIP remainder: no LibreOffice at {}",
@@ -605,6 +871,36 @@ int main() {
     require(status.ok(), "late options render ok: " + status.error_message());
     require(first_width > 0 && first_width <= 200,
             "max_width_px from a later chunk still applies");
+  }
+
+  // Redaction through the service: a refusal reaches the caller as
+  // FAILED_PRECONDITION carrying the worker's reason, and a redaction that
+  // succeeds leaves the redacted text out of the ToDocument result too.
+  {
+    officev1::StreamOptions spreadsheet;
+    spreadsheet.add_redact_spans()->set_char_end(4);
+    auto refused = stream_pages(channel, "a,b\nc,d\n", "sheet.csv", true,
+                                false, 0, 0, 0, 0, 0, &spreadsheet);
+    require(refused.status.error_code() == grpc::StatusCode::FAILED_PRECONDITION,
+            "a spreadsheet redaction is FAILED_PRECONDITION");
+    require(refused.status.error_message().contains("only text documents"),
+            "the refusal carries the worker's reason, got: "
+                + refused.status.error_message());
+    require(refused.pages == 0 && !refused.got_status,
+            "a refused redaction streams nothing");
+
+    const std::string text = "Name: SECRET-VALUE.\nAgain SECRET-VALUE here.\n";
+    officev1::StreamOptions redact;
+    officev1::TextSpan* span = redact.add_redact_spans();
+    span->set_char_start(6);
+    span->set_char_end(18);
+    officev1::ToDocumentResponse mapped;
+    grpc::Status status = to_document(channel, text, "names.txt", &redact, &mapped);
+    require(status.ok(), "redacted ToDocument ok: " + status.error_message());
+    require(!mapped.document().DebugString().contains("SECRET-VALUE"),
+            "the mapped document carries no redacted text");
+    require(mapped.document().DebugString().contains("Again"),
+            "the mapped document keeps the rest of the text");
   }
 
   // A repairable broken package (a stored-entry OOXML zip truncated before
