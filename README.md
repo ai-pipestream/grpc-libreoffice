@@ -168,11 +168,12 @@ legacy), the OpenDocument families, RTF, CSV, HTML, and plain text.
 
 Errors are gRPC status codes: `INVALID_ARGUMENT` (no bytes, missing complete
 flag, unresolvable format, out-of-range options, or the core cannot load
-the document), `RESOURCE_EXHAUSTED` (over the byte cap),
-`FAILED_PRECONDITION` (broken package needing repair without the
-`allow_package_repair` opt-in), `DEADLINE_EXCEEDED` (per-document timeout,
-worker killed), `INTERNAL` (worker crash). Health checking and reflection
-are registered.
+the document), `RESOURCE_EXHAUSTED` (over the byte cap, or the server-wide
+upload buffer is full), `FAILED_PRECONDITION` (broken package needing
+repair without the `allow_package_repair` opt-in), `DEADLINE_EXCEEDED`
+(per-document timeout or the caller's deadline, worker killed),
+`CANCELLED` (the caller cancelled; a running worker is killed), `INTERNAL`
+(worker crash). Health checking and reflection are registered.
 
 A document whose zip package is broken but repairable is a special case:
 LibreOffice can only open it through its repair path, which rebuilds the
@@ -203,13 +204,20 @@ captures, what still rides untyped, and what is not captured yet.
 
 ## Process model
 
-The server buffers each upload under a hard byte cap, then spawns
-`grlibre-worker` with the document on stdin. The worker initializes
-LibreOfficeKit with its own user profile, loads the document, and writes
-length-prefixed response events to stdout, which the server relays to the
-gRPC stream as they arrive. A concurrency gate bounds simultaneous workers;
-a deadline kills workers that hang. Worker exit codes distinguish "could not
-load the document" (client error) from crashes (server error).
+The server buffers each upload under a hard byte cap, and every buffered
+byte also counts against a server-wide upload buffer cap until its request
+ends, so concurrent uploads cannot pile up in memory without bound before
+they are admitted. It then spawns `grlibre-worker` with the document on
+stdin. The worker initializes LibreOfficeKit with its own user profile,
+loads the document, and writes length-prefixed response events to stdout,
+which the server relays to the gRPC stream as they arrive. A concurrency
+gate bounds simultaneous workers; a deadline kills workers that hang, and
+it covers the whole worker run, the upload copy into the worker included.
+The caller's own deadline caps that deadline, and a caller that cancels or
+runs out of time while queued for the gate stops waiting (`CANCELLED` or
+`DEADLINE_EXCEEDED`); once its worker runs, cancellation kills it, for
+`ToDocument` too. Worker exit codes distinguish "could not load the
+document" (client error) from crashes (server error).
 
 Uploaded document bytes never touch disk. Each worker gets a private 0700
 work dir on a RAM-backed tmpfs (`GRLIBRE_TMPFS_DIR`, default `/dev/shm`);
@@ -238,6 +246,7 @@ profile switches macro execution off as well.
 |---|---|---|
 | `GRLIBRE_PORT` | `50053` | Listen port |
 | `GRLIBRE_MAX_DOCUMENT_MIB` | `500` | Per-document byte cap |
+| `GRLIBRE_MAX_UPLOAD_BUFFER_MIB` | per-document cap × concurrent documents | Upload bytes held in memory across all in-flight requests; a chunk that would exceed it fails the request with `RESOURCE_EXHAUSTED` (never below the per-document cap) |
 | `GRLIBRE_MAX_CONCURRENT_DOCUMENTS` | `2` | Worker processes in flight |
 | `GRLIBRE_TASK_TIMEOUT_SECONDS` | `120` | Per-document deadline |
 | `GRLIBRE_RENDER_DPI` | `144` | Default page render DPI; a request may override it via `StreamOptions.render_dpi` |

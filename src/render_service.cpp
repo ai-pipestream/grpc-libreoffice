@@ -248,18 +248,50 @@ class ScopedWorkDir {
   std::string path_;
 };
 
+// How often a call waiting for a render slot checks whether it was
+// cancelled or ran out of time.
+constexpr std::chrono::milliseconds kSlotPoll{100};
+
+// True when the call carries a deadline at all; gRPC reports an unbounded
+// call as the time point's maximum.
+bool has_deadline(const grpc::ServerContext* context) {
+  return context->deadline() != std::chrono::system_clock::time_point::max();
+}
+
 }  // namespace
 
 class RenderServiceImpl::SlotGuard {
  public:
-  SlotGuard(RenderServiceImpl& service) : service_(service) {
+  explicit SlotGuard(RenderServiceImpl& service) : service_(service) {}
+  SlotGuard(const SlotGuard&) = delete;
+  SlotGuard& operator=(const SlotGuard&) = delete;
+
+  // Blocks until a slot frees up. A caller that cancels, or whose deadline
+  // passes, stops waiting: its request would otherwise still render to
+  // completion after the caller had gone, and a retry would queue behind
+  // the abandoned render.
+  grpc::Status acquire(grpc::ServerContext* context) {
+    const bool bounded = has_deadline(context);
+    const auto deadline = context->deadline();
     std::unique_lock<std::mutex> lock(service_.slots_mutex_);
-    service_.slots_available_.wait(lock, [&] {
-      return service_.busy_slots_ < service_.config_.max_concurrent_documents;
-    });
+    while (service_.busy_slots_ >= service_.config_.max_concurrent_documents) {
+      if (context->IsCancelled()) {
+        return {grpc::StatusCode::CANCELLED,
+                "the call was cancelled while waiting for a render slot"};
+      }
+      if (bounded && std::chrono::system_clock::now() >= deadline) {
+        return {grpc::StatusCode::DEADLINE_EXCEEDED,
+                "the call's deadline passed while waiting for a render slot"};
+      }
+      service_.slots_available_.wait_for(lock, kSlotPoll);
+    }
     service_.busy_slots_++;
+    held_ = true;
+    return grpc::Status::OK;
   }
+
   ~SlotGuard() {
+    if (!held_) return;
     {
       std::lock_guard<std::mutex> lock(service_.slots_mutex_);
       service_.busy_slots_--;
@@ -269,15 +301,53 @@ class RenderServiceImpl::SlotGuard {
 
  private:
   RenderServiceImpl& service_;
+  bool held_ = false;
+};
+
+class RenderServiceImpl::UploadReservation {
+ public:
+  explicit UploadReservation(RenderServiceImpl& service) : service_(service) {}
+  UploadReservation(const UploadReservation&) = delete;
+  UploadReservation& operator=(const UploadReservation&) = delete;
+  ~UploadReservation() { service_.buffered_upload_bytes -= reserved_; }
+
+  // Counts bytes against the server-wide upload buffer; false, with
+  // nothing counted, when they would push it past the cap.
+  bool add(long bytes) {
+    long current = service_.buffered_upload_bytes.load();
+    do {
+      if (current + bytes > service_.config_.max_buffered_upload_bytes) {
+        return false;
+      }
+    } while (!service_.buffered_upload_bytes.compare_exchange_weak(
+        current, current + bytes));
+    reserved_ += bytes;
+    return true;
+  }
+
+ private:
+  RenderServiceImpl& service_;
+  long reserved_ = 0;
 };
 
 RenderServiceImpl::RenderServiceImpl(ServiceConfig config)
-    : config_(std::move(config)), supported_formats_(kExtensions) {}
+    : config_(std::move(config)), supported_formats_(kExtensions) {
+  if (config_.max_buffered_upload_bytes <= 0) {
+    config_.max_buffered_upload_bytes =
+        config_.max_document_bytes * config_.max_concurrent_documents;
+  }
+  config_.max_buffered_upload_bytes =
+      std::max(config_.max_buffered_upload_bytes, config_.max_document_bytes);
+}
 
 template <typename Response, typename Request, typename In>
 grpc::Status RenderServiceImpl::render(
-    const char* mode, In* in, const std::function<bool(Response&&)>& write,
-    const char* default_parts) {
+    const char* mode, grpc::ServerContext* context, In* in,
+    const std::function<bool(Response&&)>& write, const char* default_parts) {
+  // Every buffered byte counts against the server-wide cap from the moment
+  // it arrives until this request ends, so concurrent uploads cannot pile
+  // up whole documents in memory without bound before admission.
+  UploadReservation reservation(*this);
   std::string bytes;
   std::string document_id;
   std::string filename;
@@ -306,6 +376,13 @@ grpc::Status RenderServiceImpl::render(
       rejected++;
       return {grpc::StatusCode::RESOURCE_EXHAUSTED,
               "document exceeds " + std::to_string(config_.max_document_bytes) + " bytes"};
+    }
+    if (!reservation.add(static_cast<long>(chunk.data().size()))) {
+      rejected++;
+      return {grpc::StatusCode::RESOURCE_EXHAUSTED,
+              "the server's upload buffer is full ("
+                  + std::to_string(config_.max_buffered_upload_bytes)
+                  + " bytes across in-flight requests); retry later"};
     }
     bytes.append(chunk.data());
     if (chunk.complete()) saw_complete = true;
@@ -370,6 +447,10 @@ grpc::Status RenderServiceImpl::render(
   }
 
   SlotGuard slot(*this);
+  if (grpc::Status waited = slot.acquire(context); !waited.ok()) {
+    rejected++;
+    return waited;
+  }
   ScopedWorkDir work_dir(config_.tmpfs_dir);
   if (work_dir.path().empty()) {
     failed++;
@@ -390,6 +471,18 @@ grpc::Status RenderServiceImpl::render(
   if (extras.timeout_seconds() > 0) {
     deadline = std::chrono::milliseconds(extras.timeout_seconds() * 1000);
   }
+  // The caller's own deadline caps the worker's: render time past it is
+  // spent on a response nobody is waiting for.
+  if (has_deadline(context)) {
+    auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+        context->deadline() - std::chrono::system_clock::now());
+    if (left.count() <= 0) {
+      rejected++;
+      return {grpc::StatusCode::DEADLINE_EXCEEDED,
+              "the call's deadline passed before the render started"};
+    }
+    deadline = std::min(deadline, left);
+  }
   std::vector<std::string> argv = {
       config_.worker_path, mode, extension,
       std::to_string(render_dpi), std::to_string(config_.max_side_px),
@@ -408,7 +501,8 @@ grpc::Status RenderServiceImpl::render(
           response.mutable_document_info()->set_document_id(document_id);
         }
         return write(std::move(response));
-      });
+      },
+      [context] { return context->IsCancelled(); });
 
   switch (outcome.kind) {
     case WorkerOutcome::Kind::kOk:
@@ -433,6 +527,10 @@ grpc::Status RenderServiceImpl::render(
     case WorkerOutcome::Kind::kAborted:
       failed++;
       return grpc::Status::CANCELLED;
+    case WorkerOutcome::Kind::kCancelled:
+      failed++;
+      return {grpc::StatusCode::CANCELLED,
+              "the call was cancelled; its worker was killed"};
     case WorkerOutcome::Kind::kCrash:
     default:
       failed++;
@@ -441,36 +539,38 @@ grpc::Status RenderServiceImpl::render(
 }
 
 grpc::Status RenderServiceImpl::StreamPages(
-    grpc::ServerContext*,
+    grpc::ServerContext* context,
     grpc::ServerReaderWriter<officev1::StreamPagesResponse,
                              officev1::StreamPagesRequest>* stream) {
   return render<officev1::StreamPagesResponse, officev1::StreamPagesRequest>(
-      "pages", stream, [&](officev1::StreamPagesResponse&& response) {
+      "pages", context, stream, [&](officev1::StreamPagesResponse&& response) {
         return stream->Write(response);
       });
 }
 
 grpc::Status RenderServiceImpl::ConvertToPdf(
-    grpc::ServerContext*,
+    grpc::ServerContext* context,
     grpc::ServerReaderWriter<officev1::ConvertToPdfResponse,
                              officev1::ConvertToPdfRequest>* stream) {
   return render<officev1::ConvertToPdfResponse, officev1::ConvertToPdfRequest>(
-      "pdf", stream, [&](officev1::ConvertToPdfResponse&& response) {
+      "pdf", context, stream, [&](officev1::ConvertToPdfResponse&& response) {
         return stream->Write(response);
       });
 }
 
 grpc::Status RenderServiceImpl::ToDocument(
-    grpc::ServerContext*,
+    grpc::ServerContext* context,
     grpc::ServerReader<officev1::StreamPagesRequest>* reader,
     officev1::ToDocumentResponse* response) {
   DoclingMapper mapper;
   // Page images are omitted unless the caller explicitly selects
   // DOCUMENT_PART_PAGES: the mapper inlines them as data URIs, which would
-  // blow the unary response far past typical client message limits.
+  // blow the unary response far past typical client message limits. The
+  // fold never writes to the caller until the end, so the worker run's
+  // cancellation probe is what notices a caller that went away.
   grpc::Status status =
       render<officev1::StreamPagesResponse, officev1::StreamPagesRequest>(
-          "pages", reader,
+          "pages", context, reader,
           [&](officev1::StreamPagesResponse&& event) {
             if (event.has_document_info()) {
               *response->mutable_document_info() = event.document_info();

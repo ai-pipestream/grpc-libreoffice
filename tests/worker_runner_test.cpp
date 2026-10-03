@@ -4,6 +4,7 @@
 // integration lives in worker_render_test.cpp.
 
 #include <signal.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <cstdlib>
@@ -192,12 +193,75 @@ void verify_concurrent_workers_do_not_share_pipes() {
               + std::to_string(first_ms) + "ms");
 }
 
+// The caller's cancellation probe is polled while the worker runs: once it
+// reports true the worker is killed and the run ends as kCancelled,
+// promptly rather than at the stub's own pace.
+void verify_cancellation_kills_worker() {
+  const auto begin = std::chrono::steady_clock::now();
+  std::vector<std::string> argv = {"/bin/sh", "-c", "exec sleep 60"};
+  auto outcome = grlibre::run_worker(
+      argv, "", std::chrono::milliseconds(30000), 1u << 20,
+      [](std::string&&) { return true; },
+      [&] {
+        return std::chrono::steady_clock::now() - begin
+            > std::chrono::milliseconds(300);
+      });
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - begin);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kCancelled,
+          "a cancelled caller kills the worker, got: " + outcome.detail);
+  require(elapsed.count() < 5000,
+          "the cancellation kill happens promptly, took "
+              + std::to_string(elapsed.count()) + "ms");
+}
+
+// The deadline covers the stdin copy, not just the render after it: a
+// worker that never reads an upload larger than the pipe buffer must still
+// die at the deadline instead of parking the parent in a blocking write.
+void verify_deadline_covers_stdin_copy() {
+  const std::string upload(4u << 20, 'x');
+  const auto begin = std::chrono::steady_clock::now();
+  auto outcome = run_stub("exec sleep 60", upload, nullptr,
+                          std::chrono::milliseconds(500));
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - begin);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kTimeout,
+          "a worker ignoring its upload times out, got: " + outcome.detail);
+  require(elapsed.count() < 10000,
+          "the stdin copy honours the deadline, took "
+              + std::to_string(elapsed.count()) + "ms");
+}
+
+// Frames split across many reads, a zero-length frame, and a frame that
+// lands in the same read as the next one's header all reassemble intact.
+void verify_frames_reassemble_across_reads() {
+  std::vector<std::string> payloads;
+  // A 200000-byte frame (larger than one read), an empty frame, then a
+  // short one; printf emits each piece in its own write.
+  auto outcome = run_stub(
+      "printf '\\100\\015\\003\\000'; head -c 200000 /dev/zero | tr '\\0' a; "
+      "printf '\\000\\000\\000\\000\\002\\000\\000\\000ok'",
+      "", &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "split frames stream ok, got: " + outcome.detail);
+  require(payloads.size() == 3, "three frames arrived, got "
+                                    + std::to_string(payloads.size()));
+  require(payloads[0] == std::string(200000, 'a'),
+          "the large frame reassembled intact");
+  require(payloads[1].empty(), "the empty frame arrived empty");
+  require(payloads[2] == "ok", "the short frame arrived intact");
+}
+
 }  // namespace
 
 int main() {
   // The server ignores SIGPIPE; the runner under test assumes the same, so
   // an upload raced against a dead stub must not kill this test.
   ::signal(SIGPIPE, SIG_IGN);
+  // Every case here finishes in seconds; a runner that wedges (a blocking
+  // write the deadline cannot interrupt) fails the test instead of hanging
+  // it.
+  ::alarm(120);
   verify_ok_stream_echoes_stdin();
   verify_exit_code_mapping();
   verify_deadline_kill_is_timeout();
@@ -207,6 +271,9 @@ int main() {
   verify_signal_death_names_signal();
   verify_exec_failure_is_crash();
   verify_concurrent_workers_do_not_share_pipes();
+  verify_cancellation_kills_worker();
+  verify_deadline_covers_stdin_copy();
+  verify_frames_reassemble_across_reads();
   std::println("worker-runner-test passed");
   return 0;
 }

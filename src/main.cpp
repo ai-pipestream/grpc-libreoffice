@@ -95,6 +95,10 @@ int main() {
     port = int_from_env("GRLIBRE_PORT", 50053, 1, 65535);
     config.max_document_bytes =
         static_cast<long>(int_from_env("GRLIBRE_MAX_DOCUMENT_MIB", 500, 1, 2048)) << 20;
+    // Unset (0) derives the cap from the per-document cap and the
+    // concurrency gate; see ServiceConfig::max_buffered_upload_bytes.
+    config.max_buffered_upload_bytes =
+        static_cast<long>(int_from_env("GRLIBRE_MAX_UPLOAD_BUFFER_MIB", 0, 1, 131072)) << 20;
     config.max_concurrent_documents = int_from_env("GRLIBRE_MAX_CONCURRENT_DOCUMENTS", 2, 1, 64);
     config.task_deadline = std::chrono::milliseconds(
         1000L * int_from_env("GRLIBRE_TASK_TIMEOUT_SECONDS", 120, 5, 3600));
