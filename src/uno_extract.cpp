@@ -176,6 +176,11 @@ using EmitFn = std::function<bool(const google::protobuf::MessageLite&)>;
 // 1/100 mm to twips: 1 inch = 2540 * (1/100 mm) = 1440 twips.
 long hundredth_mm_to_twips(long value) { return value * 72 / 127; }
 
+// Draw-page groups nest recursively, and every walk over them recurses
+// with them; a crafted document can nest groups deep enough to exhaust the
+// worker's stack. Groups past this depth are reported and not descended.
+constexpr int kMaxShapeGroupDepth = 64;
+
 std::string utf8(const rtl::OUString& text) {
   rtl::OString bytes = rtl::OUStringToOString(text, RTL_TEXTENCODING_UTF8);
   return std::string(bytes.getStr(), static_cast<size_t>(bytes.getLength()));
@@ -202,8 +207,14 @@ class Warner {
     if (sink_ != nullptr) sink_->push_back("typed content: " + message);
   }
 
+  // Warns about a condition once per walk, however often it recurs.
+  void warn_once(const std::string& message) {
+    if (warned_.insert(message).second) warn(message);
+  }
+
  private:
   std::vector<std::string>* sink_;
+  std::set<std::string> warned_;
 };
 
 // The office core bootstrapped UNO in this process when LibreOfficeKit
@@ -2315,10 +2326,12 @@ void emit_form_control(const Reference<css::beans::XPropertySet>& shape_props,
 // backing frame) emit Shape events (gated on SHAPES). Control shapes and
 // empty-text shapes are skipped silently. group_path names the ancestor
 // chain, empty at the top level; groups are recursed even when only IMAGES
-// is selected so nested image shapes are found.
+// is selected so nested image shapes are found. depth counts the enclosing
+// groups; children past kMaxShapeGroupDepth are not descended.
 bool emit_writer_shapes(const Reference<css::container::XIndexAccess>& shapes,
                         const std::string& group_path, WriterShapeWalk* walk,
-                        const EmitFn& emit_fn, Warner& warner) {
+                        const EmitFn& emit_fn, Warner& warner,
+                        int depth = 0) {
   for (sal_Int32 i = 0; i < shapes->getCount(); i++) {
     std::string slot = group_path.empty()
         ? std::to_string(i) : group_path + "/" + std::to_string(i);
@@ -2373,8 +2386,13 @@ bool emit_writer_shapes(const Reference<css::container::XIndexAccess>& shapes,
         walk->shape_index++;
       }
       Reference<css::container::XIndexAccess> children(props, UNO_QUERY);
-      if (children.is()) {
-        if (!emit_writer_shapes(children, slot, walk, emit_fn, warner)) {
+      if (children.is() && depth >= kMaxShapeGroupDepth) {
+        warner.warn_once("shape groups nested deeper than "
+                         + std::to_string(kMaxShapeGroupDepth)
+                         + " levels were not descended");
+      } else if (children.is()) {
+        if (!emit_writer_shapes(children, slot, walk, emit_fn, warner,
+                                depth + 1)) {
           return false;
         }
       }
@@ -2646,12 +2664,13 @@ bool emit_text_frames(const Reference<css::text::XTextDocument>& text_doc,
 // emitted for image shapes across the whole document. DrawingShape events
 // are gated on the SHAPES part and image bytes on the IMAGES part; groups
 // are still recursed when only IMAGES is selected so nested image shapes
-// are found.
+// are found. depth counts the enclosing groups; children past
+// kMaxShapeGroupDepth are not descended.
 bool emit_shapes(const Reference<css::drawing::XShapes>& shapes,
                  int32_t page_index, const std::string& group_path,
                  const Reference<css::graphic::XGraphicProvider>& provider,
                  int32_t* image_counter, const PartSelection& parts,
-                 const EmitFn& emit_fn, Warner& warner) {
+                 const EmitFn& emit_fn, Warner& warner, int depth = 0) {
   bool want_shapes = parts.wants(officev1::DOCUMENT_PART_SHAPES);
   bool want_images = parts.wants(officev1::DOCUMENT_PART_IMAGES);
   for (sal_Int32 i = 0; i < shapes->getCount(); i++) {
@@ -2718,8 +2737,13 @@ bool emit_shapes(const Reference<css::drawing::XShapes>& shapes,
     out->set_is_group(children.is());
     if (want_shapes && !emit_fn(event)) return false;
     if (children.is()) {
-      if (!emit_shapes(children, page_index, shape_path, provider,
-                       image_counter, parts, emit_fn, warner)) {
+      if (depth >= kMaxShapeGroupDepth) {
+        warner.warn_once("shape groups nested deeper than "
+                         + std::to_string(kMaxShapeGroupDepth)
+                         + " levels were not descended");
+      } else if (!emit_shapes(children, page_index, shape_path, provider,
+                              image_counter, parts, emit_fn, warner,
+                              depth + 1)) {
         return false;
       }
       continue;
@@ -2877,7 +2901,7 @@ bool emit_slide_shape(const Reference<css::drawing::XShape>& shape,
                       bool want_slides,
                       const Reference<css::graphic::XGraphicProvider>& provider,
                       int32_t* image_counter, const EmitFn& emit_fn,
-                      Warner& warner) {
+                      Warner& warner, int depth = 0) {
   std::string shape_type = utf8(shape->getShapeType());
   std::string label = "slide " + std::to_string(slide_index) +
                       (notes ? " notes shape " : " shape ") +
@@ -2993,6 +3017,12 @@ bool emit_slide_shape(const Reference<css::drawing::XShape>& shape,
   if (shape_type.ends_with(".GroupShape")) {
     children = Reference<css::drawing::XShapes>(shape, UNO_QUERY);
   }
+  if (children.is() && depth >= kMaxShapeGroupDepth) {
+    warner.warn_once("shape groups nested deeper than "
+                     + std::to_string(kMaxShapeGroupDepth)
+                     + " levels were not descended");
+    children.clear();
+  }
   if (children.is()) {
     for (sal_Int32 i = 0; i < children->getCount(); i++) {
       Reference<css::drawing::XShape> child;
@@ -3008,7 +3038,7 @@ bool emit_slide_shape(const Reference<css::drawing::XShape>& shape,
       if (!child.is()) continue;
       if (!emit_slide_shape(child, slide_index, static_cast<int32_t>(i), notes,
                             want_slides, provider, image_counter, emit_fn,
-                            warner)) {
+                            warner, depth + 1)) {
         return false;
       }
     }

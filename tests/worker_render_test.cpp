@@ -2972,6 +2972,93 @@ void verify_svg_fallback_raster_is_clamped() {
               std::to_string(width) + "x" + std::to_string(height));
 }
 
+// One text shape buried under `depth` nested groups, in a text document, a
+// presentation, or a drawing, as flat ODF.
+std::string nested_groups_document(const std::string& kind, int depth) {
+  std::string groups;
+  for (int i = 0; i < depth; i++) groups += "<draw:g>";
+  groups += "<draw:rect svg:x=\"1cm\" svg:y=\"1cm\" svg:width=\"4cm\" "
+            "svg:height=\"2cm\"><text:p>DEEP-LEAF</text:p></draw:rect>";
+  for (int i = 0; i < depth; i++) groups += "</draw:g>";
+  std::string body;
+  std::string mimetype;
+  if (kind == "text") {
+    mimetype = "application/vnd.oasis.opendocument.text";
+    // Only the outermost group carries the paragraph anchor.
+    groups.replace(0, 8, "<draw:g text:anchor-type=\"paragraph\">");
+    body = "<office:text><text:p>Anchor" + groups + "</text:p></office:text>";
+  } else if (kind == "presentation") {
+    mimetype = "application/vnd.oasis.opendocument.presentation";
+    body = "<office:presentation><draw:page draw:name=\"page1\">" + groups +
+           "</draw:page></office:presentation>";
+  } else {
+    mimetype = "application/vnd.oasis.opendocument.graphics";
+    body = "<office:drawing><draw:page draw:name=\"page1\">" + groups +
+           "</draw:page></office:drawing>";
+  }
+  return R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ office:version="1.2" office:mimetype=")" +
+         mimetype + "\"><office:body>" + body +
+         "</office:body></office:document>\n";
+}
+
+// Shape-group recursion is capped: a shape buried past the cap is not
+// reached and the stream says so once, while the same shape under fewer
+// groups than the cap is extracted normally. Covers the three group walks:
+// Writer draw-page shapes, presentation slide shapes, and drawing shapes.
+void verify_shape_group_depth_is_capped() {
+  struct Kind {
+    std::string name;
+    std::string extension;
+    std::string parts;
+  };
+  const std::vector<Kind> kinds = {{"text", "fodt", "12"},
+                                   {"presentation", "fodp", "11"},
+                                   {"drawing", "fodg", "12"}};
+  for (const Kind& kind : kinds) {
+    for (int depth : {60, 80}) {
+      std::vector<std::string> payloads;
+      auto outcome =
+          run_with_parts("pages", kind.extension,
+                         nested_groups_document(kind.name, depth), kind.parts,
+                         &payloads);
+      const std::string what =
+          kind.name + " with " + std::to_string(depth) + " nested groups";
+      require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+              what + " renders ok: " + outcome.detail);
+      bool reached_leaf = false;
+      int capped_warnings = 0;
+      officev1::StreamPagesResponse event;
+      for (const std::string& payload : payloads) {
+        require(event.ParseFromString(payload), what + " event parses");
+        // Any typed event carrying the leaf's text means the walk got there.
+        if ((event.has_shape() || event.has_slide_shape() ||
+             event.has_drawing_shape()) &&
+            event.DebugString().contains("DEEP-LEAF")) {
+          reached_leaf = true;
+        }
+        if (event.has_status()) {
+          for (const std::string& warning : event.status().warnings()) {
+            if (warning.contains("nested deeper than 64")) capped_warnings++;
+          }
+        }
+      }
+      if (depth < 64) {
+        require(reached_leaf, what + ": the leaf under the cap is extracted");
+        require(capped_warnings == 0, what + ": no cap warning under the cap");
+      } else {
+        require(!reached_leaf, what + ": the leaf past the cap is not reached");
+        require(capped_warnings == 1,
+                what + ": the cap is reported exactly once");
+      }
+    }
+  }
+}
+
 int main() {
   if (!std::filesystem::exists(lo_install_path())) {
     std::println(stderr, "SKIP: no LibreOffice at {}", lo_install_path());
@@ -3010,6 +3097,7 @@ int main() {
   verify_per_page_style();
   verify_unknown_form_value_is_harmless();
   verify_svg_fallback_raster_is_clamped();
+  verify_shape_group_depth_is_capped();
   verify_death_before_status_is_crash();
   verify_hung_worker_is_killed_at_deadline();
   verify_eof_without_exit_is_reaped();
