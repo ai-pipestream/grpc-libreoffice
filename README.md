@@ -267,7 +267,9 @@ it right after), and it lives in the same tmpfs `TMPDIR`. File locking is
 disabled through the worker profile, so no `.~lock` siblings are written
 anywhere. Document macros never run: every load passes LibreOfficeKit's
 `EnableMacrosExecution=false` and `MacroSecurityLevel=3`, and the worker
-profile switches macro execution off as well.
+profile switches macro execution off as well. The profile also blocks
+links from untrusted referers, so the office core does not fetch the
+pictures or other resources an uploaded document links to.
 
 ## Configuration
 

@@ -2,9 +2,14 @@
 // Skips (exit 77) when soffice is not installed.
 
 #include <linux/magic.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
 #include <sys/vfs.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
@@ -15,6 +20,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "ai/pipestream/office/v1/office_service.pb.h"
@@ -3515,6 +3521,87 @@ void verify_document_macros_never_run() {
   }
 }
 
+// Listens on an ephemeral loopback port and counts the connections made to
+// it, standing in for any host an uploaded document links to.
+class ConnectionCounter {
+ public:
+  ConnectionCounter() {
+    fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    require(fd_ >= 0, "listener socket");
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    require(::bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == 0,
+            "listener bind");
+    require(::listen(fd_, 16) == 0, "listener listen");
+    socklen_t length = sizeof addr;
+    require(::getsockname(fd_, reinterpret_cast<sockaddr*>(&addr), &length) == 0,
+            "listener port");
+    port_ = ntohs(addr.sin_port);
+    thread_ = std::thread([this] {
+      while (!stop_) {
+        pollfd waiter{.fd = fd_, .events = POLLIN, .revents = 0};
+        if (::poll(&waiter, 1, 50) <= 0) continue;
+        int client = ::accept(fd_, nullptr, nullptr);
+        if (client >= 0) {
+          connections_++;
+          ::close(client);
+        }
+      }
+    });
+  }
+  ~ConnectionCounter() {
+    stop_ = true;
+    thread_.join();
+    ::close(fd_);
+  }
+  int port() const { return port_; }
+  int connections() const { return connections_; }
+
+ private:
+  int fd_ = -1;
+  int port_ = 0;
+  std::atomic<bool> stop_{false};
+  std::atomic<int> connections_{0};
+  std::thread thread_;
+};
+
+// A document that links a picture from a web host must not make the worker
+// fetch it: the worker runs inside the service's network, so a fetch would
+// let an upload reach hosts behind it. Without the profile's referer block
+// the office core requests the picture on every render of this fixture.
+void verify_linked_resources_are_not_fetched() {
+  ConnectionCounter counter;
+  const std::string doc = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ xmlns:xlink="http://www.w3.org/1999/xlink"
+ office:version="1.2"
+ office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:body>
+  <office:text>
+   <text:p>A linked picture follows.<draw:frame draw:name="Linked" text:anchor-type="as-char" svg:width="2cm" svg:height="2cm"><draw:image xlink:href="http://127.0.0.1:)"
+      + std::to_string(counter.port()) + R"(/probe.png" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/></draw:frame></text:p>
+  </office:text>
+ </office:body>
+</office:document>
+)";
+  for (const std::string& mode : {std::string("pages"), std::string("pdf")}) {
+    std::vector<std::string> payloads;
+    auto outcome = run(mode, "fodt", doc, &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "the linked-picture document renders ok (" + mode + "): "
+                + outcome.detail);
+  }
+  // Give a connection attempt that raced the worker's exit time to land.
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  require(counter.connections() == 0,
+          "the worker fetched a linked picture "
+              + std::to_string(counter.connections()) + " time(s)");
+}
+
 int main() {
   if (!std::filesystem::exists(lo_install_path())) {
     std::println(stderr, "SKIP: no LibreOffice at {}", lo_install_path());
@@ -3557,6 +3644,7 @@ int main() {
   verify_svg_fallback_raster_is_clamped();
   verify_shape_group_depth_is_capped();
   verify_document_macros_never_run();
+  verify_linked_resources_are_not_fetched();
   verify_death_before_status_is_crash();
   verify_hung_worker_is_killed_at_deadline();
   verify_eof_without_exit_is_reaped();
