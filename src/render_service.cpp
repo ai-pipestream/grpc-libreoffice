@@ -489,7 +489,11 @@ grpc::Status RenderServiceImpl::render(
 
   {
     std::ofstream extras_out(work_dir.path() + "/options.pb", std::ios::binary);
-    if (!extras.SerializeToOstream(&extras_out)) {
+    // The filebuf only reaches tmpfs on close, so a full work dir shows up
+    // there and nowhere else. A lost options file would drop redact_spans.
+    bool serialized = extras.SerializeToOstream(&extras_out);
+    extras_out.close();
+    if (!serialized || extras_out.fail()) {
       failed++;
       return {grpc::StatusCode::INTERNAL, "cannot write worker options"};
     }
@@ -523,10 +527,14 @@ grpc::Status RenderServiceImpl::render(
       format_token};
   // Frames can carry a full page PNG; bound generously above the pixel cap.
   std::uint32_t max_frame = 256u * 1024 * 1024;
+  bool malformed_frame = false;
   WorkerOutcome outcome = run_worker(
       argv, bytes, deadline, max_frame, [&](std::string&& payload) {
         Response response;
-        if (!response.ParseFromString(payload)) return false;
+        if (!response.ParseFromString(payload)) {
+          malformed_frame = true;
+          return false;
+        }
         if (response.has_document_info()) {
           response.mutable_document_info()->set_document_id(document_id);
         }
@@ -534,6 +542,12 @@ grpc::Status RenderServiceImpl::render(
       },
       [context] { return context->IsCancelled(); });
 
+  // The worker, not the caller, broke the stream: stopping for it is not a
+  // cancellation.
+  if (malformed_frame) {
+    failed++;
+    return {grpc::StatusCode::INTERNAL, "the worker sent a malformed event"};
+  }
   switch (outcome.kind) {
     case WorkerOutcome::Kind::kOk:
       rendered++;

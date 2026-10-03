@@ -205,12 +205,12 @@ WorkerOutcome run_worker(const std::vector<std::string>& argv,
     if (to_child[0] == STDIN_FILENO) {
       ::fcntl(STDIN_FILENO, F_SETFD, 0);
     } else {
-      ::dup2(to_child[0], STDIN_FILENO);
+      if (::dup2(to_child[0], STDIN_FILENO) < 0) ::_exit(kExitRenderFailure);
     }
     if (from_child[1] == STDOUT_FILENO) {
       ::fcntl(STDOUT_FILENO, F_SETFD, 0);
     } else {
-      ::dup2(from_child[1], STDOUT_FILENO);
+      if (::dup2(from_child[1], STDOUT_FILENO) < 0) ::_exit(kExitRenderFailure);
     }
     // Nothing but stdin, stdout, and stderr crosses into the worker, even
     // a descriptor some library opened without close-on-exec.
@@ -279,6 +279,10 @@ WorkerOutcome run_worker(const std::vector<std::string>& argv,
           if (wrote < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            if (errno != EPIPE) {
+              return stop(true, WorkerOutcome::Kind::kCrash,
+                          "writing the upload to the worker failed");
+            }
             // EPIPE: the worker died before consuming the upload. The exit
             // status tells the real story; stop feeding.
             written = stdin_bytes.size();

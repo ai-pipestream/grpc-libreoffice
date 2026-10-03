@@ -49,6 +49,14 @@ std::string lo_install_path() {
   return configured != nullptr ? configured : "/usr/lib/libreoffice/program";
 }
 
+// The service always stages options.pb, and the worker refuses to run
+// without it; an empty file is the all-defaults StreamOptions.
+void stage_default_options(const std::string& work_dir) {
+  std::ofstream out(work_dir + "/options.pb", std::ios::binary);
+  out.close();
+  require(!out.fail(), "stage options.pb");
+}
+
 // Work dirs live on tmpfs, mirroring the service: the worker refuses a
 // disk-backed work dir outright.
 std::string make_work_dir() {
@@ -58,6 +66,7 @@ std::string make_work_dir() {
   std::vector<char> buffer(pattern.begin(), pattern.end());
   buffer.push_back('\0');
   require(::mkdtemp(buffer.data()) != nullptr, "mkdtemp");
+  stage_default_options(buffer.data());
   return buffer.data();
 }
 
@@ -2113,6 +2122,7 @@ void verify_disk_work_dir_is_refused() {
   buffer.push_back('\0');
   require(::mkdtemp(buffer.data()) != nullptr, "mkdtemp on disk");
   std::string work_dir = buffer.data();
+  stage_default_options(work_dir);
   std::vector<std::string> payloads;
   std::vector<std::string> argv = {
       worker_path(), "pages", "txt", "96", "2048",

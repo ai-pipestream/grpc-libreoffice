@@ -13,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <print>
 #include <string>
 
@@ -51,14 +52,20 @@ grlibre::PartSelection parse_parts(const std::string& token) {
   return parts;
 }
 
-std::string read_all_stdin() {
+// Empty when stdin fails: a read error must not pass a truncated upload off
+// as the whole document.
+std::optional<std::string> read_all_stdin() {
   std::string bytes;
   char buffer[1 << 16];
-  ssize_t got;
-  while ((got = ::read(STDIN_FILENO, buffer, sizeof buffer)) > 0) {
+  for (;;) {
+    ssize_t got = ::read(STDIN_FILENO, buffer, sizeof buffer);
+    if (got == 0) return bytes;
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      return std::nullopt;
+    }
     bytes.append(buffer, static_cast<size_t>(got));
   }
-  return bytes;
 }
 
 // The uploaded document must never reach disk. Everything the worker or the
@@ -185,7 +192,14 @@ int main(int argc, char** argv) {
   {
     std::ifstream extras_in(options.work_dir + "/options.pb", std::ios::binary);
     ai::pipestream::office::v1::StreamOptions extras;
-    if (extras_in && extras.ParseFromIstream(&extras_in)) {
+    // The service always writes this file, and it can carry redact_spans:
+    // rendering without it would emit text the caller asked to remove.
+    if (!extras_in || !extras.ParseFromIstream(&extras_in)) {
+      std::println(stderr, "grlibre-worker: cannot read {}/options.pb",
+                   options.work_dir);
+      return grlibre::kExitRenderFailure;
+    }
+    {
       if (extras.max_width_px() > 0) options.max_width_px = extras.max_width_px();
       options.grayscale = options.grayscale || extras.grayscale();
       if (extras.tracked_changes() != 0) {
@@ -226,7 +240,13 @@ int main(int argc, char** argv) {
     }
   }
 
-  std::string document = read_all_stdin();
+  std::optional<std::string> upload = read_all_stdin();
+  if (!upload) {
+    std::println(stderr, "grlibre-worker: reading the document from stdin "
+                         "failed: {}", std::strerror(errno));
+    return grlibre::kExitRenderFailure;
+  }
+  std::string document = std::move(*upload);
   if (document.empty()) {
     std::println(stderr, "grlibre-worker: no document bytes on stdin");
     return grlibre::kExitLoadFailure;
