@@ -279,8 +279,10 @@ docker run --rm --read-only --tmpfs /tmp:rw,size=1g -p 50053:50053 grlibre
 ```
 
 The image build runs the full test suite, including real renders through a
-headless LibreOffice, before an image can exist. Tests author their fixtures
-in memory; the render tests skip cleanly on machines without LibreOffice.
+headless LibreOffice, before an image can exist. The image carries the
+license texts of everything statically linked into the two binaries in
+`/opt/grlibre/licenses/`. Tests author their fixtures in memory; the render
+tests skip cleanly on machines without LibreOffice.
 
 ## Demo kit
 
