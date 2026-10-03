@@ -1,5 +1,6 @@
 #include "worker_runner.h"
 
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -113,27 +114,56 @@ WorkerOutcome run_worker(const std::vector<std::string>& argv,
                          std::chrono::milliseconds deadline,
                          std::uint32_t max_frame_bytes,
                          const std::function<bool(std::string&&)>& on_frame) {
+  // The server runs several workers at once, each spawned from its own
+  // request thread. Pipes created close-on-exec cannot leak into a sibling
+  // worker forked in the window between pipe creation and this request's
+  // own close: a leaked stdin write end keeps a worker from ever seeing
+  // EOF on its upload, and a leaked stdout write end keeps the parent from
+  // ever seeing the worker's EOF. dup2 onto 0 and 1 clears the flag on the
+  // child's own copies.
   int to_child[2];
   int from_child[2];
-  if (::pipe(to_child) != 0 || ::pipe(from_child) != 0) {
+  if (::pipe2(to_child, O_CLOEXEC) != 0) {
+    return {WorkerOutcome::Kind::kCrash, "pipe creation failed"};
+  }
+  if (::pipe2(from_child, O_CLOEXEC) != 0) {
+    ::close(to_child[0]);
+    ::close(to_child[1]);
     return {WorkerOutcome::Kind::kCrash, "pipe creation failed"};
   }
 
+  // Built before fork: the child of a multithreaded process may only make
+  // async-signal-safe calls until exec, and allocation is not one of them.
+  std::vector<char*> args;
+  args.reserve(argv.size() + 1);
+  for (const std::string& arg : argv) args.push_back(const_cast<char*>(arg.c_str()));
+  args.push_back(nullptr);
+
   pid_t pid = ::fork();
   if (pid < 0) {
-    return {WorkerOutcome::Kind::kCrash, "fork failed"};
-  }
-  if (pid == 0) {
-    ::dup2(to_child[0], STDIN_FILENO);
-    ::dup2(from_child[1], STDOUT_FILENO);
     ::close(to_child[0]);
     ::close(to_child[1]);
     ::close(from_child[0]);
     ::close(from_child[1]);
-    std::vector<char*> args;
-    args.reserve(argv.size() + 1);
-    for (const std::string& arg : argv) args.push_back(const_cast<char*>(arg.c_str()));
-    args.push_back(nullptr);
+    return {WorkerOutcome::Kind::kCrash, "fork failed"};
+  }
+  if (pid == 0) {
+    // dup2 onto the same descriptor makes no copy and keeps the flag, so
+    // an end that already sits on its target (a parent started with a
+    // closed stdin or stdout) has close-on-exec cleared directly.
+    if (to_child[0] == STDIN_FILENO) {
+      ::fcntl(STDIN_FILENO, F_SETFD, 0);
+    } else {
+      ::dup2(to_child[0], STDIN_FILENO);
+    }
+    if (from_child[1] == STDOUT_FILENO) {
+      ::fcntl(STDOUT_FILENO, F_SETFD, 0);
+    } else {
+      ::dup2(from_child[1], STDOUT_FILENO);
+    }
+    // Nothing but stdin, stdout, and stderr crosses into the worker, even
+    // a descriptor some library opened without close-on-exec.
+    ::close_range(3, ~0U, 0);
     ::execv(args[0], args.data());
     ::_exit(kExitRenderFailure);
   }

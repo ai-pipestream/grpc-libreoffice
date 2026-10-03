@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <print>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "lok_engine.h"
@@ -157,6 +158,40 @@ void verify_exec_failure_is_crash() {
               + outcome.detail);
 }
 
+// Two workers in flight at once, as the server's concurrency gate allows.
+// A's upload outgrows the pipe buffer and its stub drains stdin only after
+// a pause, so A's parent sits mid-copy holding its stdin write end while B
+// forks; B's stub then sleeps for seconds. A pipe end that leaked into B's
+// worker would keep A's worker from seeing EOF on its upload until B's
+// worker exited. Close-on-exec pipes keep A finishing right after its own
+// pause.
+void verify_concurrent_workers_do_not_share_pipes() {
+  const std::string upload(4u << 20, 'x');
+  std::vector<std::string> payloads;
+  grlibre::WorkerOutcome first;
+  long first_ms = 0;
+  std::thread runner([&] {
+    const auto begin = std::chrono::steady_clock::now();
+    first = run_stub("sleep 1; cat >/dev/null; printf '\\002\\000\\000\\000ok'",
+                     upload, &payloads);
+    first_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - begin)
+                   .count();
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  auto second = run_stub("exec sleep 4", "", nullptr);
+  runner.join();
+  require(first.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "the uploading worker finishes ok, got: " + first.detail);
+  require(payloads.size() == 1 && payloads[0] == "ok",
+          "the uploading worker's frame arrived");
+  require(second.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "the sleeping worker finishes ok, got: " + second.detail);
+  require(first_ms < 3000,
+          "the uploading worker saw EOF without waiting for its sibling, took "
+              + std::to_string(first_ms) + "ms");
+}
+
 }  // namespace
 
 int main() {
@@ -171,6 +206,7 @@ int main() {
   verify_torn_frame_is_crash();
   verify_signal_death_names_signal();
   verify_exec_failure_is_crash();
+  verify_concurrent_workers_do_not_share_pipes();
   std::println("worker-runner-test passed");
   return 0;
 }
