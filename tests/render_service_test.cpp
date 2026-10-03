@@ -8,6 +8,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -448,16 +449,16 @@ int main() {
     require(info.render_dpi() == 96, "dpi reported");
     require(info.supported_formats_size() > 20, "formats reported");
     require(info.diskless_documents(), "diskless posture advertised");
-    require(info.internal_temp_artifacts_size() == 4,
+    require(info.internal_temp_artifacts_size() == 3,
             "every LibreOffice-internal temp artifact class named");
     require(info.internal_temp_artifacts(0).contains("odf-load"),
             "ODF load residual named");
-    require(info.internal_temp_artifacts(1).contains("pdf-import"),
-            "PDF import residual named");
-    require(info.internal_temp_artifacts(2).contains("embedded-media"),
+    require(info.internal_temp_artifacts(1).contains("embedded-media"),
             "embedded media residual named");
-    require(info.internal_temp_artifacts(3).contains("pdf-export"),
+    require(info.internal_temp_artifacts(2).contains("pdf-export"),
             "PDF export residual named");
+    require(!std::ranges::contains(info.supported_formats(), std::string("pdf")),
+            "PDF is not advertised as a source format");
     require(info.document_mapping(), "ToDocument advertised");
     require(info.package_repair(), "package repair advertised");
     require(info.service_version() == "0.4.0", "service version");
@@ -466,6 +467,35 @@ int main() {
     require(info.ui().description() ==
                 "Renders office documents via LibreOfficeKit; pages out as PNG",
             "ui description advertised");
+  }
+
+  // PDF input is refused before any worker spawns, recognized by the
+  // filename extension, by the content type when the filename has no
+  // known extension, and by the %PDF- signature whatever the name says.
+  {
+    const std::string pdf_bytes = "%PDF-1.7\n%fake body\n";
+    auto by_name = stream_pages(channel, "not really a pdf", "report.PDF", true);
+    require(by_name.status.error_code() == grpc::StatusCode::UNIMPLEMENTED,
+            "a .pdf filename is UNIMPLEMENTED");
+    require(by_name.status.error_message().contains("PDF input is not supported"),
+            "the refusal says PDF input is not supported");
+    auto by_signature = stream_pages(channel, pdf_bytes, "disguised.docx", true);
+    require(by_signature.status.error_code() == grpc::StatusCode::UNIMPLEMENTED,
+            "PDF bytes behind an office extension are UNIMPLEMENTED");
+    auto stub = officev1::OfficeRenderService::NewStub(channel);
+    grpc::ClientContext context;
+    auto stream = stub->ConvertToPdf(&context);
+    officev1::ConvertToPdfRequest request;
+    request.mutable_chunk()->set_filename("upload");
+    request.mutable_chunk()->set_content_type("application/pdf; charset=binary");
+    request.mutable_chunk()->set_data("not really a pdf");
+    request.mutable_chunk()->set_complete(true);
+    stream->Write(request);
+    stream->WritesDone();
+    officev1::ConvertToPdfResponse ignored;
+    while (stream->Read(&ignored)) {}
+    require(stream->Finish().error_code() == grpc::StatusCode::UNIMPLEMENTED,
+            "an application/pdf content type is UNIMPLEMENTED");
   }
 
   // Protocol error paths, no office core involved.

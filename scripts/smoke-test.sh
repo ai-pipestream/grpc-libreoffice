@@ -9,7 +9,11 @@
 #      inside the image. The loader answers directly (LD_TRACE_LOADED_OBJECTS
 #      is what ldd does), so no shell or ldd is needed in the image.
 #   2. non-root: the image must not default to root (it ships USER grlibre).
-#   3. boot: the server reaches its own "grpc-libreoffice listening on" line
+#   3. no GPL: neither Poppler nor LibreOffice's PDF import (xpdfimport, the
+#      one Poppler consumer) is on the image's filesystem or in its dpkg
+#      database, which SBOM and license scanners read. The service refuses
+#      PDF input, so nothing needs them.
+#   4. boot: the server reaches its own "grpc-libreoffice listening on" line
 #      under the hardened run flags the stack uses (read-only rootfs, tmpfs
 #      at /tmp, no capabilities). The tmpfs mount matters: the server
 #      refuses to start without one, so a green boot also proves uploaded
@@ -64,6 +68,23 @@ echo "== smoke: image does not run as root"
 image_user=$(docker inspect --format '{{.Config.User}}' "$image")
 if [[ -z "$image_user" || "$image_user" == "root" || "$image_user" == "0" ]]; then
   echo "expected a non-root USER, image has '${image_user:-root}'" >&2
+  exit 1
+fi
+
+echo "== smoke: no GPL Poppler or PDF import in the image"
+# Read from outside the image, like the closure check: nothing in the image
+# is needed to list its filesystem.
+probe=$(docker create "$image")
+image_files=$(docker export "$probe" | tar -t)
+dpkg_status=$(docker cp "$probe":/var/lib/dpkg/status - | tar -xO)
+docker rm "$probe" >/dev/null
+if grep -E '(^|/)(libpoppler[^/]*|xpdfimport|libpdfimportlo\.so|pdfimport\.xcd)$' \
+    <<<"$image_files"; then
+  echo "the image ships Poppler or LibreOffice's PDF import (files above)" >&2
+  exit 1
+fi
+if grep -E '^Package: (lib)?poppler' <<<"$dpkg_status"; then
+  echo "the image's dpkg database lists Poppler (packages above)" >&2
   exit 1
 fi
 

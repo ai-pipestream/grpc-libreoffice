@@ -12,7 +12,6 @@ fetch sample4.docx https://filesamples.com/samples/document/docx/sample4.docx
 fetch sample3.xlsx https://filesamples.com/samples/document/xlsx/sample3.xlsx
 fetch sample2.doc  https://filesamples.com/samples/document/doc/sample2.doc
 fetch sample2.xls  https://filesamples.com/samples/document/xls/sample2.xls
-fetch dummy.pdf    https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf
 fetch sample1.pptx https://raw.githubusercontent.com/scanny/python-pptx/master/features/steps/test_files/test.pptx
 
 # odt and rtf: converted locally (their public sample URLs 403/404).

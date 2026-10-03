@@ -169,7 +169,8 @@ legacy), the OpenDocument families, RTF, CSV, HTML, and plain text.
 Errors are gRPC status codes: `INVALID_ARGUMENT` (no bytes, missing complete
 flag, unresolvable format, out-of-range options, or the core cannot load
 the document), `RESOURCE_EXHAUSTED` (over the byte cap, or the server-wide
-upload buffer is full), `FAILED_PRECONDITION` (broken package needing
+upload buffer is full), `UNIMPLEMENTED` (PDF input, see below),
+`FAILED_PRECONDITION` (broken package needing
 repair without the `allow_package_repair` opt-in), `DEADLINE_EXCEEDED`
 (per-document timeout or the caller's deadline, worker killed),
 `CANCELLED` (the caller cancelled; a running worker is killed), `INTERNAL`
@@ -185,9 +186,15 @@ the opt-in the worker retries the load with `RepairPackage=true`. A
 package that still will not open fails as `INVALID_ARGUMENT`. A broken
 package is never repaired silently.
 
-Accepted formats also include PDF, which the core imports through Draw;
-PDF pages rasterize like any other document and, because the import
-produces a drawing model, emit `DrawingShape` typed content.
+PDF input is refused with `UNIMPLEMENTED`, before any worker spawns:
+LibreOffice reads PDFs through its PDF import (`xpdfimport`), which runs
+GPL Poppler, and PDFs belong to the dedicated PDF backends. A PDF is
+recognized by a `.pdf` filename extension, by an `application/pdf`
+content type when the filename has no known extension, and by a `%PDF-`
+signature on the first bytes whatever the filename says. The service
+image ships without the PDF import component and without Poppler, which
+`scripts/smoke-test.sh` checks on every published image; `pdf` is not in
+`GetServiceInfo.supported_formats`.
 
 The repo also carries `ai.pipestream.document.v1`, the pipestream document
 structure schema, and a consumer-side mapper (built into the server
@@ -227,8 +234,7 @@ way. The document is staged there just long enough for the office core to
 open it and is unlinked the moment the load returns (the core keeps its own
 descriptors, so lazy reads of embedded media keep working). The core's own
 temp spills (`TMPDIR`) are pinned inside the same tmpfs: an ODF load keeps
-a full package copy there for the document's lifetime, a PDF upload is
-staged in full by the office core's PDF import, and embedded media
+a full package copy there for the document's lifetime, and embedded media
 spill their raw bytes plus derived bitmaps, so size the tmpfs for the
 document plus those spills, times the number of concurrent workers. In pdf
 mode the PDF streams straight from the export filter's output stream into
@@ -286,7 +292,7 @@ live stats show time to first page, pages per second, and typed-content
 counts.](docs/frontend.png)
 
 `fixtures/fetch.sh` downloads (or locally converts) a sample document set:
-docx, doc, xlsx, xls, pptx, odt, rtf, pdf, including a 224-page docx for
+docx, doc, xlsx, xls, pptx, odt, rtf, including a 224-page docx for
 stress runs.
 
 `frontend/` is a demo web UI: a small Node BFF speaks gRPC to the server

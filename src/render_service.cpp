@@ -16,15 +16,23 @@ namespace {
 namespace officev1 = ai::pipestream::office::v1;
 
 // Canonical extensions the office core loads; the advertised format list.
+// PDF is deliberately absent: see names_pdf.
 const std::vector<std::string> kExtensions = {
     "doc", "docx", "dot", "dotx", "rtf", "txt", "html", "odt", "ott", "fodt", "wpd",
     "xls", "xlsx", "xlt", "xltx", "csv", "tsv", "ods", "ots", "fods",
     "ppt", "pptx", "pot", "potx", "odp", "otp", "fodp",
-    "odg", "fodg", "vsd", "vsdx", "pdf"};
+    "odg", "fodg", "vsd", "vsdx"};
+
+// PDF input is refused with UNIMPLEMENTED rather than served. LibreOffice
+// reads PDFs through its PDF import, which runs GPL Poppler; the image
+// ships without that component, and PDFs belong to the dedicated PDF
+// backends anyway.
+constexpr char kPdfRefusal[] =
+    "PDF input is not supported: this service ships without LibreOffice's "
+    "PDF import (it runs GPL Poppler); send PDFs to a PDF backend";
 
 // Fallback resolution when the filename has no usable extension.
 const std::unordered_map<std::string, std::string> kContentTypes = {
-    {"application/pdf", "pdf"},
     {"application/msword", "doc"},
     {"application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"},
     {"application/rtf", "rtf"},
@@ -45,6 +53,21 @@ const std::unordered_map<std::string, std::string> kContentTypes = {
 std::string lowercase(std::string value) {
   for (char& c : value) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   return value;
+}
+
+// True when the identity fields name a PDF, resolved the way
+// resolve_extension resolves a format: the filename extension first, the
+// content type only when the filename has no extension it knows.
+bool names_pdf(const std::string& filename, const std::string& content_type) {
+  if (size_t dot = filename.rfind('.');
+      dot != std::string::npos && dot + 1 < filename.size()) {
+    std::string extension = lowercase(filename.substr(dot + 1));
+    if (extension == "pdf") return true;
+    if (std::ranges::contains(kExtensions, extension)) return false;
+  }
+  std::string bare = lowercase(content_type.substr(0, content_type.find(';')));
+  while (!bare.empty() && bare.back() == ' ') bare.pop_back();
+  return bare == "application/pdf" || bare == "application/x-pdf";
 }
 
 // Resolves the canonical source extension; empty when unresolvable.
@@ -386,6 +409,12 @@ grpc::Status RenderServiceImpl::render(
     }
     bytes.append(chunk.data());
     if (chunk.complete()) saw_complete = true;
+    // Refused as early as the stream reveals it, whatever the filename
+    // claims: a PDF signature on the first bytes is a PDF.
+    if (names_pdf(filename, content_type) || bytes.starts_with("%PDF-")) {
+      rejected++;
+      return {grpc::StatusCode::UNIMPLEMENTED, kPdfRefusal};
+    }
   }
   if (bytes.empty()) {
     rejected++;
@@ -610,9 +639,6 @@ grpc::Status RenderServiceImpl::GetServiceInfo(
   response->add_internal_temp_artifacts(
       "odf-load: LibreOffice keeps one internal temp copy of an ODF package "
       "in the tmpfs work dir until the document closes");
-  response->add_internal_temp_artifacts(
-      "pdf-import: LibreOffice's PDF import stages one full copy of the "
-      "uploaded document in the tmpfs work dir for the document lifetime");
   response->add_internal_temp_artifacts(
       "embedded-media: raw bytes of embedded objects and derived bitmaps "
       "may spill into the tmpfs work dir during a render");
