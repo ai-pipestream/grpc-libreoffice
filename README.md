@@ -228,7 +228,9 @@ chunk events; the one remaining materialization is LibreOffice-internal
 (the pdf filter renders into a named temp file and copies it out, unlinking
 it right after), and it lives in the same tmpfs `TMPDIR`. File locking is
 disabled through the worker profile, so no `.~lock` siblings are written
-anywhere.
+anywhere. Document macros never run: every load passes LibreOfficeKit's
+`EnableMacrosExecution=false` and `MacroSecurityLevel=3`, and the worker
+profile switches macro execution off as well.
 
 ## Configuration
 

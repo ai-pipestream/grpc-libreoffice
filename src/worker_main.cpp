@@ -77,11 +77,15 @@ bool on_tmpfs(const std::string& path) {
 // document and a failed lock write aborts a batch-mode load outright. The
 // officecfg setting is the only working off switch in this core: the
 // SAL_ENABLE_FILE_LOCKING env var ENABLES advisory locking when set to any
-// value, "0" included (sal/osl/unx/file.cxx).
+// value, "0" included (sal/osl/unx/file.cxx). The scripting settings switch
+// document macros off at the profile level too, so they stay off even for
+// a load path that does not pass the engine's explicit load options.
 constexpr char kProfileSeed[] =
     R"(<?xml version="1.0" encoding="UTF-8"?>
 <oor:items xmlns:oor="http://openoffice.org/2001/registry" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
 <item oor:path="/org.openoffice.Office.Common/Misc"><prop oor:name="UseLocking" oor:op="fuse"><value>false</value></prop></item>
+<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="DisableMacrosExecution" oor:op="fuse"><value>true</value></prop></item>
+<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop></item>
 </oor:items>
 )";
 

@@ -187,6 +187,26 @@ std::vector<std::string> rasterize_pdf(const std::string& pdf) {
   return pages;
 }
 
+// The PDF's text layer, as pdftotext extracts it: what selecting the text,
+// copy and paste, or any text extraction recovers from the file.
+// Requires poppler-utils, like rasterize_pdf.
+std::string pdf_text(const std::string& pdf) {
+  std::string work_dir = make_work_dir();
+  {
+    std::ofstream out(work_dir + "/doc.pdf", std::ios::binary);
+    out.write(pdf.data(), static_cast<std::streamsize>(pdf.size()));
+  }
+  std::string command = "pdftotext -enc UTF-8 '" + work_dir + "/doc.pdf' '"
+      + work_dir + "/doc.txt' >/dev/null 2>&1";
+  require(std::system(command.c_str()) == 0, "pdftotext runs");
+  std::ifstream in(work_dir + "/doc.txt", std::ios::binary);
+  std::string text((std::istreambuf_iterator<char>(in)),
+                   std::istreambuf_iterator<char>());
+  std::error_code ignored;
+  std::filesystem::remove_all(work_dir, ignored);
+  return text;
+}
+
 // The longest horizontal run of near-black pixels in a P6 PPM. Text
 // glyph strokes stay short; only a filled redaction box produces a long
 // run.
@@ -3059,6 +3079,74 @@ void verify_shape_group_depth_is_capped() {
   }
 }
 
+// A text document carrying an embedded Basic library whose macro is bound
+// to the document's load event: run, it appends a marker to the body
+// text. Flat ODF, so the macro source sits in the fixture in plain sight.
+// With macro execution switched on in the engine, the marker does appear
+// in both the extracted text and the PDF, so the assertions below cannot
+// pass vacuously on a fixture that never runs.
+constexpr char kAutoRunMacroFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:script="urn:oasis:names:tc:opendocument:xmlns:script:1.0"
+ xmlns:ooo="http://openoffice.org/2004/office"
+ xmlns:xlink="http://www.w3.org/1999/xlink"
+ xmlns:dom="http://www.w3.org/2001/xml-events"
+ office:version="1.2"
+ office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:scripts>
+  <office:script script:language="ooo:Basic">
+   <ooo:libraries>
+    <ooo:library-embedded ooo:name="Standard">
+     <ooo:module ooo:name="AutoRun">
+      <ooo:source-code>Sub OnLoadMarker
+  ThisComponent.getText().getEnd().setString("MACRO-RAN")
+End Sub
+</ooo:source-code>
+     </ooo:module>
+    </ooo:library-embedded>
+   </ooo:libraries>
+  </office:script>
+  <office:event-listeners>
+   <script:event-listener script:language="ooo:script" script:event-name="dom:load"
+    xlink:href="vnd.sun.star.script:Standard.AutoRun.OnLoadMarker?language=Basic&amp;location=document"/>
+  </office:event-listeners>
+ </office:scripts>
+ <office:body>
+  <office:text>
+   <text:p>Macro carrier.</text:p>
+  </office:text>
+ </office:body>
+</office:document>
+)";
+
+// Document macros never run: the load-event macro above must stay inert,
+// in pages mode (whose typed extraction pumps the office core's event
+// queue, where a posted load event would be dispatched) and in pdf mode.
+void verify_document_macros_never_run() {
+  {
+    std::vector<std::string> payloads;
+    auto outcome = run("pages", "fodt", kAutoRunMacroFodt, &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "macro document renders ok: " + outcome.detail);
+    PagesRun run_result = fold_pages(payloads);
+    const std::string text = all_paragraph_text(run_result);
+    require(text.contains("Macro carrier."), "the document body is extracted");
+    require(!text.contains("MACRO-RAN"),
+            "the load-event macro did not run, body: " + text);
+  }
+  {
+    std::vector<std::string> payloads;
+    auto outcome = run("pdf", "fodt", kAutoRunMacroFodt, &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "macro document exports ok: " + outcome.detail);
+    const std::string text = pdf_text(fold_pdf(payloads));
+    require(text.contains("Macro carrier."), "the PDF carries the body");
+    require(!text.contains("MACRO-RAN"),
+            "the load-event macro did not run before export, text: " + text);
+  }
+}
+
 int main() {
   if (!std::filesystem::exists(lo_install_path())) {
     std::println(stderr, "SKIP: no LibreOffice at {}", lo_install_path());
@@ -3098,6 +3186,7 @@ int main() {
   verify_unknown_form_value_is_harmless();
   verify_svg_fallback_raster_is_clamped();
   verify_shape_group_depth_is_capped();
+  verify_document_macros_never_run();
   verify_death_before_status_is_crash();
   verify_hung_worker_is_killed_at_deadline();
   verify_eof_without_exit_is_reaped();

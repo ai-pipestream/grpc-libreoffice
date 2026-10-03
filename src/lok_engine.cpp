@@ -418,13 +418,24 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
   // Every load gets LOK's Batch option: it installs the non-interactive
   // handler, without which any import interaction (Calc's text-import
   // dialog, the corrupt-document repair prompt) parks the load on a condvar
-  // forever. Delimiter formats additionally preset the text-import filter
-  // (separator 44 comma / 9 tab, quote 34, charset 76 UTF-8, from row 1).
-  const char* filter_options = "Batch=true";
+  // forever. Document macros never run, and that is stated rather than
+  // inherited: EnableMacrosExecution=false keeps the load at
+  // MacroExecMode::NEVER_EXECUTE, and MacroSecurityLevel=3 pins the core's
+  // security level to its strictest setting (LOK resets the level on every
+  // load when the option is absent). Delimiter formats additionally preset
+  // the text-import filter (separator 44 comma / 9 tab, quote 34, charset
+  // 76 UTF-8, from row 1); LOK strips its own options before the filter
+  // sees the string.
+  const char* filter_options =
+      "Batch=true,EnableMacrosExecution=false,MacroSecurityLevel=3";
   if (options.extension == "csv") {
-    filter_options = "44,34,76,1,,0,false,true,true,false,false,false,Batch=true";
+    filter_options = "44,34,76,1,,0,false,true,true,false,false,false,"
+                     "Batch=true,EnableMacrosExecution=false,"
+                     "MacroSecurityLevel=3";
   } else if (options.extension == "tsv") {
-    filter_options = "9,34,76,1,,0,false,true,true,false,false,false,Batch=true";
+    filter_options = "9,34,76,1,,0,false,true,true,false,false,false,"
+                     "Batch=true,EnableMacrosExecution=false,"
+                     "MacroSecurityLevel=3";
   }
   lok::Document* document = office->documentLoad(url.c_str(), filter_options);
   if (document == nullptr && options.allow_package_repair) {
