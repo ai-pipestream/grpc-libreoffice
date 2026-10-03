@@ -2868,12 +2868,12 @@ void verify_redaction_fails_closed() {
 // spreadsheet.
 std::string embedding_fodt(const std::string& frame_xml) {
   std::string filler;
-  for (int i = 0; i < 8; i++) {
+  for (int i = 0; i < 20; i++) {
     filler += "  <text:p>This filler paragraph pads the byte offset of the "
               "embedded object below past the window the flat XML type "
               "detector reads, so the nested office:mimetype token does not "
               "decide the type of the whole document. It carries no "
-              "assertions of its own and says the same thing eight times "
+              "assertions of its own and says the same thing twenty times "
               "over.</text:p>\n";
   }
   return R"(<?xml version="1.0" encoding="UTF-8"?>
