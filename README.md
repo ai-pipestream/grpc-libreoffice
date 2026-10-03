@@ -193,8 +193,9 @@ or extracted, each span resolves to the text it covers in the annotation
 text space, and that text leaves the document model wherever it occurs:
 body, tables, headers and footers, footnotes and endnotes, text frames,
 drawing shapes and their alt text, comments, fields, content controls,
-hyperlink targets, index entries, user-defined style names, and the
-document properties. Each character becomes one U+2588 FULL BLOCK drawn
+hyperlink targets (on text, images, shapes, and frames, image maps
+included), form controls and their forms, index entries, user-defined
+style names, and the document properties. Each character becomes one U+2588 FULL BLOCK drawn
 black on black, so the page shows a solid bar. Page images, SVG pages, the
 PDF (its text layer and document information included), and every typed
 event of the response come from that rewritten model. A span's text splits
@@ -203,11 +204,18 @@ and case-sensitive.
 Redaction fails closed with `FAILED_PRECONDITION`, and nothing streams,
 when a span ends past the annotation text space (spreadsheets,
 presentations, and drawings have none, so any span on them is refused),
-when the document embeds an object the service cannot inspect or one whose
-content carries the text, or when the text survives the rewrite anywhere
-the service can see, such as a tracked change's author (accept or reject
-the changes through `tracked_changes` to redact such a document). The
-pixels of embedded images are not inspected.
+when the document embeds an object the service cannot inspect (a foreign
+OLE object) or one whose content carries the text (every sheet of an
+embedded spreadsheet, every title, label, and category of an embedded
+chart, and objects nested inside them are inspected), when the text
+survives the rewrite anywhere the service can see, such as a tracked
+change's author (accept or reject the changes through `tracked_changes` to
+redact such a document), or when any of these checks fails to read part
+of the document. The reason names the region and the check, never
+document text. The pixels of embedded images are not inspected. Every
+typed event is checked again on its way out; in pages mode, should that
+last guard ever find the text the checks above missed, page images may
+already have streamed before the call ends `FAILED_PRECONDITION`.
 
 PDF input is refused with `UNIMPLEMENTED`, before any worker spawns:
 LibreOffice reads PDFs through its PDF import (`xpdfimport`), which runs

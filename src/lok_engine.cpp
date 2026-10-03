@@ -638,6 +638,9 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     // problems degrade to status warnings, never a failed render. Under a
     // redaction every event is checked once more on its way out, and one
     // that still carries redacted text ends the render refused instead.
+    // apply_redaction already ran the same check over every part this can
+    // emit, before anything was painted, so this guard is a backstop; if
+    // it ever trips, the page images above have already gone out.
     bool redaction_breached = false;
     if (ok) {
       ok = emit_typed_content(
