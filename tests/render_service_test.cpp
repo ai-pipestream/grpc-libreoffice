@@ -461,7 +461,8 @@ int main() {
             "PDF is not advertised as a source format");
     require(info.document_mapping(), "ToDocument advertised");
     require(info.package_repair(), "package repair advertised");
-    require(info.service_version() == "0.4.0", "service version");
+    require(info.service_version() == GRLIBRE_VERSION,
+            "service version is the build version");
     require(info.ui().title() == "LibreOffice", "ui title advertised");
     require(info.ui().path() == "/ui/libreoffice", "ui path advertised");
     require(info.ui().description() ==

@@ -14,7 +14,6 @@ struct WorkerOutcome {
     kOk,                    // exit 0, all frames delivered
     kLoadFailure,           // office core could not load the document
     kRepairNeedsOptIn,      // broken package; repair not opted into
-    kRepairUnimplemented,   // older worker exit 7; current workers do not emit this
     kWorkDirNotTmpfs,       // deployment error: work dir is not tmpfs
     kRedactionRefused,      // the requested redaction could not be applied
     kTimeout,               // deadline elapsed; worker was killed

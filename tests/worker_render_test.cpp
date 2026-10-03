@@ -2205,9 +2205,6 @@ void verify_broken_package_needs_repair_opt_in() {
           payloads.push_back(std::move(payload));
           return true;
         });
-    require(outcome.kind != grlibre::WorkerOutcome::Kind::kRepairUnimplemented,
-            "opted-in repair is no longer unimplemented, got detail: "
-                + outcome.detail);
     require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk
                 || outcome.kind == grlibre::WorkerOutcome::Kind::kLoadFailure,
             "opted-in repair either loads or fails as a load error, got detail: "

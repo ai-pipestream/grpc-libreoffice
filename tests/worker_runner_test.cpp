@@ -67,8 +67,6 @@ void verify_exit_code_mapping() {
       {grlibre::kExitLoadFailure, grlibre::WorkerOutcome::Kind::kLoadFailure},
       {grlibre::kExitRepairNeedsOptIn,
        grlibre::WorkerOutcome::Kind::kRepairNeedsOptIn},
-      {grlibre::kExitRepairUnimplemented,
-       grlibre::WorkerOutcome::Kind::kRepairUnimplemented},
       {grlibre::kExitWorkDirNotTmpfs,
        grlibre::WorkerOutcome::Kind::kWorkDirNotTmpfs},
       {grlibre::kExitRedactionRefused,

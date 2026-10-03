@@ -544,9 +544,6 @@ grpc::Status RenderServiceImpl::render(
     case WorkerOutcome::Kind::kRepairNeedsOptIn:
       rejected++;
       return {grpc::StatusCode::FAILED_PRECONDITION, outcome.detail};
-    case WorkerOutcome::Kind::kRepairUnimplemented:
-      rejected++;
-      return {grpc::StatusCode::UNIMPLEMENTED, outcome.detail};
     case WorkerOutcome::Kind::kWorkDirNotTmpfs:
       failed++;
       return {grpc::StatusCode::FAILED_PRECONDITION, outcome.detail};
@@ -633,7 +630,7 @@ grpc::Status RenderServiceImpl::ToDocument(
 grpc::Status RenderServiceImpl::GetServiceInfo(
     grpc::ServerContext*, const officev1::GetServiceInfoRequest*,
     officev1::GetServiceInfoResponse* response) {
-  response->set_service_version("0.4.0");
+  response->set_service_version(GRLIBRE_VERSION);
   response->set_typed_content(true);
   response->set_document_mapping(true);
   response->set_package_repair(true);

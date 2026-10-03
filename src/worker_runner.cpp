@@ -136,11 +136,6 @@ WorkerOutcome finish(pid_t pid, bool kill_first, WorkerOutcome::Kind kind_on_exi
                        "office core's repair path, which rebuilds a rewritten "
                        "copy of the document and requires the "
                        "allow_package_repair opt-in";
-    } else if (code == kExitRepairUnimplemented) {
-      outcome.kind = WorkerOutcome::Kind::kRepairUnimplemented;
-      outcome.detail = "allow_package_repair is set, but this server does not "
-                       "implement the repair path; the broken package cannot "
-                       "be loaded";
     } else if (code == kExitRedactionRefused) {
       outcome.kind = WorkerOutcome::Kind::kRedactionRefused;
       outcome.detail = "the requested redaction could not be applied to "

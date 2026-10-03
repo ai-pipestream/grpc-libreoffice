@@ -98,10 +98,9 @@ inline constexpr int kExitRenderFailure = 5;
 // The package is broken but repairable, and the caller did not opt into the
 // rewriting repair path.
 inline constexpr int kExitRepairNeedsOptIn = 6;
-// Retained so an older worker binary that still exits 7 maps to
-// UNIMPLEMENTED. Current workers retry with RepairPackage=true and
-// report a load failure if the package still will not open.
-inline constexpr int kExitRepairUnimplemented = 7;
+// Exit code 7 once meant "repair unimplemented"; the worker now retries
+// with RepairPackage=true and reports a load failure if the package still
+// will not open, and the server and worker always ship together.
 // The work dir handed to the worker is not on tmpfs; the worker refuses to
 // stage the upload rather than write document bytes to disk.
 inline constexpr int kExitWorkDirNotTmpfs = 8;
