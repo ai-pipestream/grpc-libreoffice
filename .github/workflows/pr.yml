@@ -5,9 +5,11 @@ name: Pull Request Build
 # does, where the Dockerfile's build stage runs the full test suite with
 # real LibreOffice renders, pushes nothing, and runs the same image gate,
 # scripts/smoke-test.sh, that publish runs before a digest gets a tag.
+# Renovate opens its pull requests against development, the GitHub default
+# branch, so those are built too.
 on:
   pull_request:
-    branches: [main]
+    branches: [main, development]
 
 permissions:
   contents: read

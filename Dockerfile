@@ -44,8 +44,10 @@ RUN set -e; deps=build/_deps; tp=$deps/grpc-src/third_party; out=build/licenses;
 # server verifies at startup that it really is tmpfs (uploaded documents
 # stay in RAM, never on disk) and refuses to run otherwise.
 #
-# No GPL code ships: LibreOffice's PDF import (xpdfimport, libpdfimportlo,
-# and its registry fragment) is the only consumer of GPL Poppler here, and
+# The service loads no GPL library (the Ubuntu base keeps its own GPL
+# userland, such as bash and coreutils): LibreOffice's PDF import
+# (xpdfimport, libpdfimportlo, and its registry fragment) is the only
+# consumer of GPL Poppler here, and
 # the service refuses PDF input, so dpkg is told not to unpack the import
 # and Poppler is purged after the install. libreoffice-core keeps its
 # declared dependency on Poppler unsatisfied, which matters only to apt
