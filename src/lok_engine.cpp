@@ -74,6 +74,40 @@ std::vector<PageRect> parse_page_rectangles(const char* rectangles) {
   return pages;
 }
 
+// The paint geometry of one page: the twips-to-pixels scale, the pixel size
+// it yields, and the DPI that scale amounts to.
+struct PaintSize {
+  double scale = 0;
+  int width_px = 1;
+  int height_px = 1;
+  int dpi = 0;
+};
+
+// Scales a page to the requested DPI, or to max_width_px when set, then
+// clamps its longer side to max_side_px. Every path that paints a page
+// sizes its pixel buffer from this, so no buffer is ever sized from a
+// page's twips extent alone: a spreadsheet page is the whole used sheet,
+// which a single far-away cell stretches to millions of twips.
+PaintSize paint_size(const PageRect& page, const RenderOptions& options) {
+  PaintSize size;
+  size.scale = options.dpi / kTwipsPerInch;
+  size.dpi = options.dpi;
+  if (options.max_width_px > 0 && page.width > 0) {
+    size.scale = static_cast<double>(options.max_width_px) / page.width;
+    size.dpi = std::max(1, static_cast<int>(size.scale * kTwipsPerInch));
+  }
+  long side = std::max(page.width, page.height);
+  if (side * size.scale > options.max_side_px) {
+    size.scale = static_cast<double>(options.max_side_px) / side;
+    size.dpi = std::max(1, static_cast<int>(size.scale * kTwipsPerInch));
+  }
+  size.width_px =
+      std::max(1, static_cast<int>(std::lround(page.width * size.scale)));
+  size.height_px =
+      std::max(1, static_cast<int>(std::lround(page.height * size.scale)));
+  return size;
+}
+
 bool emit(int fd, const google::protobuf::MessageLite& message) {
   std::string serialized;
   if (!message.SerializeToString(&serialized)) return false;
@@ -284,20 +318,16 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
               "PNG wrapped in SVG");
           svg_fallback_warned = true;
         }
-        double scale = options.dpi / kTwipsPerInch;
-        if (options.max_width_px > 0 && page.width > 0) {
-          scale = static_cast<double>(options.max_width_px) / page.width;
-        }
-        int width_px = std::max(1, static_cast<int>(std::lround(page.width * scale)));
-        int height_px = std::max(1, static_cast<int>(std::lround(page.height * scale)));
+        const PaintSize size = paint_size(page, options);
         std::vector<unsigned char> pixels(
-            static_cast<size_t>(width_px) * height_px * 4);
-        document->paintTile(pixels.data(), width_px, height_px,
+            static_cast<size_t>(size.width_px) * size.height_px * 4);
+        document->paintTile(pixels.data(), size.width_px, size.height_px,
                             static_cast<int>(page.x), static_cast<int>(page.y),
                             static_cast<int>(page.width),
                             static_cast<int>(page.height));
-        std::string png = encode_png(pixels.data(), width_px, height_px, bgra);
-        svg = svg_from_png(png, width_px, height_px);
+        std::string png =
+            encode_png(pixels.data(), size.width_px, size.height_px, bgra);
+        svg = svg_from_png(png, size.width_px, size.height_px);
       }
       if (svg.empty() || !svg.contains("<svg")) {
         encoder_ok = false;
@@ -322,23 +352,14 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
       }
       continue;
     }
-    double scale = options.dpi / kTwipsPerInch;
-    int effective_dpi = options.dpi;
-    if (options.max_width_px > 0 && page.width > 0) {
-      scale = static_cast<double>(options.max_width_px) / page.width;
-      effective_dpi = std::max(1, static_cast<int>(scale * kTwipsPerInch));
-    }
-    long side = std::max(page.width, page.height);
-    if (side * scale > options.max_side_px) {
-      scale = static_cast<double>(options.max_side_px) / side;
-      effective_dpi = std::max(1, static_cast<int>(scale * kTwipsPerInch));
-    }
-    int width_px = std::max(1, static_cast<int>(std::lround(page.width * scale)));
-    int height_px = std::max(1, static_cast<int>(std::lround(page.height * scale)));
+    const PaintSize size = paint_size(page, options);
+    const double scale = size.scale;
+    const int width_px = size.width_px;
+    const int height_px = size.height_px;
     RawPage raw{.index = static_cast<int>(index),
                 .width_px = width_px,
                 .height_px = height_px,
-                .dpi = effective_dpi,
+                .dpi = size.dpi,
                 .style = style_of(index),
                 .pixels = {}};
     raw.pixels.resize(static_cast<size_t>(width_px) * height_px * 4);

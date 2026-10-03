@@ -2915,6 +2915,63 @@ void verify_field_and_structure_content() {
   require(merge_wide_ok, "a horizontal merge reports its column span");
 }
 
+// A spreadsheet page is its whole used sheet, so one far-away cell makes a
+// page millions of twips tall. Spreadsheet SVG pages fall back to a painted
+// raster wrapped in SVG, and that raster must obey the same per-side pixel
+// bound as plain raster pages instead of sizing its buffer from the sheet's
+// twips extent (here tens of gigabytes at the requested 96 dpi).
+void verify_svg_fallback_raster_is_clamped() {
+  const std::string tall_sheet = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ office:version="1.2"
+ office:mimetype="application/vnd.oasis.opendocument.spreadsheet">
+ <office:body>
+  <office:spreadsheet>
+   <table:table table:name="Tall">
+    <table:table-row>
+     <table:table-cell office:value-type="string"><text:p>top</text:p></table:table-cell>
+    </table:table-row>
+    <table:table-row table:number-rows-repeated="299998">
+     <table:table-cell/>
+    </table:table-row>
+    <table:table-row>
+     <table:table-cell office:value-type="string"><text:p>bottom</text:p></table:table-cell>
+    </table:table-row>
+   </table:table>
+  </office:spreadsheet>
+ </office:body>
+</office:document>
+)";
+  officev1::StreamOptions extras;
+  extras.set_vector_format(officev1::PAGE_VECTOR_FORMAT_SVG);
+  std::vector<std::string> payloads;
+  auto outcome = run_with_extras("pages", "fods", tall_sheet, extras, &payloads,
+                                 "1");
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "tall sheet svg render ok: " + outcome.detail);
+  PagesRun run = fold_pages(payloads);
+  require(run.pages.size() == 1, "tall sheet emits its one page");
+  const std::string& svg = run.pages[0].png();
+  require(svg.contains("data:image/png;base64,"),
+          "spreadsheet svg pages take the raster fallback");
+  auto attribute = [&](const std::string& name) {
+    const std::string key = " " + name + "=\"";
+    size_t at = svg.find(key);
+    require(at != std::string::npos, "svg wrapper carries " + name);
+    return std::atoi(svg.c_str() + at + key.size());
+  };
+  const int width = attribute("width");
+  const int height = attribute("height");
+  require(height > width, "the tall sheet stays tall, got " +
+                              std::to_string(width) + "x" +
+                              std::to_string(height));
+  require(width <= 2048 && height <= 2048,
+          "the fallback raster obeys the per-side bound, got " +
+              std::to_string(width) + "x" + std::to_string(height));
+}
+
 int main() {
   if (!std::filesystem::exists(lo_install_path())) {
     std::println(stderr, "SKIP: no LibreOffice at {}", lo_install_path());
@@ -2952,6 +3009,7 @@ int main() {
   verify_tracked_change_display();
   verify_per_page_style();
   verify_unknown_form_value_is_harmless();
+  verify_svg_fallback_raster_is_clamped();
   verify_death_before_status_is_crash();
   verify_hung_worker_is_killed_at_deadline();
   verify_eof_without_exit_is_reaped();
