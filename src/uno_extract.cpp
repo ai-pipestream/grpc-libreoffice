@@ -459,6 +459,7 @@ bool emit_metadata(const Reference<css::frame::XModel>& model,
   metadata->set_title(utf8(props->getTitle()));
   metadata->set_author(utf8(props->getAuthor()));
   metadata->set_subject(utf8(props->getSubject()));
+  metadata->set_description(utf8(props->getDescription()));
   for (const rtl::OUString& keyword : props->getKeywords()) {
     metadata->add_keywords(utf8(keyword));
   }

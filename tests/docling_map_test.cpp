@@ -1740,6 +1740,8 @@ void verify_document_meta() {
     (*meta->mutable_statistics())["WordCount"] = 1234;
     (*meta->mutable_statistics())["PageCount"] = 12;
     (*meta->mutable_statistics())["LineCount"] = 99;
+    (*meta->mutable_statistics())["NonWhitespaceCharacterCount"] = 5600;
+    meta->set_description("Board pack, final");
     officev1::UserProperty* owner = meta->add_user_properties();
     owner->set_name("Owner");
     owner->set_text("Finance");
@@ -1776,11 +1778,17 @@ void verify_document_meta() {
   require(meta.statistics().words() == 1234
               && meta.statistics().pages() == 12,
           "meta: the statistics the schema counts are typed by name");
-  require(meta.user_properties_size() == 3
+  require(meta.statistics().characters() == 5600,
+          "meta: a character count without whitespace fills the counter when "
+          "the count with whitespace is absent");
+  require(meta.user_properties_size() == 4
               && meta.user_properties(0).text() == "Finance"
               && meta.user_properties(1).boolean()
               && meta.user_properties(2).instant().seconds() == 1679011200,
           "meta: user properties keep the type the source stored");
+  require(meta.user_properties(3).name() == "description"
+              && meta.user_properties(3).text() == "Board pack, final",
+          "meta: the description rides as a text property");
   require(mapper.document().body().meta().custom_fields().empty(),
           "meta: nothing about the document rides a value map");
 }
