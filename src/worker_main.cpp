@@ -305,6 +305,13 @@ int main(int argc, char** argv) {
   if (code != grlibre::kExitOk) {
     std::println(stderr, "grlibre-worker: {}", error);
   }
+  if (code == grlibre::kExitRedactionRefused) {
+    // The parent reads the reason back into the call's status; a refusal
+    // names regions and offsets, never document text.
+    std::ofstream refusal(options.work_dir + "/" + grlibre::kRefusalFile,
+                          std::ios::binary);
+    refusal << error;
+  }
   // End the process here, skipping exit-time teardown. This worker never
   // runs DeInitVCL, and letting exit() walk LibreOffice's atexit handlers
   // and static destructors after a render both stalls (destroying the

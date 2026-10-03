@@ -78,7 +78,8 @@ struct RenderOptions {
   bool include_notes_pages = false;
   // Form field writes applied after load, before paint/export.
   std::vector<std::pair<std::string, std::string>> form_values;
-  // Annotation-space spans to black out on rasters and on PDF export.
+  // Annotation-space spans whose text is redacted from the document model
+  // before paint, export, or extraction (see apply_redaction).
   std::vector<std::pair<std::int64_t, std::int64_t>> redact_spans;
   // Uploaded byte count, echoed into RenderStatus.
   long input_bytes = 0;
@@ -104,6 +105,13 @@ inline constexpr int kExitRepairUnimplemented = 7;
 // The work dir handed to the worker is not on tmpfs; the worker refuses to
 // stage the upload rather than write document bytes to disk.
 inline constexpr int kExitWorkDirNotTmpfs = 8;
+// The requested redaction could not be applied to the whole document; the
+// worker emitted nothing that could carry the text, and leaves the reason
+// in kRefusalFile under its work dir.
+inline constexpr int kExitRedactionRefused = 9;
+// Where a refusing worker leaves its human-readable reason, relative to
+// the work dir, for the parent to put in the call's status.
+inline constexpr char kRefusalFile[] = "refusal.txt";
 
 // Loads the document through LibreOfficeKit and writes framed response
 // events to out_fd. Returns a worker exit code; on failure *error names the

@@ -141,6 +141,10 @@ WorkerOutcome finish(pid_t pid, bool kill_first, WorkerOutcome::Kind kind_on_exi
       outcome.detail = "allow_package_repair is set, but this server does not "
                        "implement the repair path; the broken package cannot "
                        "be loaded";
+    } else if (code == kExitRedactionRefused) {
+      outcome.kind = WorkerOutcome::Kind::kRedactionRefused;
+      outcome.detail = "the requested redaction could not be applied to "
+                       "every region of the document";
     } else if (code == kExitWorkDirNotTmpfs) {
       outcome.kind = WorkerOutcome::Kind::kWorkDirNotTmpfs;
       outcome.detail = "the worker's work dir is not on tmpfs; the server "

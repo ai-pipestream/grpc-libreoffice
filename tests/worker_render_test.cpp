@@ -90,7 +90,8 @@ grlibre::WorkerOutcome run_with_extras(const std::string& mode,
                                        const std::string& document,
                                        const officev1::StreamOptions& extras,
                                        std::vector<std::string>* payloads,
-                                       const std::string& parts_token = "all") {
+                                       const std::string& parts_token = "all",
+                                       std::string* refusal = nullptr) {
   std::string work_dir = make_work_dir();
   {
     std::ofstream out(work_dir + "/options.pb", std::ios::binary);
@@ -105,6 +106,12 @@ grlibre::WorkerOutcome run_with_extras(const std::string& mode,
         payloads->push_back(std::move(payload));
         return true;
       });
+  if (refusal != nullptr) {
+    // A refusing worker leaves its reason behind for the parent.
+    std::ifstream in(work_dir + "/refusal.txt", std::ios::binary);
+    refusal->assign(std::istreambuf_iterator<char>(in),
+                    std::istreambuf_iterator<char>());
+  }
   std::error_code ignored;
   std::filesystem::remove_all(work_dir, ignored);
   return outcome;
@@ -2447,33 +2454,397 @@ void verify_redact_spans_change_pages() {
           "mid-paragraph redact span changes the painted page");
 }
 
-// Redaction on PDF export: the exported page must carry a filled black
-// box where the text was. Glyph strokes never produce a long horizontal
-// black run; a redaction rectangle does.
-void verify_pdf_redaction_paints_black_box() {
-  const std::string doc = "Hello over gRPC, this line gets redacted.\n";
+// The redaction span over the first length code points of the first
+// occurrence of needle in a pages-mode run's body paragraphs, in the
+// annotation text space the spans address (all of needle by default).
+officev1::TextSpan span_over(const PagesRun& run, const std::string& needle,
+                             size_t length = std::string::npos) {
+  for (const officev1::Paragraph& paragraph : run.paragraphs) {
+    std::string text;
+    for (const officev1::TextRun& text_run : paragraph.runs()) {
+      text += text_run.text();
+    }
+    size_t at = text.find(needle);
+    if (paragraph.char_offset() < 0 || at == std::string::npos) continue;
+    // ASCII up to the needle, so bytes count code points.
+    officev1::TextSpan span;
+    span.set_char_start(paragraph.char_offset() + static_cast<int64_t>(at));
+    span.set_char_end(span.char_start()
+                      + static_cast<int64_t>(std::min(length, needle.size())));
+    return span;
+  }
+  require(false, "the body carries \"" + needle + "\"");
+  return {};
+}
+
+// Every event of a pages-mode run, page images aside, as text: where any
+// string the stream carries would show up.
+std::string typed_event_text(const std::vector<std::string>& payloads) {
+  std::string all;
+  for (const std::string& payload : payloads) {
+    officev1::StreamPagesResponse event;
+    require(event.ParseFromString(payload), "event parses");
+    if (event.has_page_image()) continue;
+    all += event.DebugString();
+  }
+  return all;
+}
+
+// The PDF's document information dictionary as pdfinfo reports it.
+std::string pdf_info_text(const std::string& pdf) {
+  std::string work_dir = make_work_dir();
+  {
+    std::ofstream out(work_dir + "/doc.pdf", std::ios::binary);
+    out.write(pdf.data(), static_cast<std::streamsize>(pdf.size()));
+  }
+  std::string command = "pdfinfo -enc UTF-8 '" + work_dir + "/doc.pdf' > '"
+      + work_dir + "/info.txt' 2>/dev/null";
+  require(std::system(command.c_str()) == 0, "pdfinfo runs");
+  std::ifstream in(work_dir + "/info.txt", std::ios::binary);
+  std::string text((std::istreambuf_iterator<char>(in)),
+                   std::istreambuf_iterator<char>());
+  std::error_code ignored;
+  std::filesystem::remove_all(work_dir, ignored);
+  return text;
+}
+
+// A text document carrying one name in every region a reader can see: the
+// body (the occurrence the span addresses), a table cell, the page header,
+// the first-page header, and the footer, a footnote and an endnote, a text
+// frame, a drawing shape and one inside a group, a comment, a hyperlink
+// target, a field that shows the title, a content control and a dropdown
+// content control's entry, the name of a user-defined paragraph style, and
+// the title, subject, and keywords themselves.
+constexpr char kRedactionFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ xmlns:xlink="http://www.w3.org/1999/xlink"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0"
+ xmlns:loext="urn:org:documentfoundation:names:experimental:office:xmlns:loext:1.0"
+ office:version="1.3"
+ office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:meta>
+  <dc:title>Report on SECRET-VALUE</dc:title>
+  <dc:subject>About SECRET-VALUE</dc:subject>
+  <meta:keyword>SECRET-VALUE</meta:keyword>
+ </office:meta>
+ <office:styles>
+  <style:style style:name="Style_20_SECRET-VALUE"
+   style:display-name="Style SECRET-VALUE" style:family="paragraph"/>
+ </office:styles>
+ <office:automatic-styles>
+  <style:page-layout style:name="pm1">
+   <style:page-layout-properties fo:page-width="21cm" fo:page-height="29.7cm"
+    fo:margin-left="2cm" fo:margin-right="2cm" fo:margin-top="2cm"
+    fo:margin-bottom="2cm"/>
+   <style:header-style/>
+   <style:footer-style/>
+  </style:page-layout>
+ </office:automatic-styles>
+ <office:master-styles>
+  <style:master-page style:name="Standard" style:page-layout-name="pm1">
+   <style:header><text:p>Header SECRET-VALUE</text:p></style:header>
+   <style:header-first><text:p>First-page header SECRET-VALUE</text:p></style:header-first>
+   <style:footer><text:p>Footer SECRET-VALUE</text:p></style:footer>
+  </style:master-page>
+ </office:master-styles>
+ <office:body>
+  <office:text>
+   <text:p>Visible opening line.</text:p>
+   <text:p>The SECRET-VALUE sits in the body<text:note text:id="n1" text:note-class="footnote"><text:note-citation>1</text:note-citation><text:note-body><text:p>Footnote SECRET-VALUE</text:p></text:note-body></text:note>.</text:p>
+   <table:table table:name="T1">
+    <table:table-column/>
+    <table:table-row>
+     <table:table-cell office:value-type="string"><text:p>Cell SECRET-VALUE</text:p></table:table-cell>
+    </table:table-row>
+   </table:table>
+   <text:p><draw:frame draw:name="Frame1" text:anchor-type="paragraph" svg:width="8cm" svg:height="2cm"><draw:text-box><text:p>Frame SECRET-VALUE</text:p></draw:text-box></draw:frame>Frame anchor.</text:p>
+   <text:p><draw:rect text:anchor-type="paragraph" svg:x="1cm" svg:y="3cm" svg:width="8cm" svg:height="2cm"><text:p>Shape SECRET-VALUE</text:p></draw:rect>Shape anchor.</text:p>
+   <text:p><draw:g text:anchor-type="paragraph"><draw:rect svg:x="1cm" svg:y="6cm" svg:width="8cm" svg:height="2cm"><text:p>Grouped SECRET-VALUE</text:p></draw:rect></draw:g>Group anchor.<text:note text:id="n2" text:note-class="endnote"><text:note-citation>i</text:note-citation><text:note-body><text:p>Endnote SECRET-VALUE</text:p></text:note-body></text:note></text:p>
+   <text:p>Control: <loext:content-control>Controlled SECRET-VALUE</loext:content-control> and <loext:content-control loext:dropdown="true"><loext:list-item loext:display-text="Pick SECRET-VALUE" loext:value="SECRET-VALUE"/>a choice</loext:content-control>.</text:p>
+   <text:p>Commented<office:annotation><dc:creator>Reviewer</dc:creator><text:p>Comment on SECRET-VALUE</text:p></office:annotation> text.</text:p>
+   <text:p>A <text:a xlink:type="simple" xlink:href="https://example.com/SECRET-VALUE">link</text:a> and a title field: <text:title>Report on SECRET-VALUE</text:title></text:p>
+   <text:p text:style-name="Style_20_SECRET-VALUE">Visible closing line.</text:p>
+  </office:text>
+ </office:body>
+</office:document>
+)";
+
+// Redaction removes the addressed text from the document model, and every
+// other occurrence of it with it, before anything is painted, exported, or
+// extracted: the typed events, the PDF's text layer and document
+// information, and SVG pages no longer carry it anywhere, while the text
+// around it survives.
+void verify_redaction_removes_text_everywhere() {
+  const std::string secret = "SECRET-VALUE";
+  std::vector<std::string> baseline_payloads;
+  auto baseline = run("pages", "fodt", kRedactionFodt, &baseline_payloads);
+  require(baseline.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "redaction fixture renders ok: " + baseline.detail);
+  const std::string before = typed_event_text(baseline_payloads);
+  // The fixture really puts the name everywhere it claims to: in the typed
+  // events where extraction reaches, and in the PDF where only the page
+  // does (first-page header, content controls).
+  for (const char* region :
+       {"Header SECRET-VALUE", "Footer SECRET-VALUE", "Cell SECRET-VALUE",
+        "Footnote SECRET-VALUE", "Endnote SECRET-VALUE", "Frame SECRET-VALUE",
+        "Shape SECRET-VALUE", "Grouped SECRET-VALUE", "Comment on SECRET-VALUE",
+        "example.com/SECRET-VALUE", "Report on SECRET-VALUE",
+        "About SECRET-VALUE", "Style SECRET-VALUE"}) {
+    require(before.contains(region),
+            std::string("the unredacted stream carries ") + region);
+  }
+  {
+    std::vector<std::string> payloads;
+    auto outcome = run("pdf", "fodt", kRedactionFodt, &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "unredacted pdf ok: " + outcome.detail);
+    // pdftotext may break the content control's text across lines.
+    const std::string text = pdf_text(fold_pdf(payloads));
+    require(text.contains("First-page header SECRET-VALUE"),
+            "the unredacted PDF carries the first-page header");
+    const size_t control = text.find("Controlled");
+    require(control != std::string::npos
+                && text.find("SECRET-VALUE", control) < control + 20,
+            "the unredacted PDF carries the content control's text");
+  }
+  officev1::StreamOptions extras;
+  // The body occurrence only; the span covers the name and nothing else.
+  *extras.add_redact_spans() =
+      span_over(fold_pages(baseline_payloads), "SECRET-VALUE sits",
+                secret.size());
+
+  {
+    std::vector<std::string> payloads;
+    auto outcome = run_with_extras("pages", "fodt", kRedactionFodt, extras,
+                                   &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "redacted render ok: " + outcome.detail);
+    const std::string after = typed_event_text(payloads);
+    require(!after.contains(secret),
+            "no typed event carries the redacted text");
+    PagesRun run_result = fold_pages(payloads);
+    const std::string body = all_paragraph_text(run_result);
+    require(body.contains("Visible opening line."),
+            "unredacted body text survives");
+    require(body.contains("███████"
+                          "█████ sits in the body"),
+            "the addressed text became redaction glyphs, body: " + body);
+    require(!run_result.pages.empty(), "pages still paint");
+  }
+  {
+    std::vector<std::string> payloads;
+    auto outcome = run_with_extras("pdf", "fodt", kRedactionFodt, extras,
+                                   &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "redacted pdf ok: " + outcome.detail);
+    const std::string pdf = fold_pdf(payloads);
+    const std::string text = pdf_text(pdf);
+    require(text.contains("Visible opening line."),
+            "the PDF text layer keeps the unredacted text");
+    require(!text.contains(secret),
+            "the PDF text layer no longer holds the redacted text: " + text);
+    require(!pdf_info_text(pdf).contains(secret),
+            "the PDF document information no longer holds it");
+    require(!pdf.contains(secret), "no PDF byte run spells it out either");
+  }
+  {
+    // Text documents have no SVG store filter, so their SVG pages wrap a
+    // raster painted from the model; the redacted model must be what got
+    // painted, and no SVG text may spell the redacted text out.
+    officev1::StreamOptions plain_svg;
+    plain_svg.set_vector_format(officev1::PAGE_VECTOR_FORMAT_SVG);
+    std::vector<std::string> baseline_svg;
+    auto baseline_outcome = run_with_extras("pages", "fodt", kRedactionFodt,
+                                            plain_svg, &baseline_svg);
+    require(baseline_outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "unredacted svg render ok: " + baseline_outcome.detail);
+    officev1::StreamOptions svg = extras;
+    svg.set_vector_format(officev1::PAGE_VECTOR_FORMAT_SVG);
+    std::vector<std::string> payloads;
+    auto outcome = run_with_extras("pages", "fodt", kRedactionFodt, svg,
+                                   &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "redacted svg render ok: " + outcome.detail);
+    PagesRun run_result = fold_pages(payloads);
+    PagesRun baseline_run = fold_pages(baseline_svg);
+    require(!run_result.pages.empty(), "svg pages emitted");
+    require(run_result.pages.size() == baseline_run.pages.size(),
+            "redaction keeps the page count");
+    for (size_t i = 0; i < run_result.pages.size(); i++) {
+      const officev1::PageImage& page = run_result.pages[i];
+      require(page.format() == officev1::PAGE_IMAGE_FORMAT_SVG,
+              "the page is an svg page");
+      require(!page.png().contains(secret),
+              "the svg page no longer holds the redacted text");
+      require(page.png() != baseline_run.pages[i].png(),
+              "the svg page was painted from the redacted model");
+    }
+  }
+}
+
+// The PDF a redaction exports holds glyphs where the text was, so its text
+// layer has no trace of it, and the glyphs, drawn black on black, still
+// read as a solid bar on the rendered page.
+void verify_pdf_redaction_removes_text() {
+  const std::string doc = "The account SECRET-VALUE-1234 belongs here.\n";
   std::vector<std::string> baseline_payloads;
   auto baseline_outcome = run("pdf", "txt", doc, &baseline_payloads);
   require(baseline_outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
           "baseline pdf ok: " + baseline_outcome.detail);
-  std::vector<std::string> baseline_pages =
-      rasterize_pdf(fold_pdf(baseline_payloads));
+  const std::string baseline_pdf = fold_pdf(baseline_payloads);
+  require(pdf_text(baseline_pdf).contains("SECRET-VALUE-1234"),
+          "the baseline PDF text layer holds the account");
+  std::vector<std::string> baseline_pages = rasterize_pdf(baseline_pdf);
   require(!baseline_pages.empty(), "baseline pdf rasterizes");
   require(longest_black_run(baseline_pages[0]) < 50,
           "un-redacted pdf has no long black run");
 
   officev1::StreamOptions extras;
   officev1::TextSpan* span = extras.add_redact_spans();
-  span->set_char_start(0);
-  span->set_char_end(5);
+  span->set_char_start(12);
+  span->set_char_end(29);
   std::vector<std::string> payloads;
   auto outcome = run_with_extras("pdf", "txt", doc, extras, &payloads);
   require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
           "redacted pdf ok: " + outcome.detail);
-  std::vector<std::string> pages = rasterize_pdf(fold_pdf(payloads));
+  const std::string pdf = fold_pdf(payloads);
+  const std::string text = pdf_text(pdf);
+  require(!text.contains("SECRET") && !text.contains("1234"),
+          "the PDF text layer no longer holds the account: " + text);
+  require(text.contains("The account") && text.contains("belongs here."),
+          "the rest of the line survives: " + text);
+  std::vector<std::string> pages = rasterize_pdf(pdf);
   require(!pages.empty(), "redacted pdf rasterizes");
   require(longest_black_run(pages[0]) >= 50,
-          "redacted pdf carries a filled black box");
+          "the redacted stretch reads as a solid black bar");
+}
+
+// A tracked change by an author named like the redacted text: the office
+// core does not let the service rewrite a change's author, so with the
+// change in place the redaction is refused before anything is emitted.
+// Accepting the changes first (tracked_changes=FINAL) drops the change, and
+// the same redaction then succeeds.
+constexpr char kRedactedAuthorFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ office:version="1.2"
+ office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:body>
+  <office:text>
+   <text:tracked-changes>
+    <text:changed-region xml:id="ct1" text:id="ct1">
+     <text:insertion>
+      <office:change-info>
+       <dc:creator>SECRET-VALUE</dc:creator>
+       <dc:date>2024-01-01T00:00:00</dc:date>
+      </office:change-info>
+     </text:insertion>
+    </text:changed-region>
+   </text:tracked-changes>
+   <text:p>Written by SECRET-VALUE: <text:change-start text:change-id="ct1"/>an inserted remark<text:change-end text:change-id="ct1"/>.</text:p>
+  </office:text>
+ </office:body>
+</office:document>
+)";
+
+// A text document embedding another text document as an object whose body
+// is inner_text. The service inspects an embedded document but never
+// rewrites it: the object's picture on the page is drawn from that
+// content. (An embedded drawing would do as well, but a flat ODT naming
+// the graphics media type anywhere is detected as a drawing.)
+std::string embedded_document_fodt(const std::string& inner_text) {
+  return R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ office:version="1.2"
+ office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:body>
+  <office:text>
+   <text:p>The SECRET-VALUE heads an embedded document.</text:p>
+   <text:p><draw:frame draw:name="Object1" text:anchor-type="as-char" svg:width="4cm" svg:height="2cm"><draw:object><office:document office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.text"><office:body><office:text><text:p>)"
+      + inner_text + R"(</text:p></office:text></office:body></office:document></draw:object></draw:frame></text:p>
+  </office:text>
+ </office:body>
+</office:document>
+)";
+}
+
+// Redaction fails closed: a document kind without an annotation text space,
+// a span past its end, a region the service cannot rewrite, and an embedded
+// object it cannot inspect each refuse the request before a single frame
+// goes out, rather than returning output that still carries the text.
+void verify_redaction_fails_closed() {
+  auto refused = [](const std::string& what, const std::string& extension,
+                    const std::string& document,
+                    const officev1::StreamOptions& extras,
+                    const std::string& mode, const std::string& reason) {
+    std::vector<std::string> payloads;
+    std::string refusal;
+    auto outcome = run_with_extras(mode, extension, document, extras, &payloads,
+                                   "all", &refusal);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kRedactionRefused,
+            what + " is refused, got: " + outcome.detail);
+    require(payloads.empty(), what + " is refused before any frame");
+    require(refusal.contains(reason),
+            what + " gives its reason, got: " + refusal);
+    require(!refusal.contains("SECRET-VALUE"),
+            what + ": the reason never quotes the redacted text");
+  };
+  officev1::StreamOptions first_chars;
+  first_chars.add_redact_spans()->set_char_end(5);
+  for (const std::string& mode : {std::string("pages"), std::string("pdf")}) {
+    refused("a spreadsheet redaction (" + mode + ")", "fods", kTwoSheetFods,
+            first_chars, mode, "only text documents");
+    refused("a presentation redaction (" + mode + ")", "fodp", kNotesFodp,
+            first_chars, mode, "only text documents");
+  }
+  officev1::StreamOptions past_end;
+  officev1::TextSpan* span = past_end.add_redact_spans();
+  span->set_char_start(100);
+  span->set_char_end(105);
+  refused("a span past the annotation text space", "txt", "Short.\n", past_end,
+          "pages", "ends past");
+
+  officev1::StreamOptions author;
+  author.add_redact_spans()->set_char_start(11);
+  author.mutable_redact_spans(0)->set_char_end(23);
+  refused("a redaction a change author would leak", "fodt", kRedactedAuthorFodt,
+          author, "pdf", "tracked_change.author");
+  author.set_tracked_changes(officev1::TRACKED_CHANGE_DISPLAY_FINAL);
+  std::vector<std::string> payloads;
+  auto accepted = run_with_extras("pages", "fodt", kRedactedAuthorFodt, author,
+                                  &payloads);
+  require(accepted.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "with the changes accepted the redaction succeeds: "
+              + accepted.detail);
+  require(!typed_event_text(payloads).contains("SECRET-VALUE"),
+          "with the changes accepted no event carries the redacted text");
+
+  officev1::StreamOptions embedded;
+  embedded.add_redact_spans()->set_char_start(4);
+  embedded.mutable_redact_spans(0)->set_char_end(16);
+  refused("a redaction the embedded document would leak", "fodt",
+          embedded_document_fodt("SECRET-VALUE inside"), embedded, "pages",
+          "remains in embedded object 0");
+  std::vector<std::string> clean_payloads;
+  auto clean = run_with_extras("pdf", "fodt",
+                               embedded_document_fodt("Nothing to hide"),
+                               embedded, &clean_payloads);
+  require(clean.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "an embedded document without the text does not block the "
+          "redaction: " + clean.detail);
+  require(!pdf_text(fold_pdf(clean_payloads)).contains("SECRET-VALUE"),
+          "and the host's occurrence is redacted");
 }
 
 // The PDF page range: a multi-page document exported 1:1 yields exactly
@@ -3176,7 +3547,9 @@ int main() {
   verify_stream_option_extras();
   verify_all_but_pages_token();
   verify_redact_spans_change_pages();
-  verify_pdf_redaction_paints_black_box();
+  verify_pdf_redaction_removes_text();
+  verify_redaction_removes_text_everywhere();
+  verify_redaction_fails_closed();
   verify_pdf_page_range();
   verify_pdf_skip_hidden();
   verify_sheet_visibility_and_used_range();

@@ -7,6 +7,7 @@
 #include <unordered_map>
 
 #include "docling_map.h"
+#include "lok_engine.h"
 #include "worker_runner.h"
 
 namespace grlibre {
@@ -549,6 +550,18 @@ grpc::Status RenderServiceImpl::render(
     case WorkerOutcome::Kind::kWorkDirNotTmpfs:
       failed++;
       return {grpc::StatusCode::FAILED_PRECONDITION, outcome.detail};
+    case WorkerOutcome::Kind::kRedactionRefused: {
+      // The worker leaves the precise reason (which span, which region) in
+      // its work dir; the generic detail stands in if it could not.
+      rejected++;
+      std::ifstream refusal(work_dir.path() + "/" + kRefusalFile,
+                            std::ios::binary);
+      std::string reason(4096, '\0');
+      refusal.read(reason.data(), static_cast<std::streamsize>(reason.size()));
+      reason.resize(static_cast<size_t>(std::max<std::streamsize>(0, refusal.gcount())));
+      return {grpc::StatusCode::FAILED_PRECONDITION,
+              reason.empty() ? outcome.detail : reason};
+    }
     case WorkerOutcome::Kind::kTimeout:
       failed++;
       return {grpc::StatusCode::DEADLINE_EXCEEDED,

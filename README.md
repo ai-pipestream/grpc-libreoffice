@@ -137,8 +137,8 @@ at STANDARD plus COMMENTS):
   from page images; `paint_used_range` crops spreadsheet pages to the
   used cell range; `include_notes_pages` appends each slide's notes page.
   `form_values` writes named form fields before paint or export;
-  `redact_spans` blacks out annotation-space character ranges on rasters
-  and draws matching rectangles on PDF export.
+  `redact_spans` removes text from the document before anything is
+  painted, exported, or extracted (see Redaction below).
   `DocumentInfo` and `RenderStatus` are always sent.
   `DocumentInfo` also carries the layout rectangle of every page in the
   same twips space the typed positions use, so a consumer can map any
@@ -170,11 +170,12 @@ Errors are gRPC status codes: `INVALID_ARGUMENT` (no bytes, missing complete
 flag, unresolvable format, out-of-range options, or the core cannot load
 the document), `RESOURCE_EXHAUSTED` (over the byte cap, or the server-wide
 upload buffer is full), `UNIMPLEMENTED` (PDF input, see below),
-`FAILED_PRECONDITION` (broken package needing
-repair without the `allow_package_repair` opt-in), `DEADLINE_EXCEEDED`
-(per-document timeout or the caller's deadline, worker killed),
-`CANCELLED` (the caller cancelled; a running worker is killed), `INTERNAL`
-(worker crash). Health checking and reflection are registered.
+`FAILED_PRECONDITION` (broken package needing repair without the
+`allow_package_repair` opt-in, or a redaction that cannot be applied to the
+whole document), `DEADLINE_EXCEEDED` (per-document timeout or the caller's
+deadline, worker killed), `CANCELLED` (the caller cancelled; a running
+worker is killed), `INTERNAL` (worker crash). Health checking and
+reflection are registered.
 
 A document whose zip package is broken but repairable is a special case:
 LibreOffice can only open it through its repair path, which rebuilds the
@@ -185,6 +186,28 @@ such a document fails with `FAILED_PRECONDITION` naming the field; with
 the opt-in the worker retries the load with `RepairPackage=true`. A
 package that still will not open fails as `INVALID_ARGUMENT`. A broken
 package is never repaired silently.
+
+Redaction (`redact_spans`, on `StreamOptions` and on `ConvertToPdfRequest`)
+removes text, not pixels. Before anything is laid out, painted, exported,
+or extracted, each span resolves to the text it covers in the annotation
+text space, and that text leaves the document model wherever it occurs:
+body, tables, headers and footers, footnotes and endnotes, text frames,
+drawing shapes and their alt text, comments, fields, content controls,
+hyperlink targets, index entries, user-defined style names, and the
+document properties. Each character becomes one U+2588 FULL BLOCK drawn
+black on black, so the page shows a solid bar. Page images, SVG pages, the
+PDF (its text layer and document information included), and every typed
+event of the response come from that rewritten model. A span's text splits
+per paragraph and is trimmed of surrounding whitespace; matching is exact
+and case-sensitive.
+Redaction fails closed with `FAILED_PRECONDITION`, and nothing streams,
+when a span ends past the annotation text space (spreadsheets,
+presentations, and drawings have none, so any span on them is refused),
+when the document embeds an object the service cannot inspect or one whose
+content carries the text, or when the text survives the rewrite anywhere
+the service can see, such as a tracked change's author (accept or reject
+the changes through `tracked_changes` to redact such a document). The
+pixels of embedded images are not inspected.
 
 PDF input is refused with `UNIMPLEMENTED`, before any worker spawns:
 LibreOffice reads PDFs through its PDF import (`xpdfimport`), which runs

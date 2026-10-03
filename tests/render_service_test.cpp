@@ -872,6 +872,36 @@ int main() {
             "max_width_px from a later chunk still applies");
   }
 
+  // Redaction through the service: a refusal reaches the caller as
+  // FAILED_PRECONDITION carrying the worker's reason, and a redaction that
+  // succeeds leaves the redacted text out of the ToDocument result too.
+  {
+    officev1::StreamOptions spreadsheet;
+    spreadsheet.add_redact_spans()->set_char_end(4);
+    auto refused = stream_pages(channel, "a,b\nc,d\n", "sheet.csv", true,
+                                false, 0, 0, 0, 0, 0, &spreadsheet);
+    require(refused.status.error_code() == grpc::StatusCode::FAILED_PRECONDITION,
+            "a spreadsheet redaction is FAILED_PRECONDITION");
+    require(refused.status.error_message().contains("only text documents"),
+            "the refusal carries the worker's reason, got: "
+                + refused.status.error_message());
+    require(refused.pages == 0 && !refused.got_status,
+            "a refused redaction streams nothing");
+
+    const std::string text = "Name: SECRET-VALUE.\nAgain SECRET-VALUE here.\n";
+    officev1::StreamOptions redact;
+    officev1::TextSpan* span = redact.add_redact_spans();
+    span->set_char_start(6);
+    span->set_char_end(18);
+    officev1::ToDocumentResponse mapped;
+    grpc::Status status = to_document(channel, text, "names.txt", &redact, &mapped);
+    require(status.ok(), "redacted ToDocument ok: " + status.error_message());
+    require(!mapped.document().DebugString().contains("SECRET-VALUE"),
+            "the mapped document carries no redacted text");
+    require(mapped.document().DebugString().contains("Again"),
+            "the mapped document keeps the rest of the text");
+  }
+
   // A repairable broken package (a stored-entry OOXML zip truncated before
   // its central directory) maps to the repair statuses: refusal naming the
   // opt-in by default; opted-in repair is attempted and never UNIMPLEMENTED.
