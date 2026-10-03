@@ -284,13 +284,23 @@ void set_statistics(
   for (const auto& [name, count] : statistics) {
     if (name == "PageCount") out->set_pages(count);
     else if (name == "WordCount") out->set_words(count);
-    else if (name == "CharacterCount") out->set_characters(count);
     else if (name == "ParagraphCount") out->set_paragraphs(count);
     else if (name == "TableCount") out->set_tables(count);
     else if (name == "ImageCount") out->set_images(count);
     else if (name == "ObjectCount") out->set_objects(count);
     else if (name == "CellCount") out->set_cells(count);
     else if (name == "SheetCount") out->set_sheets(count);
+  }
+  // The core counts characters both with and without whitespace, and an
+  // imported OOXML document carries only the latter (its app.xml
+  // Characters). The counter takes the count with whitespace when there is
+  // one and falls back to the other, rather than leaving it empty.
+  if (const auto found = statistics.find("CharacterCount");
+      found != statistics.end()) {
+    out->set_characters(found->second);
+  } else if (const auto stripped = statistics.find("NonWhitespaceCharacterCount");
+             stripped != statistics.end()) {
+    out->set_characters(stripped->second);
   }
 }
 
@@ -1103,6 +1113,14 @@ void DoclingMapper::on_metadata(const officev1::DocumentMetadata& meta) {
         // for keeps its name and no value.
         break;
     }
+  }
+  // The metadata slot has no description field of its own, so the
+  // document's description rides as a text property under the key the
+  // other office collectors give it.
+  if (!meta.description().empty()) {
+    docv1::UserProperty* out = source_meta->add_user_properties();
+    out->set_name("description");
+    out->set_text(meta.description());
   }
   if (!meta.language().empty()) {
     docv1::LanguageMetaField* language = body_meta->mutable_language();
