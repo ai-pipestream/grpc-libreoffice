@@ -1357,6 +1357,56 @@ std::map<int, int> run_selection(const std::string& extension,
   return counts;
 }
 
+// A flat ODT whose stored category is the user-defined property the office
+// core files an OOXML cp:category under, beside an ordinary custom property
+// and a description.
+constexpr char kCategoryFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0"
+ office:version="1.3"
+ office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:meta>
+  <dc:title>Quarterly board pack</dc:title>
+  <dc:description>Board pack, final</dc:description>
+  <meta:user-defined meta:name="OOXMLCorePropertyCategory">Board papers</meta:user-defined>
+  <meta:user-defined meta:name="Owner">Finance</meta:user-defined>
+ </office:meta>
+ <office:body>
+  <office:text>
+   <text:p>Agenda.</text:p>
+  </office:text>
+ </office:body>
+</office:document>
+)";
+
+// The category reaches its typed field and does not also ride as a custom
+// property; the other custom properties and the description are unchanged.
+void verify_document_category() {
+  std::vector<std::string> payloads;
+  auto outcome = run_with_parts("pages", "fodt", kCategoryFodt, "2", &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "category fodt renders ok: " + outcome.detail);
+  int metadata_events = 0;
+  officev1::StreamPagesResponse event;
+  for (const std::string& payload : payloads) {
+    require(event.ParseFromString(payload), "category event parses");
+    if (!event.has_metadata()) continue;
+    metadata_events++;
+    const officev1::DocumentMetadata& meta = event.metadata();
+    require(meta.category() == "Board papers",
+            "the stored category fills the typed field, got: " + meta.category());
+    require(meta.description() == "Board pack, final",
+            "the description sits beside the category");
+    require(meta.user_properties_size() == 1
+                && meta.user_properties(0).name() == "Owner"
+                && meta.user_properties(0).text() == "Finance",
+            "the category is not repeated as a custom property");
+  }
+  require(metadata_events == 1, "one metadata event for the category fixture");
+}
+
 void verify_part_selection() {
   using Response = officev1::StreamPagesResponse;
   // METADATA only: no pages painted, no text content walked.
@@ -3946,6 +3996,7 @@ int main() {
   verify_draw_shapes();
   verify_typed_presentation();
   verify_part_selection();
+  verify_document_category();
   verify_embedded_objects();
   verify_line_rects();
   verify_docling_mapping();
