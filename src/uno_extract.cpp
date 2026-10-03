@@ -441,6 +441,67 @@ int64_t date_midnight_epoch_ms(const css::util::Date& value) {
   return static_cast<int64_t>(timegm(&parts)) * 1000;
 }
 
+// The user-defined property the office core files an OOXML document's
+// cp:category under, and writes back out as cp:category on export.
+constexpr std::string_view kCategoryProperty = "OOXMLCorePropertyCategory";
+
+// Copies one user-defined property value into its typed slot, keeping the
+// type the document stored.
+void set_user_property_value(const rtl::OUString& name,
+                             const css::uno::Any& value,
+                             officev1::UserProperty* out, Warner& warner) {
+  rtl::OUString text;
+  double number = 0;
+  bool flag = false;
+  css::util::DateTime datetime;
+  css::util::Date date;
+  if (value >>= text) {
+    out->set_text(utf8(text));
+  } else if (value >>= number) {
+    out->set_number(number);
+  } else if (value >>= flag) {
+    out->set_flag(flag);
+  } else if (value >>= datetime) {
+    out->set_epoch_ms(datetime_epoch_ms(datetime));
+  } else if (value >>= date) {
+    css::util::DateTime midnight;
+    midnight.Year = date.Year;
+    midnight.Month = date.Month;
+    midnight.Day = date.Day;
+    out->set_epoch_ms(datetime_epoch_ms(midnight));
+  } else {
+    warner.warn("user property " + utf8(name) +
+                " has an unmapped type and was emitted without a value");
+  }
+}
+
+// Reads the custom properties. The category has a typed field, so the
+// property the office core keeps it in fills that field instead of riding
+// as a custom property.
+void read_user_properties(
+    const Reference<css::document::XDocumentProperties>& props,
+    officev1::DocumentMetadata* metadata, Warner& warner) {
+  try {
+    Reference<css::beans::XPropertySet> user_props(
+        props->getUserDefinedProperties(), UNO_QUERY);
+    if (!user_props.is()) return;
+    for (const css::beans::Property& definition :
+         user_props->getPropertySetInfo()->getProperties()) {
+      css::uno::Any value = user_props->getPropertyValue(definition.Name);
+      rtl::OUString category;
+      if (utf8(definition.Name) == kCategoryProperty && (value >>= category)) {
+        metadata->set_category(utf8(category));
+        continue;
+      }
+      officev1::UserProperty* out = metadata->add_user_properties();
+      out->set_name(utf8(definition.Name));
+      set_user_property_value(definition.Name, value, out, warner);
+    }
+  } catch (const css::uno::Exception& error) {
+    warner.warn("user defined properties failed", error);
+  }
+}
+
 bool emit_metadata(const Reference<css::frame::XModel>& model,
                    const EmitFn& emit_fn, Warner& warner) {
   Reference<css::document::XDocumentPropertiesSupplier> supplier(model, UNO_QUERY);
@@ -482,43 +543,7 @@ bool emit_metadata(const Reference<css::frame::XModel>& model,
       (*metadata->mutable_statistics())[utf8(stat.Name)] = count;
     }
   }
-  try {
-    Reference<css::beans::XPropertySet> user_props(
-        props->getUserDefinedProperties(), UNO_QUERY);
-    if (user_props.is()) {
-      for (const css::beans::Property& definition :
-           user_props->getPropertySetInfo()->getProperties()) {
-        css::uno::Any value = user_props->getPropertyValue(definition.Name);
-        officev1::UserProperty* out = metadata->add_user_properties();
-        out->set_name(utf8(definition.Name));
-        rtl::OUString text;
-        double number = 0;
-        bool flag = false;
-        css::util::DateTime datetime;
-        css::util::Date date;
-        if (value >>= text) {
-          out->set_text(utf8(text));
-        } else if (value >>= number) {
-          out->set_number(number);
-        } else if (value >>= flag) {
-          out->set_flag(flag);
-        } else if (value >>= datetime) {
-          out->set_epoch_ms(datetime_epoch_ms(datetime));
-        } else if (value >>= date) {
-          css::util::DateTime midnight;
-          midnight.Year = date.Year;
-          midnight.Month = date.Month;
-          midnight.Day = date.Day;
-          out->set_epoch_ms(datetime_epoch_ms(midnight));
-        } else {
-          warner.warn("user property " + utf8(definition.Name) +
-                      " has an unmapped type and was emitted without a value");
-        }
-      }
-    }
-  } catch (const css::uno::Exception& error) {
-    warner.warn("user defined properties failed", error);
-  }
+  read_user_properties(props, metadata, warner);
   return emit_fn(event);
 }
 

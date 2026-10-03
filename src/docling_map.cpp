@@ -7,6 +7,8 @@
 #include <ctime>
 #include <set>
 #include <sstream>
+#include <string>
+#include <string_view>
 
 #include <google/protobuf/struct.pb.h>
 #include <google/protobuf/timestamp.pb.h>
@@ -302,6 +304,16 @@ void set_statistics(
              stripped != statistics.end()) {
     out->set_characters(stripped->second);
   }
+}
+
+// Adds a named text property to the source metadata, unless the value is
+// empty.
+void add_text_property(std::string_view name, const std::string& value,
+                       docv1::DocumentMeta* out) {
+  if (value.empty()) return;
+  docv1::UserProperty* property = out->add_user_properties();
+  property->set_name(std::string(name));
+  property->set_text(value);
 }
 
 // A shape's identity, on whichever item the shape became. Every field is
@@ -1114,14 +1126,11 @@ void DoclingMapper::on_metadata(const officev1::DocumentMetadata& meta) {
         break;
     }
   }
-  // The metadata slot has no description field of its own, so the
-  // document's description rides as a text property under the key the
-  // other office collectors give it.
-  if (!meta.description().empty()) {
-    docv1::UserProperty* out = source_meta->add_user_properties();
-    out->set_name("description");
-    out->set_text(meta.description());
-  }
+  // The metadata slot has no description or category field of its own, so
+  // each rides as a text property under the key the other office collectors
+  // give it.
+  add_text_property("description", meta.description(), source_meta);
+  add_text_property("category", meta.category(), source_meta);
   if (!meta.language().empty()) {
     docv1::LanguageMetaField* language = body_meta->mutable_language();
     language->set_code_raw(meta.language());

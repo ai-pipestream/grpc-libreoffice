@@ -1742,6 +1742,7 @@ void verify_document_meta() {
     (*meta->mutable_statistics())["LineCount"] = 99;
     (*meta->mutable_statistics())["NonWhitespaceCharacterCount"] = 5600;
     meta->set_description("Board pack, final");
+    meta->set_category("Board papers");
     officev1::UserProperty* owner = meta->add_user_properties();
     owner->set_name("Owner");
     owner->set_text("Finance");
@@ -1781,7 +1782,7 @@ void verify_document_meta() {
   require(meta.statistics().characters() == 5600,
           "meta: a character count without whitespace fills the counter when "
           "the count with whitespace is absent");
-  require(meta.user_properties_size() == 4
+  require(meta.user_properties_size() == 5
               && meta.user_properties(0).text() == "Finance"
               && meta.user_properties(1).boolean()
               && meta.user_properties(2).instant().seconds() == 1679011200,
@@ -1789,6 +1790,9 @@ void verify_document_meta() {
   require(meta.user_properties(3).name() == "description"
               && meta.user_properties(3).text() == "Board pack, final",
           "meta: the description rides as a text property");
+  require(meta.user_properties(4).name() == "category"
+              && meta.user_properties(4).text() == "Board papers",
+          "meta: the category rides as a text property");
   require(mapper.document().body().meta().custom_fields().empty(),
           "meta: nothing about the document rides a value map");
 }

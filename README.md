@@ -57,7 +57,8 @@ at STANDARD plus COMMENTS):
 
   Typed content comes from the same loaded document the pages were painted
   from, in one pass with no second conversion: `DocumentMetadata` (title,
-  author, subject, keywords, numeric timestamps) for every document type,
+  author, subject, description, category, keywords, numeric timestamps)
+  for every document type,
   and for text documents `Paragraph` events (style, outline level, list
   level, exact caret positions in twips from the live layout, runs with
   font, size, weight, slant, underline, strikethrough, color), `TableData`
