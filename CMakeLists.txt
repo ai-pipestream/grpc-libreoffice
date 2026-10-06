@@ -165,6 +165,7 @@ add_executable(grlibre-worker
   src/lok_engine.cpp
   src/uno_extract.cpp
   src/png_encode.cpp
+  src/gif_palette.cpp
   src/event_frame.cpp
   src/document_passwords.cpp)
 add_dependencies(grlibre-worker uno_headers)
@@ -198,7 +199,7 @@ if(GRLIBRE_TCMALLOC)
 endif()
 
 if(BUILD_TESTING)
-  set(GRLIBRE_TESTS event-frame-test png-encode-test worker-runner-test
+  set(GRLIBRE_TESTS event-frame-test png-encode-test gif-palette-test worker-runner-test
       worker-render-test render-service-test docling-map-test)
   add_executable(event-frame-test tests/event_frame_test.cpp src/event_frame.cpp)
   target_include_directories(event-frame-test PRIVATE src)
@@ -211,6 +212,10 @@ if(BUILD_TESTING)
   target_include_directories(png-encode-test PRIVATE src third_party/stb
     ${GRLIBRE_ZLIB_INCLUDE_DIRS})
   target_link_libraries(png-encode-test PRIVATE zlibstatic webp grlibre_flags)
+
+  add_executable(gif-palette-test tests/gif_palette_test.cpp src/gif_palette.cpp)
+  target_include_directories(gif-palette-test PRIVATE src)
+  target_link_libraries(gif-palette-test PRIVATE grlibre_flags)
 
   add_executable(worker-render-test tests/worker_render_test.cpp)
   target_link_libraries(worker-render-test PRIVATE grlibre_core grlibre_flags)
