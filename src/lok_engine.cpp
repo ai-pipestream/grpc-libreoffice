@@ -21,10 +21,12 @@
 #include <iterator>
 #include <mutex>
 #include <sstream>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 #include "ai/pipestream/office/v1/office_service.pb.h"
+#include "document_passwords.h"
 #include "event_frame.h"
 #include "png_encode.h"
 #include "uno_extract.h"
@@ -369,6 +371,33 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
   return true;
 }
 
+// Answers the office core's password requests during a load with the
+// call's candidates, one per request, in order: a wrong password makes the
+// core ask again, and once the candidates run out the answer is no password,
+// which fails the load. The core calls this from inside documentLoad and
+// waits for setDocumentPassword, so answering from within the callback is
+// what lets the load go on.
+struct PasswordPrompt {
+  lok::Office* office = nullptr;
+  const std::string* url = nullptr;
+  const std::vector<std::string>* candidates = nullptr;
+  size_t next = 0;
+  // Whether the core asked at all: the document is password-protected.
+  bool asked = false;
+};
+
+void answer_password_request(int type, const char* /*payload*/, void* data) {
+  if (type != LOK_CALLBACK_DOCUMENT_PASSWORD) return;
+  auto* prompt = static_cast<PasswordPrompt*>(data);
+  prompt->asked = true;
+  if (prompt->next < prompt->candidates->size()) {
+    const std::string& candidate = (*prompt->candidates)[prompt->next++];
+    prompt->office->setDocumentPassword(prompt->url->c_str(), candidate.c_str());
+  } else {
+    prompt->office->setDocumentPassword(prompt->url->c_str(), nullptr);
+  }
+}
+
 }  // namespace
 
 int run_render(const RenderOptions& options, int out_fd, std::string* error) {
@@ -405,6 +434,30 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
                      "MacroSecurityLevel=3";
   }
   lok::Document* document = office->documentLoad(url.c_str(), filter_options);
+  if (document == nullptr && !options.passwords.empty()) {
+    // Batch also marks the load Silent, and a silent load never asks for a
+    // password: an encrypted document just fails. With candidate passwords
+    // the load is retried without Batch, the core's password request
+    // answered from them through the callback. The first load already put
+    // the process in Batch's dialog-cancel mode, which no later load
+    // resets, so every other interaction the retry meets (a repair prompt,
+    // an import dialog) is still cancelled rather than parked on.
+    std::string retry_options = filter_options;
+    constexpr std::string_view kBatch = "Batch=true,";
+    retry_options.erase(retry_options.find(kBatch), kBatch.size());
+    PasswordPrompt prompt{.office = office, .url = &url, .candidates = &options.passwords};
+    office->setOptionalFeatures(LOK_FEATURE_DOCUMENT_PASSWORD);
+    office->registerCallback(&answer_password_request, &prompt);
+    document = office->documentLoad(url.c_str(), retry_options.c_str());
+    office->registerCallback(nullptr, nullptr);
+    if (document == nullptr && prompt.asked) {
+      // Password-protected, and no candidate opened it: said apart from a
+      // broken document, with how many were tried and never which.
+      *error = "the document is password-protected and "
+          + password_attempt_clause(prompt.next);
+      return kExitPasswordRequired;
+    }
+  }
   if (document == nullptr && options.allow_package_repair) {
     // Retry through the core's repair path. Batch stays on so the repair
     // prompt cannot park the load; RepairPackage rebuilds a rewritten copy

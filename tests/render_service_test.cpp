@@ -17,9 +17,11 @@
 #include <print>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "ai/pipestream/office/v1/office_service.grpc.pb.h"
+#include "encrypted_docx_fixture.h"
 #include "render_service.h"
 
 namespace {
@@ -79,9 +81,12 @@ StreamResult stream_pages(const std::shared_ptr<grpc::Channel>& channel,
                           int render_dpi = 0, int first_page = 0,
                           int last_page = 0, int page_format = 0,
                           int page_quality = 0,
-                          const officev1::StreamOptions* extra = nullptr) {
+                          const officev1::StreamOptions* extra = nullptr,
+                          const std::vector<std::pair<std::string, std::string>>&
+                              metadata = {}) {
   auto stub = officev1::OfficeRenderService::NewStub(channel);
   grpc::ClientContext context;
+  for (const auto& [key, value] : metadata) context.AddMetadata(key, value);
   auto stream = stub->StreamPages(&context);
   size_t chunk_size = 64 * 1024;
   for (size_t offset = 0; offset < bytes.size() || offset == 0; offset += chunk_size) {
@@ -598,6 +603,50 @@ int main() {
     require(result.got_metadata, "metadata event relayed through the service");
     require(result.paragraphs >= 1, "paragraph events relayed through the service");
     require(result.got_status, "final status emitted");
+  }
+
+  // Per-request document passwords ride the call metadata. Over-bound
+  // metadata is refused before any upload is buffered; an encrypted docx
+  // with only wrong candidates is a load failure that says how many were
+  // tried and never which; the right candidate, on either key, renders it.
+  {
+    std::vector<std::pair<std::string, std::string>> too_many;
+    for (int i = 0; i < 17; i++) {
+      too_many.emplace_back("document-password", "p" + std::to_string(i));
+    }
+    auto result = stream_pages(channel, "Hello.\n", "a.txt", true, false, 0, 0, 0, 0, 0,
+                               nullptr, too_many);
+    require(result.status.error_code() == grpc::StatusCode::INVALID_ARGUMENT,
+            "more than 16 passwords is INVALID_ARGUMENT");
+    require(result.status.error_message().find("p16") == std::string::npos,
+            "the bound error carries no candidate");
+    auto too_long = stream_pages(channel, "Hello.\n", "a.txt", true, false, 0, 0, 0, 0, 0,
+                                 nullptr, {{"document-password-bin", std::string(1025, 'x')}});
+    require(too_long.status.error_code() == grpc::StatusCode::INVALID_ARGUMENT,
+            "a password over 1024 bytes is INVALID_ARGUMENT");
+  }
+  {
+    const std::string locked(kEncryptedDocx, sizeof kEncryptedDocx - 1);
+    auto wrong = stream_pages(channel, locked, "locked.docx", true, false, 0, 0, 0, 0, 0,
+                              nullptr,
+                              {{"document-password", "wrong-one"},
+                               {"document-password-bin", "wr\xC3\xB6ng-two"}});
+    require(wrong.status.error_code() == grpc::StatusCode::INVALID_ARGUMENT,
+            "wrong passwords are INVALID_ARGUMENT: " + wrong.status.error_message());
+    const std::string& message = wrong.status.error_message();
+    require(message.find("password-protected") != std::string::npos &&
+                message.find("none of the 2 supplied passwords") != std::string::npos,
+            "the refusal names the attempt: " + message);
+    require(message.find("wrong-one") == std::string::npos &&
+                message.find("ng-two") == std::string::npos,
+            "the refusal carries no candidate");
+    require(wrong.pages == 0, "no pages before a password refusal");
+    auto right = stream_pages(channel, locked, "locked.docx", true, false, 0, 0, 0, 0, 0,
+                              nullptr,
+                              {{"document-password", "wrong-one"},
+                               {"document-password-bin", kEncryptedDocxPassword}});
+    require(right.status.ok(), "the right password renders: " + right.status.error_message());
+    require(right.pages >= 1 && right.paragraphs >= 1, "decrypted pages and paragraphs");
   }
 
   // The per-request DPI override: a 48-dpi render of the same document must

@@ -16,6 +16,7 @@ struct WorkerOutcome {
     kRepairNeedsOptIn,      // broken package; repair not opted into
     kWorkDirNotTmpfs,       // deployment error: work dir is not tmpfs
     kRedactionRefused,      // the requested redaction could not be applied
+    kPasswordRequired,      // password-protected; no candidate opened it
     kTimeout,               // deadline elapsed; worker was killed
     kAborted,               // the frame consumer declined further frames
     kCancelled,             // the caller went away; worker was killed
