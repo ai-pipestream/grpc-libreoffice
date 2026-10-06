@@ -4,9 +4,14 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <string>
+#include <string_view>
+#include <system_error>
 #include <unordered_map>
+#include <vector>
 
 #include "docling_map.h"
+#include "document_passwords.h"
 #include "lok_engine.h"
 #include "worker_runner.h"
 
@@ -282,6 +287,32 @@ bool has_deadline(const grpc::ServerContext* context) {
   return context->deadline() != std::chrono::system_clock::time_point::max();
 }
 
+// The call's candidate passwords (document_passwords.h), bounded before
+// any upload byte is buffered. Errors name the bound, never a value.
+grpc::Status read_passwords(const grpc::ServerContext* context,
+                            std::vector<std::string>* passwords) {
+  const auto& metadata = context->client_metadata();
+  for (const std::string_view key : {kDocumentPasswordKey, kDocumentPasswordBinKey}) {
+    const auto [first, last] =
+        metadata.equal_range(grpc::string_ref(key.data(), key.size()));
+    for (auto entry = first; entry != last; ++entry) {
+      if (entry->second.empty()) continue;
+      if (entry->second.size() > kMaxDocumentPasswordBytes) {
+        return {grpc::StatusCode::INVALID_ARGUMENT,
+                "a " + std::string(key) + " metadata value is longer than "
+                    + std::to_string(kMaxDocumentPasswordBytes) + " bytes"};
+      }
+      if (passwords->size() == kMaxDocumentPasswords) {
+        return {grpc::StatusCode::INVALID_ARGUMENT,
+                "more than " + std::to_string(kMaxDocumentPasswords)
+                    + " document passwords in the call metadata"};
+      }
+      passwords->emplace_back(entry->second.data(), entry->second.size());
+    }
+  }
+  return grpc::Status::OK;
+}
+
 }  // namespace
 
 class RenderServiceImpl::SlotGuard {
@@ -383,6 +414,11 @@ grpc::Status RenderServiceImpl::render(
   officev1::StreamOptions extras;
   bool allow_package_repair = false;
   bool saw_complete = false;
+  std::vector<std::string> passwords;
+  if (grpc::Status read = read_passwords(context, &passwords); !read.ok()) {
+    rejected++;
+    return read;
+  }
 
   Request request;
   while (in->Read(&request)) {
@@ -498,6 +534,24 @@ grpc::Status RenderServiceImpl::render(
       return {grpc::StatusCode::INTERNAL, "cannot write worker options"};
     }
   }
+  if (!passwords.empty()) {
+    // Owner-only, on the work dir's tmpfs; the worker unlinks it the moment
+    // it has read it, and the work dir goes with the request either way.
+    const std::string path =
+        work_dir.path() + "/" + std::string(kPasswordsFileName);
+    std::ofstream passwords_out(path, std::ios::binary);
+    std::error_code ignored;
+    std::filesystem::permissions(path,
+                                 std::filesystem::perms::owner_read
+                                     | std::filesystem::perms::owner_write,
+                                 ignored);
+    passwords_out << encode_passwords(passwords);
+    passwords_out.close();
+    if (passwords_out.fail()) {
+      failed++;
+      return {grpc::StatusCode::INTERNAL, "cannot write worker passwords"};
+    }
+  }
   {
     // The upload's own file name, without any directory part, for the
     // fields that print it: the loaded copy is named doc.<ext> in the work
@@ -567,6 +621,13 @@ grpc::Status RenderServiceImpl::render(
     case WorkerOutcome::Kind::kLoadFailure:
       rejected++;
       return {grpc::StatusCode::INVALID_ARGUMENT, outcome.detail};
+    case WorkerOutcome::Kind::kPasswordRequired:
+      // The caller's problem, like any document that will not load: how
+      // many candidates were tried, never which.
+      rejected++;
+      return {grpc::StatusCode::INVALID_ARGUMENT,
+              "document load failed: " + outcome.detail + " and "
+                  + password_attempt_clause(passwords.size())};
     case WorkerOutcome::Kind::kRepairNeedsOptIn:
       rejected++;
       return {grpc::StatusCode::FAILED_PRECONDITION, outcome.detail};

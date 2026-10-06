@@ -19,6 +19,7 @@
 #include <string>
 
 #include "ai/pipestream/office/v1/office_service.pb.h"
+#include "document_passwords.h"
 #include "lok_engine.h"
 
 namespace {
@@ -254,6 +255,27 @@ int main(int argc, char** argv) {
       if (options.last_page == 0 && extras.last_page() != 0) {
         options.last_page = extras.last_page();
       }
+    }
+  }
+
+  {
+    // Optional: present only when the call carried candidate passwords.
+    // Unlinked the moment it is read, so the work dir holds them for no
+    // longer than the worker's start-up.
+    const std::string path = options.work_dir + "/"
+        + std::string(grlibre::kPasswordsFileName);
+    std::ifstream passwords_in(path, std::ios::binary);
+    if (passwords_in) {
+      const std::string bytes((std::istreambuf_iterator<char>(passwords_in)),
+                              std::istreambuf_iterator<char>());
+      passwords_in.close();
+      ::unlink(path.c_str());
+      auto passwords = grlibre::decode_passwords(bytes);
+      if (!passwords.has_value()) {
+        std::println(stderr, "grlibre-worker: malformed {}", path);
+        return grlibre::kExitRenderFailure;
+      }
+      options.passwords = std::move(*passwords);
     }
   }
 

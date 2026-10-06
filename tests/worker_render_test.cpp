@@ -25,6 +25,8 @@
 
 #include "ai/pipestream/office/v1/office_service.pb.h"
 #include "docling_map.h"
+#include "document_passwords.h"
+#include "encrypted_docx_fixture.h"
 #include "worker_runner.h"
 
 namespace {
@@ -2289,6 +2291,87 @@ void verify_broken_package_needs_repair_opt_in() {
 // steps after the terminal frame. The worker now ends with _exit, so an
 // HTML render must succeed and the outcome must follow the final frame
 // far inside the flusher's 2 s wait quantum.
+// Runs the worker with password candidates staged in the work dir the way
+// the service stages them, and reports whether the worker left the file
+// behind (it must unlink it before loading anything).
+grlibre::WorkerOutcome run_with_passwords(const std::string& extension,
+                                          const std::string& document,
+                                          const std::vector<std::string>& passwords,
+                                          std::vector<std::string>* payloads,
+                                          bool* passwords_file_left) {
+  std::string work_dir = make_work_dir();
+  const std::string passwords_path = work_dir + "/" + std::string(grlibre::kPasswordsFileName);
+  if (!passwords.empty()) {
+    std::ofstream out(passwords_path, std::ios::binary);
+    out << grlibre::encode_passwords(passwords);
+    out.close();
+    require(!out.fail(), "stage passwords");
+  }
+  std::vector<std::string> argv = {
+      worker_path(), "pages", extension, "96", "2048",
+      work_dir, lo_install_path(), "all"};
+  grlibre::WorkerOutcome outcome = grlibre::run_worker(
+      argv, document, std::chrono::milliseconds(120000), 256u * 1024 * 1024,
+      [&](std::string&& payload) {
+        payloads->push_back(std::move(payload));
+        return true;
+      });
+  *passwords_file_left = std::filesystem::exists(passwords_path);
+  std::error_code ignored;
+  std::filesystem::remove_all(work_dir, ignored);
+  return outcome;
+}
+
+void verify_encrypted_document_passwords() {
+  const std::string locked(kEncryptedDocx, sizeof kEncryptedDocx - 1);
+  bool left = false;
+  {
+    // No candidates: the Batch load fails as it always has.
+    std::vector<std::string> payloads;
+    auto outcome = run_with_passwords("docx", locked, {}, &payloads, &left);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kLoadFailure,
+            "encrypted docx without passwords is a load failure, got: " + outcome.detail);
+  }
+  {
+    // Only wrong candidates: password-required, naming the count and never
+    // a candidate.
+    std::vector<std::string> payloads;
+    auto outcome =
+        run_with_passwords("docx", locked, {"wrong-one", "wrong-two"}, &payloads, &left);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kPasswordRequired,
+            "wrong passwords are password-required, got: " + outcome.detail);
+    require(!left, "worker unlinks the passwords file");
+    require(payloads.empty(), "no frames before a password refusal");
+  }
+  {
+    // A wrong candidate then the right one: the document loads and renders.
+    std::vector<std::string> payloads;
+    auto outcome = run_with_passwords("docx", locked, {"wrong-one", kEncryptedDocxPassword},
+                                      &payloads, &left);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "right password renders: " + outcome.detail);
+    require(!left, "worker unlinks the passwords file after a good load");
+    PagesRun pages = fold_pages(payloads);
+    require(pages.got_status && pages.status.state() == officev1::RenderStatus::STATE_OK,
+            "decrypted render status ok");
+    require(!pages.pages.empty(), "decrypted document has a page");
+    std::string text;
+    for (const auto& paragraph : pages.paragraphs) {
+      for (const auto& text_run : paragraph.runs()) text += text_run.text();
+    }
+    require(text.find(kEncryptedDocxText) != std::string::npos,
+            "decrypted text reaches the paragraphs: " + text);
+  }
+  {
+    // A plain document with candidates still loads on the first, Batch,
+    // attempt; the candidates are never consulted.
+    std::vector<std::string> payloads;
+    auto outcome = run_with_passwords("txt", "Plain text.\n", {"unused"}, &payloads, &left);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "plain document with passwords renders: " + outcome.detail);
+  }
+}
+
 void verify_html_renders_and_exits_promptly() {
   std::string work_dir = make_work_dir();
   std::vector<std::string> argv = {
@@ -4131,6 +4214,7 @@ int main() {
   verify_disk_work_dir_is_refused();
   verify_corrupt_zip_is_load_failure();
   verify_broken_package_needs_repair_opt_in();
+  verify_encrypted_document_passwords();
   verify_html_renders_and_exits_promptly();
   verify_stream_option_extras();
   verify_all_but_pages_token();

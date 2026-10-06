@@ -130,6 +130,9 @@ WorkerOutcome finish(pid_t pid, bool kill_first, WorkerOutcome::Kind kind_on_exi
     } else if (code == kExitLoadFailure) {
       outcome.kind = WorkerOutcome::Kind::kLoadFailure;
       outcome.detail = "the office core could not load the document";
+    } else if (code == kExitPasswordRequired) {
+      outcome.kind = WorkerOutcome::Kind::kPasswordRequired;
+      outcome.detail = "the document is password-protected";
     } else if (code == kExitRepairNeedsOptIn) {
       outcome.kind = WorkerOutcome::Kind::kRepairNeedsOptIn;
       outcome.detail = "the document package is broken; opening it needs the "

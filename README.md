@@ -188,6 +188,22 @@ the opt-in the worker retries the load with `RepairPackage=true`. A
 package that still will not open fails as `INVALID_ARGUMENT`. A broken
 package is never repaired silently.
 
+A password-protected document opens when the caller sends its password
+with the call, in the initial metadata and never in a request message:
+one candidate per `document-password` entry (printable ASCII) or
+`document-password-bin` entry (any bytes), at most 16 candidates of at
+most 1024 bytes each. gRParse forwards its own callers' candidates this
+way. The worker first loads the document as it always does; only when
+that fails and candidates were sent does it reload with the core's
+password request answered from them, in order. The service passes them to
+the worker through an owner-only file in the tmpfs work dir, which the
+worker unlinks as soon as it has read it. Nothing is stored or
+configured on the server. A protected document that none of the
+candidates opens fails as `INVALID_ARGUMENT` with a message naming
+`password-protected` and how many candidates were tried, never which;
+over-bound metadata is refused with `INVALID_ARGUMENT` before any upload
+is buffered.
+
 Redaction (`redact_spans`, on `StreamOptions` and on `ConvertToPdfRequest`)
 removes text, not pixels. Before anything is laid out, painted, exported,
 or extracted, each span resolves to the text it covers in the annotation

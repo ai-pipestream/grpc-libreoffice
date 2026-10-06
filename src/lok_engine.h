@@ -93,6 +93,10 @@ struct RenderOptions {
   // document path that stages a temp copy of the document. Off by default;
   // a repair-needing document then fails naming the opt-in.
   bool allow_package_repair = false;
+  // The call's candidate passwords for an encrypted document, tried in
+  // order through the office core's password request (document_passwords.h).
+  // Empty leaves an encrypted document failing as a plain load failure.
+  std::vector<std::string> passwords;
 };
 
 // Worker process exit codes, mapped to gRPC status codes by the parent.
@@ -112,6 +116,9 @@ inline constexpr int kExitWorkDirNotTmpfs = 8;
 // worker emitted nothing that could carry the text, and leaves the reason
 // in kRefusalFile under its work dir.
 inline constexpr int kExitRedactionRefused = 9;
+// The document is password-protected and no candidate password opened it
+// (none was supplied, or every one was wrong).
+inline constexpr int kExitPasswordRequired = 10;
 // Where a refusing worker leaves its human-readable reason, relative to
 // the work dir, for the parent to put in the call's status.
 inline constexpr char kRefusalFile[] = "refusal.txt";

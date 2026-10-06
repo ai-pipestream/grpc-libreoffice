@@ -144,6 +144,7 @@ add_library(grlibre_core
   src/event_frame.cpp
   src/worker_runner.cpp
   src/render_service.cpp
+  src/document_passwords.cpp
   src/docling_map.cpp)
 target_include_directories(grlibre_core PUBLIC src)
 # The one version source: GetServiceInfo reports the project version.
@@ -164,7 +165,8 @@ add_executable(grlibre-worker
   src/lok_engine.cpp
   src/uno_extract.cpp
   src/png_encode.cpp
-  src/event_frame.cpp)
+  src/event_frame.cpp
+  src/document_passwords.cpp)
 add_dependencies(grlibre-worker uno_headers)
 target_include_directories(grlibre-worker PRIVATE
   src
