@@ -13,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <optional>
 #include <print>
 #include <string>
@@ -90,6 +91,12 @@ bool on_tmpfs(const std::string& path) {
 // keep the core from fetching resources an uploaded document links to (a
 // document loaded from the work dir is never a trusted referer), so an
 // upload cannot make the worker issue requests from inside the network.
+// Graphic swapping stays off: once a document's images pass the core's
+// graphic memory limit, an idle timer swaps them out, and that timer's
+// sweep (vcl::graphic::MemoryManager::loopAndReduceMemory) segfaults
+// intermittently on image-heavy decks, killing the worker mid-stream with
+// "Unspecified Application Error". The worker is one document and exits
+// when it is done, so there is nothing to reclaim by swapping.
 constexpr char kProfileSeed[] =
     R"(<?xml version="1.0" encoding="UTF-8"?>
 <oor:items xmlns:oor="http://openoffice.org/2001/registry" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
@@ -97,6 +104,7 @@ constexpr char kProfileSeed[] =
 <item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="DisableMacrosExecution" oor:op="fuse"><value>true</value></prop></item>
 <item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop></item>
 <item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="BlockUntrustedRefererLinks" oor:op="fuse"><value>true</value></prop></item>
+<item oor:path="/org.openoffice.Office.Common/Cache/GraphicManager"><prop oor:name="GraphicSwappingEnabled" oor:op="fuse"><value>false</value></prop></item>
 </oor:items>
 )";
 
@@ -189,6 +197,15 @@ int main(int argc, char** argv) {
     }
   }
 
+  {
+    // Optional: an older service writes no name, and the fields then print
+    // the loaded copy's bare name.
+    std::ifstream name_in(options.work_dir + "/source.name", std::ios::binary);
+    if (name_in) {
+      options.source_name.assign(std::istreambuf_iterator<char>(name_in),
+                                 std::istreambuf_iterator<char>());
+    }
+  }
   {
     std::ifstream extras_in(options.work_dir + "/options.pb", std::ios::binary);
     ai::pipestream::office::v1::StreamOptions extras;

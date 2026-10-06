@@ -124,6 +124,10 @@ bool export_pdf_stream(const std::string& filter_name, size_t chunk_limit,
 // bytes, and for damage beyond repair.
 bool is_repairable_broken_package(const std::string& bytes);
 
+// The name file-name fields print: the upload's own name. The worker loads
+// one document per process, so it is set once before extraction.
+void set_source_name(const std::string& name);
+
 // Applies tracked-change display and form fills to the document currently
 // loaded in this process. Problems append to warnings and never fail the
 // render.

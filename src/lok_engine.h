@@ -64,6 +64,10 @@ struct RenderOptions {
   int image_quality = 85;
   // Fit-to-width in pixels; 0 means use dpi. Still clamped by max_side_px.
   int max_width_px = 0;
+  // The upload's file name, without directories, as the caller sent it;
+  // empty when it sent none. File-name fields print it in place of the
+  // work-dir copy's path.
+  std::string source_name;
   // Convert page rasters to grayscale before encoding.
   bool grayscale = false;
   // TrackedChangeDisplay wire value; 0 means leave the document as stored.

@@ -465,6 +465,8 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
   }
   document->initializeForRendering(nullptr);
   std::vector<std::string> option_warnings;
+  set_source_name(options.source_name.empty() ? "doc." + options.extension
+                                              : options.source_name);
   apply_document_options(options, &option_warnings);
   // Redaction rewrites the document model before anything below lays it
   // out, paints it, exports it, or extracts from it, and refuses the whole
