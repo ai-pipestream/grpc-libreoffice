@@ -554,7 +554,7 @@ const char kTypedFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
    </table:table-row>
   </table:table>
   <text:p><draw:frame draw:name="Img1" svg:width="1cm" svg:height="1cm"><draw:image><office:binary-data>iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==</office:binary-data></draw:image></draw:frame></text:p>
-  <text:p><draw:frame draw:name="Frame1" text:anchor-type="paragraph" svg:width="5cm" svg:height="2cm"><draw:text-box draw:chain-next-name="Frame2"><text:p>frame body with a <text:span text:style-name="B1">bold</text:span> run</text:p></draw:text-box></draw:frame><draw:frame draw:name="Frame2" text:anchor-type="paragraph" svg:x="8cm" svg:width="5cm" svg:height="2cm"><draw:text-box/></draw:frame></text:p>
+  <text:p><draw:frame draw:name="Frame1" text:anchor-type="paragraph" svg:width="5cm" svg:height="2cm"><draw:text-box draw:chain-next-name="Frame2"><text:p>frame body with a <text:span text:style-name="B1">bold</text:span> run</text:p><text:p>and a second paragraph</text:p></draw:text-box></draw:frame><draw:frame draw:name="Frame2" text:anchor-type="paragraph" svg:x="8cm" svg:width="5cm" svg:height="2cm"><draw:text-box/></draw:frame></text:p>
   <text:p><draw:custom-shape draw:name="Shape1" text:anchor-type="paragraph" svg:width="4cm" svg:height="2cm"><text:p>shape text</text:p><draw:enhanced-geometry draw:type="rectangle"/></draw:custom-shape></text:p>
   <text:p><draw:g draw:name="WPG1" text:anchor-type="paragraph"><draw:custom-shape draw:name="GShape1" svg:x="1cm" svg:y="0cm" svg:width="3cm" svg:height="1cm"><text:p>grouped alpha</text:p><draw:enhanced-geometry draw:type="rectangle"/></draw:custom-shape><draw:custom-shape draw:name="GShape2" svg:x="1cm" svg:y="1.5cm" svg:width="3cm" svg:height="1cm"><text:p>grouped beta</text:p><draw:enhanced-geometry draw:type="rectangle"/></draw:custom-shape></draw:g></text:p>
  </office:text></office:body>
@@ -634,7 +634,8 @@ void verify_typed_content() {
           }
           frame1_ok = frame.chain_next() == "Frame2" &&
                       frame.width_twips() > 0 && frame.height_twips() > 0 &&
-                      text == "frame body with a bold run" && offsets_ok &&
+                      text == "frame body with a bold run\nand a second paragraph" &&
+                      offsets_ok &&
                       bold_ok;
         }
         if (frame.name() == "Frame2") {
@@ -3509,6 +3510,7 @@ const char kFieldsFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
  </office:automatic-styles>
  <office:body><office:text>
   <text:p>Page <text:page-number text:select-page="current">1</text:page-number> of the report.</text:p>
+  <text:p>File <text:file-name text:display="full">C:\\old\\report.odt</text:file-name> and <text:file-name text:display="name">report</text:file-name>.</text:p>
   <text:p>See <text:bookmark-ref text:reference-format="text" text:ref-name="mark1">Target</text:bookmark-ref> below.</text:p>
   <text:p>E = mc<text:span text:style-name="SUP">2</text:span> und <text:span text:style-name="DE">Wasser</text:span>. <text:span text:style-name="SC">caps</text:span> <text:span text:style-name="HL">lit</text:span></text:p>
   <text:p><text:bookmark-start text:name="mark1"/>Target section<text:bookmark-end text:name="mark1"/></text:p>
@@ -3533,12 +3535,29 @@ const char kFieldsFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
 )";
 
 // A flat ODT whose table has a three-cell header over five columns: the
-// docx shape whose cell names count per row.
+// docx shape whose cell names count per row. Its last two rows open with a
+// block merged across two columns and two rows, so the second of them names
+// only the cells beside the covered block ("B5" is the third column's box).
+// A second table ends in a column a fraction of a percent wide, the shape a
+// Word gridAfter leaves.
 const char kGridFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
 <office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
  xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
  xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+ xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
  office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:automatic-styles>
+  <style:style style:name="Narrow" style:family="table">
+   <style:table-properties style:width="10.02cm" table:align="left"/>
+  </style:style>
+  <style:style style:name="NarrowWide" style:family="table-column">
+   <style:table-column-properties style:column-width="5cm"/>
+  </style:style>
+  <style:style style:name="NarrowThin" style:family="table-column">
+   <style:table-column-properties style:column-width="0.02cm"/>
+  </style:style>
+ </office:automatic-styles>
  <office:body><office:text>
   <text:p>Complex table.</text:p>
   <table:table table:name="Grid">
@@ -3564,6 +3583,28 @@ const char kGridFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
     <table:table-cell><text:p>727</text:p></table:table-cell>
     <table:table-cell><text:p>59%</text:p></table:table-cell>
    </table:table-row>
+   <table:table-row>
+    <table:table-cell table:number-columns-spanned="2" table:number-rows-spanned="2"><text:p>block</text:p></table:table-cell>
+    <table:covered-table-cell/>
+    <table:table-cell><text:p>c4</text:p></table:table-cell>
+    <table:table-cell><text:p>d4</text:p></table:table-cell>
+    <table:table-cell><text:p>e4</text:p></table:table-cell>
+   </table:table-row>
+   <table:table-row>
+    <table:covered-table-cell table:number-columns-repeated="2"/>
+    <table:table-cell><text:p>c5</text:p></table:table-cell>
+    <table:table-cell><text:p>d5</text:p></table:table-cell>
+    <table:table-cell><text:p>e5</text:p></table:table-cell>
+   </table:table-row>
+  </table:table>
+  <table:table table:name="Narrow" table:style-name="Narrow">
+   <table:table-column table:style-name="NarrowWide" table:number-columns-repeated="2"/>
+   <table:table-column table:style-name="NarrowThin"/>
+   <table:table-row>
+    <table:table-cell><text:p>left</text:p></table:table-cell>
+    <table:table-cell><text:p>right</text:p></table:table-cell>
+    <table:table-cell><text:p></text:p></table:table-cell>
+   </table:table-row>
   </table:table>
  </office:text></office:body>
 </office:document>
@@ -3575,17 +3616,41 @@ void verify_table_grid_from_column_separators() {
   require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
           "grid fodt renders ok: " + outcome.detail);
   bool seen = false;
+  bool narrow_seen = false;
   officev1::StreamPagesResponse event;
   for (const std::string& payload : payloads) {
     require(event.ParseFromString(payload), "grid event parses");
     if (!event.has_table()) continue;
-    seen = true;
     const officev1::TableData& table = event.table();
-    require(table.rows() == 3 && table.columns() == 5,
-            "the grid is 3x5, got " + std::to_string(table.rows()) + "x" +
-                std::to_string(table.columns()));
     std::map<std::string, const officev1::TableCellData*> by_name;
     for (const officev1::TableCellData& cell : table.cells()) by_name[cell.name()] = &cell;
+    if (table.index() == 1) {
+      narrow_seen = true;
+      require(table.columns() == 3,
+              "a column a fraction of a percent wide is still a column, got " +
+                  std::to_string(table.columns()));
+      require(by_name.count("C1") && by_name["C1"]->column() == 2 &&
+                  by_name["C1"]->column_span() == 1,
+              "the narrow last cell sits inside the grid");
+      continue;
+    }
+    seen = true;
+    require(table.rows() == 5 && table.columns() == 5,
+            "the grid is 5x5, got " + std::to_string(table.rows()) + "x" +
+                std::to_string(table.columns()));
+    require(by_name.count("A4") && by_name["A4"]->column() == 0 &&
+                by_name["A4"]->column_span() == 2 && by_name["A4"]->row_span() == 2,
+            "the merged block spans two columns and two rows");
+    const officev1::TableCellData* beside = nullptr;
+    for (const officev1::TableCellData& cell : table.cells()) {
+      if (cell.text() == "c5") beside = &cell;
+    }
+    require(beside != nullptr && beside->row() == 4 && beside->column() == 2 &&
+                beside->column_span() == 1,
+            "a cell beside a covered block keeps its own column, got " +
+                (beside == nullptr ? std::string("none")
+                                   : beside->name() + " at column " +
+                                         std::to_string(beside->column())));
     require(by_name.count("B1") && by_name["B1"]->column() == 1 &&
                 by_name["B1"]->column_span() == 2 && by_name["B1"]->text() == "May 2012",
             "the first header cell spans columns 1-2");
@@ -3600,6 +3665,7 @@ void verify_table_grid_from_column_separators() {
             "the empty corner cell stays one column wide");
   }
   require(seen, "the grid table was emitted");
+  require(narrow_seen, "the narrow-column table was emitted");
 }
 
 void verify_field_and_structure_content() {
@@ -3616,6 +3682,7 @@ void verify_field_and_structure_content() {
   bool alt_text_ok = false;
   bool merge_anchor_ok = false;
   bool merge_wide_ok = false;
+  std::vector<std::string> file_names;
   bool offsets_monotonic = true;
   int64_t next_offset = 0;
   officev1::StreamPagesResponse event;
@@ -3631,6 +3698,7 @@ void verify_field_and_structure_content() {
                 offsets_monotonic && run.char_offset() == next_offset;
             next_offset = run.char_offset() + run.char_length();
           }
+          if (run.field_code() == "FileName") file_names.push_back(run.text());
           if (run.field_code() == "PageNumber") {
             page_field_ok = !run.text().empty() && run.char_length() > 0;
           }
@@ -3684,6 +3752,11 @@ void verify_field_and_structure_content() {
   require(alt_text_ok, "an image reports its title and alt text");
   require(merge_anchor_ok, "a vertical merge anchor reports its row span");
   require(merge_wide_ok, "a horizontal merge reports its column span");
+  // The worker loads a copy named doc.<ext> in its work dir; a file-name
+  // field prints the upload's name (here none was staged, so the copy's
+  // bare name), never the work dir path.
+  require(file_names == std::vector<std::string>{"doc.fodt", "doc"},
+          "file-name fields print the document's name without the work dir");
 }
 
 // A spreadsheet page is its whole used sheet, so one far-away cell makes a

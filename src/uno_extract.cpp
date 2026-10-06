@@ -148,6 +148,7 @@
 #include <com/sun/star/text/XFootnote.hpp>
 #include <com/sun/star/text/XFootnotesSupplier.hpp>
 #include <com/sun/star/text/XFormField.hpp>
+#include <com/sun/star/text/FilenameDisplayFormat.hpp>
 #include <com/sun/star/text/XTextField.hpp>
 #include <com/sun/star/text/XTextFieldsSupplier.hpp>
 #include <com/sun/star/text/XPageCursor.hpp>
@@ -1672,6 +1673,38 @@ void fill_run_char_props(const Reference<css::beans::XPropertySet>& props,
 // several service names; the most specific one wins, so a document-info
 // field reports "docinfo.Title" rather than the shared base name. Empty when
 // the field does not name itself.
+namespace {
+std::string& source_name_storage() {
+  static std::string name;
+  return name;
+}
+}  // namespace
+
+// What a file-name field prints, for the upload rather than the copy the
+// worker loaded: that copy sits at <work dir>/doc.<ext>, a temp path that
+// means nothing to a reader and names the service's own filesystem. The
+// field's display format still decides between the name with and without
+// its extension; a path-only format prints nothing.
+std::string file_name_field_text(const Reference<css::beans::XPropertySet>& field) {
+  sal_Int16 format = css::text::FilenameDisplayFormat::FULL;
+  try {
+    if (field.is()) field->getPropertyValue("FileFormat") >>= format;
+  } catch (const css::uno::Exception&) {
+    // Expected probe result: the default full form applies.
+  }
+  const std::string& name = source_name_storage();
+  switch (format) {
+    case css::text::FilenameDisplayFormat::PATH:
+      return std::string();
+    case css::text::FilenameDisplayFormat::NAME: {
+      const size_t dot = name.rfind('.');
+      return dot == std::string::npos || dot == 0 ? name : name.substr(0, dot);
+    }
+    default:
+      return name;
+  }
+}
+
 std::string text_field_code(const Reference<css::text::XTextField>& field) {
   Reference<css::lang::XServiceInfo> info(field, UNO_QUERY);
   if (!info.is()) return std::string();
@@ -1720,8 +1753,12 @@ void fill_field_run(const Reference<css::text::XTextRange>& range,
   } catch (const css::beans::UnknownPropertyException&) {
     // Expected probe result: a field portion may not expose its field.
   }
+  std::string code = field.is() ? text_field_code(field) : std::string();
   std::string resolved = utf8(range->getString());
-  if (resolved.empty() && field.is()) {
+  if (code == "FileName") {
+    resolved = file_name_field_text(
+        Reference<css::beans::XPropertySet>(field, UNO_QUERY));
+  } else if (resolved.empty() && field.is()) {
     try {
       resolved = utf8(field->getPresentation(false));
     } catch (const css::uno::Exception& error) {
@@ -1739,7 +1776,6 @@ void fill_field_run(const Reference<css::text::XTextRange>& range,
   } else {
     run->set_char_offset(-1);
   }
-  std::string code = field.is() ? text_field_code(field) : std::string();
   // A field whose service names say nothing is still a field; the generic
   // code keeps generated text distinguishable from authored text.
   run->set_field_code(code.empty() ? "TextField" : code);
@@ -1944,7 +1980,6 @@ bool fill_grid_from_separators(const Reference<css::text::XTextTable>& table,
   }
   if (relative_sum <= 0) return false;
   std::vector<std::vector<sal_Int32>> row_edges(rows->getCount());
-  std::vector<sal_Int32> all_edges;
   for (sal_Int32 r = 0; r < rows->getCount(); r++) {
     css::uno::Sequence<css::text::TableColumnSeparator> separators;
     try {
@@ -1961,24 +1996,42 @@ bool fill_grid_from_separators(const Reference<css::text::XTextTable>& table,
     }
     edges.push_back(relative_sum);
     std::ranges::sort(edges);
-    all_edges.insert(all_edges.end(), edges.begin(), edges.end());
   }
-  // Edges within half a percent of each other are one edge: the importers
-  // round separator positions per row.
-  std::ranges::sort(all_edges);
-  const sal_Int32 tolerance = std::max<sal_Int32>(1, relative_sum / 200);
-  std::vector<sal_Int32> grid;
-  for (sal_Int32 edge : all_edges) {
-    if (grid.empty() || edge - grid.back() > tolerance) grid.push_back(edge);
-  }
-  if (grid.size() < 2) return false;
-  auto grid_index = [&grid](sal_Int32 position) {
-    size_t best = 0;
-    for (size_t i = 1; i < grid.size(); i++) {
-      if (std::abs(grid[i] - position) < std::abs(grid[best] - position)) best = i;
-    }
-    return static_cast<int32_t>(best);
+  // Edges of different rows within half a percent of each other are one
+  // edge: the importers round separator positions per row. Two edges of the
+  // same row are always two edges, however close: a narrow column (a Word
+  // gridAfter of a few twips) is still a column its cell occupies.
+  struct Edge {
+    sal_Int32 position;
+    size_t row;
+    size_t place;
   };
+  std::vector<Edge> all_edges;
+  for (size_t r = 0; r < row_edges.size(); r++) {
+    for (size_t i = 0; i < row_edges[r].size(); i++) {
+      all_edges.push_back({row_edges[r][i], r, i});
+    }
+  }
+  std::ranges::sort(all_edges, {}, &Edge::position);
+  const sal_Int32 tolerance = std::max<sal_Int32>(1, relative_sum / 200);
+  std::vector<std::vector<int32_t>> edge_column(row_edges.size());
+  for (size_t r = 0; r < row_edges.size(); r++) {
+    edge_column[r].assign(row_edges[r].size(), 0);
+  }
+  int32_t grid_lines = 0;
+  sal_Int32 cluster_start = 0;
+  std::set<size_t> cluster_rows;
+  for (const Edge& edge : all_edges) {
+    if (grid_lines == 0 || edge.position - cluster_start > tolerance ||
+        cluster_rows.contains(edge.row)) {
+      grid_lines++;
+      cluster_start = edge.position;
+      cluster_rows.clear();
+    }
+    cluster_rows.insert(edge.row);
+    edge_column[edge.row][edge.place] = grid_lines - 1;
+  }
+  if (grid_lines < 2) return false;
   std::map<int32_t, std::vector<officev1::TableCellData*>> by_row;
   for (officev1::TableCellData& cell : *out->mutable_cells()) {
     if (cell.row() < 0 || cell.column() < 0) continue;
@@ -1987,20 +2040,26 @@ bool fill_grid_from_separators(const Reference<css::text::XTextTable>& table,
   for (auto& [row, cells] : by_row) {
     if (row < 0 || static_cast<size_t>(row) >= row_edges.size()) continue;
     const std::vector<sal_Int32>& edges = row_edges[row];
-    // A row whose boxes and separators disagree (split cells) keeps its
-    // name-derived positions.
-    if (edges.size() != cells.size() + 1) continue;
-    std::ranges::sort(cells, {}, [](const officev1::TableCellData* cell) {
-      return cell->column();
-    });
-    for (size_t i = 0; i < cells.size(); i++) {
-      const int32_t left = grid_index(edges[i]);
-      const int32_t right = grid_index(edges[i + 1]);
-      cells[i]->set_column(left);
-      cells[i]->set_column_span(std::max<int32_t>(1, right - left));
+    // A cell's name letter is its box's place in the row, and the row's
+    // separators bound those boxes. The boxes a vertical merge covers are
+    // not named, so a row under a merged cell names fewer cells than it has
+    // boxes ("B2", "C2" beside a covered A2); indexing the edges by the name
+    // keeps those cells on their own columns. A row whose boxes and
+    // separators disagree (split cells) keeps its name-derived positions.
+    int32_t last_box = -1;
+    for (const officev1::TableCellData* cell : cells) {
+      last_box = std::max(last_box, cell->column());
+    }
+    if (edges.size() < static_cast<size_t>(last_box) + 2) continue;
+    for (officev1::TableCellData* cell : cells) {
+      const size_t box = static_cast<size_t>(cell->column());
+      const int32_t left = edge_column[row][box];
+      const int32_t right = edge_column[row][box + 1];
+      cell->set_column(left);
+      cell->set_column_span(std::max<int32_t>(1, right - left));
     }
   }
-  out->set_columns(static_cast<int32_t>(grid.size()) - 1);
+  out->set_columns(grid_lines - 1);
   return true;
 }
 
@@ -2138,7 +2197,29 @@ void flatten_text_runs(const Reference<css::text::XText>& text,
   while (paragraphs->hasMoreElements()) {
     Reference<css::container::XEnumerationAccess> paragraph(
         paragraphs->nextElement(), UNO_QUERY);
-    if (paragraph.is()) fill_runs(paragraph, label, runs, nullptr, marks, warner);
+    if (!paragraph.is()) continue;
+    // Paragraphs stay apart in the flattened text: a line break between
+    // one paragraph's runs and the next, as the page shows them, rather
+    // than the last word of one running into the first of the next.
+    const int before = runs->size();
+    if (before > 0) {
+      // The break carries the preceding run's character formatting, so a
+      // uniformly formatted text stays uniform, but none of its link or
+      // field identity.
+      officev1::TextRun* separator = runs->Add();
+      *separator = runs->Get(before - 1);
+      separator->set_text("\n");
+      separator->set_char_offset(-1);
+      separator->set_char_length(1);
+      separator->clear_hyperlink_url();
+      separator->clear_hyperlink_target();
+      separator->clear_hyperlink_name();
+      separator->clear_field_code();
+      separator->clear_field_target();
+      separator->clear_escapement();
+    }
+    fill_runs(paragraph, label, runs, nullptr, marks, warner);
+    if (before > 0 && runs->size() == before + 1) runs->RemoveLast();
   }
 }
 
@@ -2642,11 +2723,17 @@ bool emit_draw_shapes(const Reference<css::text::XTextDocument>& text_doc,
 // Emits every Writer text frame with its runs, chain names, layout anchor,
 // and laid-out geometry. Textbox-backing hidden frames are not in this
 // enumeration (the office core excludes them); their text arrives through
-// the draw-shape pass instead, so the two passes never overlap.
+// the draw-shape pass instead, so the two passes never overlap. A table in
+// a frame (a Word floating table imports as a frame holding just the table)
+// is no paragraph of the frame's text: it streams as a table of its own
+// after the frame, numbered on from *table_index, when table_parts is
+// non-null (the tables part is selected).
 bool emit_text_frames(const Reference<css::text::XTextDocument>& text_doc,
                       const Reference<css::text::XTextViewCursor>& cursor,
                       CaretSpace* space, MarkerCollector* marks,
-                      const EmitFn& emit_fn, Warner& warner) {
+                      const PartSelection* table_parts, SelectionProbe* probe,
+                      int32_t* table_index, const EmitFn& emit_fn,
+                      Warner& warner) {
   Reference<css::text::XTextFramesSupplier> supplier(text_doc, UNO_QUERY);
   if (!supplier.is()) return true;
   Reference<css::container::XIndexAccess> frames(supplier->getTextFrames(),
@@ -2713,6 +2800,32 @@ bool emit_text_frames(const Reference<css::text::XTextDocument>& text_doc,
       warner.warn(label + " extraction failed", error);
     }
     if (!emit_fn(event)) return false;
+    if (table_parts == nullptr) continue;
+    std::vector<Reference<css::text::XTextTable>> tables;
+    try {
+      Reference<css::text::XTextFrame> frame(frames->getByIndex(i), UNO_QUERY);
+      Reference<css::container::XEnumerationAccess> access(
+          frame.is() ? frame->getText() : Reference<css::text::XText>(),
+          UNO_QUERY);
+      if (access.is()) {
+        Reference<css::container::XEnumeration> elements =
+            access->createEnumeration();
+        while (elements->hasMoreElements()) {
+          Reference<css::text::XTextTable> table(elements->nextElement(),
+                                                 UNO_QUERY);
+          if (table.is()) tables.push_back(table);
+        }
+      }
+    } catch (const css::uno::Exception& error) {
+      warner.warn(label + " table walk failed", error);
+    }
+    for (const Reference<css::text::XTextTable>& table : tables) {
+      if (!emit_table(table, *table_index, cursor, space, *table_parts, probe,
+                      emit_fn, warner)) {
+        return false;
+      }
+      (*table_index)++;
+    }
   }
   return true;
 }
@@ -4521,6 +4634,8 @@ bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
   // paragraph and image measurements still key on LINE_RECTS.
   SelectionProbe* line_probe =
       parts.wants(officev1::DOCUMENT_PART_LINE_RECTS) ? probe : nullptr;
+  // Body tables first, then the tables text frames hold, in one index space.
+  int32_t table_index = 0;
   if (want_paragraphs || want_tables || want_markers) {
     Reference<css::container::XEnumerationAccess> body(text_doc->getText(),
                                                        UNO_QUERY);
@@ -4530,7 +4645,6 @@ bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
     }
     Reference<css::container::XEnumeration> elements = body->createEnumeration();
     int32_t paragraph_index = 0;
-    int32_t table_index = 0;
     int64_t annotation_offset = 0;
     // When only markers want the body walk, the caret and line-rectangle
     // measurements behind the unselected paragraph part stay skipped.
@@ -4587,8 +4701,9 @@ bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
     if (!emit_page_styles(model, parts, marks, emit_fn, warner)) return false;
   }
   if (parts.wants(officev1::DOCUMENT_PART_TEXT_FRAMES)) {
-    if (!emit_text_frames(text_doc, cursor, &caret_space, marks, emit_fn,
-                          warner)) {
+    if (!emit_text_frames(text_doc, cursor, &caret_space, marks,
+                          want_tables ? &parts : nullptr, probe, &table_index,
+                          emit_fn, warner)) {
       return false;
     }
   }
@@ -5282,15 +5397,19 @@ void collect_segments(const Reference<css::container::XEnumerationAccess>& porti
     if (type == "Text") {
       out->push_back({range, props, false, code_points(range->getString())});
     } else if (type == "TextField") {
+      // The same text fill_field_run puts in the annotation space.
       rtl::OUString shown = range->getString();
-      if (shown.isEmpty()) {
-        Reference<css::text::XTextField> field;
-        try {
-          props->getPropertyValue("TextField") >>= field;
-        } catch (const css::beans::UnknownPropertyException&) {
-          // Expected probe result: a field portion may not expose its field.
-        }
-        if (field.is()) shown = field->getPresentation(false);
+      Reference<css::text::XTextField> field;
+      try {
+        props->getPropertyValue("TextField") >>= field;
+      } catch (const css::beans::UnknownPropertyException&) {
+        // Expected probe result: a field portion may not expose its field.
+      }
+      if (field.is() && text_field_code(field) == "FileName") {
+        shown = oustring(file_name_field_text(
+            Reference<css::beans::XPropertySet>(field, UNO_QUERY)));
+      } else if (shown.isEmpty() && field.is()) {
+        shown = field->getPresentation(false);
       }
       out->push_back({range, props, true, code_points(shown)});
     } else if (type == "ContentControl" || type == "InContentMetadata") {
@@ -6319,6 +6438,8 @@ std::int64_t annotation_space(const Reference<css::text::XTextDocument>& text_do
 }
 
 }  // namespace
+
+void set_source_name(const std::string& name) { source_name_storage() = name; }
 
 void apply_document_options(const RenderOptions& options,
                             std::vector<std::string>* warnings) {

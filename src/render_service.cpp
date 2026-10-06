@@ -498,6 +498,18 @@ grpc::Status RenderServiceImpl::render(
       return {grpc::StatusCode::INTERNAL, "cannot write worker options"};
     }
   }
+  {
+    // The upload's own file name, without any directory part, for the
+    // fields that print it: the loaded copy is named doc.<ext> in the work
+    // dir, and a file-name field would otherwise show that temp path.
+    std::string source_name = filename;
+    if (size_t slash = source_name.find_last_of("/\\");
+        slash != std::string::npos) {
+      source_name = source_name.substr(slash + 1);
+    }
+    std::ofstream name_out(work_dir.path() + "/source.name", std::ios::binary);
+    name_out << source_name;
+  }
   int render_dpi = requested_dpi != 0
                        ? std::clamp(requested_dpi, kMinRenderDpi, kMaxRenderDpi)
                        : config_.render_dpi;
