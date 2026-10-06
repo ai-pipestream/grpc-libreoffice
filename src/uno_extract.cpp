@@ -616,6 +616,20 @@ class CaretSpace {
   std::map<std::string, std::pair<long, long>> margins_;
 };
 
+// True when the range lies in a page header or footer text. Writer hands
+// those texts out as SwXHeadFootText; body, frame and cell texts differ.
+bool anchored_in_header_footer(const Reference<css::text::XTextRange>& range,
+                               const std::string& what, Warner& warner) {
+  if (!range.is()) return false;
+  try {
+    Reference<css::lang::XServiceInfo> info(range->getText(), UNO_QUERY);
+    return info.is() && info->getImplementationName() == "SwXHeadFootText";
+  } catch (const css::uno::Exception& error) {
+    warner.warn("text of " + what + " failed", error);
+  }
+  return false;
+}
+
 // Positions the view cursor at the range and reports the caret point in
 // document-absolute twips and the 0-based page. Reports failures against
 // `what`.
@@ -2519,6 +2533,8 @@ bool emit_writer_shapes(const Reference<css::container::XIndexAccess>& shapes,
             caret_at(walk->cursor, content->getAnchor(), label + " anchor",
                      walk->space, out->mutable_anchor(), &page_index, warner);
             out->set_page_index(page_index);
+            out->set_in_header_footer(anchored_in_header_footer(
+                content->getAnchor(), label + " anchor", warner));
           }
         } catch (const css::uno::Exception& error) {
           warner.warn(label + " anchor query failed", error);
@@ -2572,6 +2588,8 @@ bool emit_writer_shapes(const Reference<css::container::XIndexAccess>& shapes,
           caret_at(walk->cursor, content->getAnchor(), image_label + " anchor",
                    walk->space, out->mutable_anchor(), &page_index, warner);
           out->set_page_index(page_index);
+          out->set_in_header_footer(anchored_in_header_footer(
+              content->getAnchor(), image_label + " anchor", warner));
           // Best effort: select over the anchor character so an as-char
           // image yields its line box. Floating anchors keep width, height,
           // and anchor as the authoritative geometry.
@@ -2667,6 +2685,8 @@ bool emit_writer_shapes(const Reference<css::container::XIndexAccess>& shapes,
         caret_at(walk->cursor, content->getAnchor(), label + " anchor",
                  walk->space, out->mutable_anchor(), &page_index, warner);
         out->set_page_index(page_index);
+        out->set_in_header_footer(anchored_in_header_footer(
+            content->getAnchor(), label + " anchor", warner));
       }
     } catch (const css::uno::Exception& error) {
       warner.warn(label + " anchor query failed", error);
@@ -2759,6 +2779,8 @@ bool emit_text_frames(const Reference<css::text::XTextDocument>& text_doc,
         caret_at(cursor, content->getAnchor(), label + " anchor", space,
                  out->mutable_anchor(), &page_index, warner);
         out->set_page_index(page_index);
+        out->set_in_header_footer(anchored_in_header_footer(
+            content->getAnchor(), label + " anchor", warner));
       }
       Reference<css::beans::XPropertySet> props(frame, UNO_QUERY);
       if (props.is()) {
@@ -4276,6 +4298,8 @@ bool emit_embedded_objects(const Reference<css::frame::XModel>& model,
           caret_at(cursor, content->getAnchor(), label + " anchor", space,
                    out->mutable_anchor(), &page_index, warner);
           out->set_page_index(page_index);
+          out->set_in_header_footer(anchored_in_header_footer(
+              content->getAnchor(), label + " anchor", warner));
         }
         Reference<css::frame::XModel> inner;
         try {

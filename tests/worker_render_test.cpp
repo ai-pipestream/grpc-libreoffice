@@ -3610,6 +3610,58 @@ const char kGridFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
 </office:document>
 )";
 
+// A flat ODT whose header holds a logo and a text frame, with one more
+// image in the body.
+const char kHeaderObjectsFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+ xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
+ office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:automatic-styles>
+  <style:page-layout style:name="pm1">
+   <style:page-layout-properties fo:page-width="21cm" fo:page-height="29.7cm"
+    fo:margin-top="1cm" fo:margin-bottom="2cm" fo:margin-left="2cm" fo:margin-right="2cm"/>
+   <style:header-style><style:header-footer-properties fo:min-height="2cm"/></style:header-style>
+  </style:page-layout>
+ </office:automatic-styles>
+ <office:master-styles>
+  <style:master-page style:name="Standard" style:page-layout-name="pm1">
+   <style:header><text:p>Letterhead<draw:frame draw:name="HeaderLogo" text:anchor-type="paragraph" svg:width="1cm" svg:height="1cm"><draw:image><office:binary-data>iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==</office:binary-data></draw:image></draw:frame><draw:frame draw:name="HeaderBox" text:anchor-type="paragraph" svg:x="8cm" svg:width="4cm" svg:height="1cm"><draw:text-box><text:p>boxed</text:p></draw:text-box></draw:frame></text:p></style:header>
+  </style:master-page>
+ </office:master-styles>
+ <office:body><office:text>
+  <text:p>Body text.<draw:frame draw:name="BodyImage" text:anchor-type="paragraph" svg:width="1cm" svg:height="1cm"><draw:image><office:binary-data>iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==</office:binary-data></draw:image></draw:frame></text:p>
+ </office:text></office:body>
+</office:document>
+)";
+
+void verify_header_objects_are_flagged() {
+  std::vector<std::string> payloads;
+  auto outcome = run("pages", "fodt", kHeaderObjectsFodt, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "header objects fodt renders ok: " + outcome.detail);
+  std::map<std::string, bool> flagged;
+  officev1::StreamPagesResponse event;
+  for (const std::string& payload : payloads) {
+    require(event.ParseFromString(payload), "header objects event parses");
+    if (event.has_embedded_image()) {
+      flagged[event.embedded_image().name()] = event.embedded_image().in_header_footer();
+    }
+    if (event.has_text_frame()) {
+      flagged[event.text_frame().name()] = event.text_frame().in_header_footer();
+    }
+  }
+  require(flagged.count("HeaderLogo") && flagged["HeaderLogo"],
+          "an image anchored in the header is flagged");
+  require(flagged.count("HeaderBox") && flagged["HeaderBox"],
+          "a frame anchored in the header is flagged");
+  require(flagged.count("BodyImage") && !flagged["BodyImage"],
+          "an image anchored in the body is not");
+}
+
 void verify_table_grid_from_column_separators() {
   std::vector<std::string> payloads;
   auto outcome = run("pages", "fodt", kGridFodt, &payloads);
@@ -4065,6 +4117,7 @@ int main() {
   verify_typed_content();
   verify_field_and_structure_content();
   verify_table_grid_from_column_separators();
+  verify_header_objects_are_flagged();
   verify_typed_spreadsheet();
   verify_draw_shapes();
   verify_typed_presentation();
