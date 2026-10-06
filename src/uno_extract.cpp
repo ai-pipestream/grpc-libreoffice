@@ -179,6 +179,7 @@
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/message.h>
 
+#include "gif_palette.h"
 #include "ai/pipestream/office/v1/office_service.pb.h"
 
 namespace grlibre {
@@ -207,6 +208,24 @@ std::string utf8(const rtl::OUString& text) {
 rtl::OUString oustring(const std::string& text) {
   return rtl::OUString(text.data(), static_cast<sal_Int32>(text.size()),
                        RTL_TEXTENCODING_UTF8);
+}
+
+// The name a mark is reported under. The office core names the fieldmarks
+// it creates on import __Fieldmark__<n>_<random>, the random part drawn
+// afresh on every load; <n> already numbers them uniquely in the document,
+// so the random tail is dropped and two parses of the same bytes agree.
+// Every other name is the document's own and passes through.
+std::string stable_mark_name(const std::string& name) {
+  static constexpr std::string_view kPrefix = "__Fieldmark__";
+  if (!name.starts_with(kPrefix)) return name;
+  size_t at = kPrefix.size();
+  const size_t digits = at;
+  while (at < name.size() && name[at] >= '0' && name[at] <= '9') at++;
+  if (at == digits || at + 1 >= name.size() || name[at] != '_') return name;
+  for (size_t i = at + 1; i < name.size(); i++) {
+    if (name[i] < '0' || name[i] > '9') return name;
+  }
+  return name.substr(0, at);
 }
 
 // Collects extraction problems. Every problem is kept for the stream's
@@ -555,8 +574,28 @@ bool emit_metadata(const Reference<css::frame::XModel>& model,
 // keeps caret anchors and line rectangles in one coordinate space.
 class CaretSpace {
  public:
-  explicit CaretSpace(const Reference<css::frame::XModel>& model)
-      : model_(model) {}
+  // pages, when given, are the laid-out page rectangles the page images and
+  // line boxes are numbered by; see page_at.
+  explicit CaretSpace(const Reference<css::frame::XModel>& model,
+                      const std::vector<PageBox>* pages = nullptr)
+      : model_(model), pages_(pages) {}
+
+  // The 0-based rendered page whose rectangle holds the document-absolute
+  // y, or -1 when no rectangles are known or none holds it. The view
+  // cursor's own page number counts the blank pages the office core
+  // inserts to put a section on a right or left page, which are never
+  // rendered, so from the first such page on it runs ahead of the page
+  // images; the rectangles are the numbering everything else uses.
+  int32_t page_at(long y) const {
+    if (pages_ == nullptr) return -1;
+    for (size_t page = 0; page < pages_->size(); page++) {
+      const PageBox& rect = (*pages_)[page];
+      if (y >= rect.y && y < rect.y + rect.height) {
+        return static_cast<int32_t>(page);
+      }
+    }
+    return -1;
+  }
 
   // Returns the (left, top) offset in twips for the page style at the
   // cursor, loading the style margin table on first use.
@@ -612,6 +651,7 @@ class CaretSpace {
   }
 
   Reference<css::frame::XModel> model_;
+  const std::vector<PageBox>* pages_ = nullptr;
   bool loaded_ = false;
   std::map<std::string, std::pair<long, long>> margins_;
 };
@@ -648,8 +688,11 @@ void caret_at(const Reference<css::text::XTextViewCursor>& cursor,
     point->set_x(hundredth_mm_to_twips(position.X) + origin.first);
     point->set_y(hundredth_mm_to_twips(position.Y) + origin.second);
     if (page_index != nullptr) {
-      Reference<css::text::XPageCursor> page_cursor(cursor, UNO_QUERY);
-      if (page_cursor.is()) *page_index = page_cursor->getPage() - 1;
+      *page_index = space != nullptr ? space->page_at(point->y()) : -1;
+      if (*page_index < 0) {
+        Reference<css::text::XPageCursor> page_cursor(cursor, UNO_QUERY);
+        if (page_cursor.is()) *page_index = page_cursor->getPage() - 1;
+      }
     }
   } catch (const css::uno::Exception& error) {
     warner.warn("caret position of " + what + " failed", error);
@@ -1067,7 +1110,7 @@ class MarkerCollector {
       officev1::StreamPagesResponse response;
       officev1::Bookmark* out = response.mutable_bookmark();
       out->set_index(bookmark_index_++);
-      out->set_name(name);
+      out->set_name(stable_mark_name(name));
       out->set_char_start(offset != nullptr ? *offset : -1);
       out->set_char_end(offset != nullptr ? *offset : -1);
       int32_t page_index = -1;
@@ -1079,7 +1122,7 @@ class MarkerCollector {
     auto found = open_bookmarks_.find(name);
     if (is_start && found == open_bookmarks_.end()) {
       Open<officev1::Bookmark>& open = open_bookmarks_[name];
-      open.event.set_name(name);
+      open.event.set_name(stable_mark_name(name));
       open.event.set_char_start(offset != nullptr ? *offset : -1);
       int32_t page_index = -1;
       anchor_at(range, "bookmark " + name, open.event.mutable_anchor(),
@@ -1093,7 +1136,7 @@ class MarkerCollector {
       officev1::StreamPagesResponse response;
       officev1::Bookmark* out = response.mutable_bookmark();
       out->set_index(bookmark_index_++);
-      out->set_name(name);
+      out->set_name(stable_mark_name(name));
       out->set_char_start(-1);
       out->set_char_end(offset != nullptr ? *offset : -1);
       int32_t page_index = -1;
@@ -1136,7 +1179,7 @@ class MarkerCollector {
     fill_redline(props, identifier, &open.event);
     open.event.set_char_start(offset != nullptr ? *offset : -1);
     int32_t page_index = -1;
-    anchor_at(range, "tracked change " + identifier,
+    anchor_at(range, "tracked change " + stable_change_id(identifier),
               open.event.mutable_anchor(), &page_index);
     open.event.set_page_index(page_index);
     if (!is_start) {
@@ -1152,12 +1195,22 @@ class MarkerCollector {
     }
   }
 
+  // The identifier a tracked change is reported under. The office core's
+  // RedlineIdentifier is the redline's address in memory, different on
+  // every load; changes are numbered instead, 1 up, in the order the walks
+  // first meet them, which the document alone decides.
+  std::string stable_change_id(const std::string& identifier) {
+    auto [found, added] = change_ordinals_.try_emplace(
+        identifier, static_cast<int32_t>(change_ordinals_.size()) + 1);
+    return std::to_string(found->second);
+  }
+
   // Fills a tracked change's identity from a redline portion's (or a
   // document-level redline's) properties.
   void fill_redline(const Reference<css::beans::XPropertySet>& props,
                     const std::string& identifier,
                     officev1::TrackedChange* out) {
-    out->set_identifier(identifier);
+    out->set_identifier(stable_change_id(identifier));
     rtl::OUString text;
     props->getPropertyValue("RedlineType") >>= text;
     out->set_kind_name(utf8(text));
@@ -1255,7 +1308,7 @@ class MarkerCollector {
   // well-known checkbox and dropdown parameters into their typed fields.
   void fill_fieldmark(const Reference<css::text::XFormField>& fieldmark,
                       const std::string& name, officev1::FormField* out) {
-    out->set_name(name);
+    out->set_name(stable_mark_name(name));
     out->set_selected_index(-1);
     std::string field_type = utf8(fieldmark->getFieldType());
     out->set_field_type(field_type);
@@ -1343,7 +1396,7 @@ class MarkerCollector {
         officev1::StreamPagesResponse response;
         officev1::Bookmark* out = response.mutable_bookmark();
         out->set_index(bookmark_index_++);
-        out->set_name(bookmark_name);
+        out->set_name(stable_mark_name(bookmark_name));
         out->set_char_start(-1);
         out->set_char_end(-1);
         Reference<css::text::XTextContent> content;
@@ -1442,7 +1495,7 @@ class MarkerCollector {
           props->getPropertyValue("RedlineStart") >>= start;
           if (start.is()) {
             int32_t page_index = -1;
-            anchor_at(start, "tracked change " + identifier,
+            anchor_at(start, "tracked change " + stable_change_id(identifier),
                       out->mutable_anchor(), &page_index);
             out->set_page_index(page_index);
           }
@@ -1472,6 +1525,7 @@ class MarkerCollector {
   std::set<std::string> seen_comment_names_;
   std::set<std::string> seen_bookmark_names_;
   std::set<std::string> seen_change_ids_;
+  std::map<std::string, int32_t> change_ordinals_;
   int32_t comment_index_ = 0;
   int32_t change_index_ = 0;
   int32_t bookmark_index_ = 0;
@@ -2322,6 +2376,9 @@ void encode_graphic(const Reference<css::graphic::XGraphic>& graphic,
     provider->storeGraphic(graphic, store_args);
     *mime_type = utf8(mime);
     *data = sink->bytes();
+    // The office core's GIF writer pads colour tables with uninitialised
+    // memory; see gif_palette.h.
+    if (*mime_type == "image/gif") grlibre::scrub_unused_gif_palette(data);
   } catch (const css::uno::Exception& original_error) {
     warner.note(label + " does not round-trip as " + utf8(mime) +
                     ", re-encoding as image/png",
@@ -4245,6 +4302,7 @@ void classify_embedded(const Reference<css::frame::XModel>& inner,
 // object into a running state.
 bool emit_embedded_objects(const Reference<css::frame::XModel>& model,
                            const Reference<css::uno::XComponentContext>& context,
+                           const std::vector<PageBox>* page_boxes,
                            const EmitFn& emit_fn, Warner& warner) {
   Reference<css::graphic::XGraphicProvider> provider =
       graphic_provider(context, warner);
@@ -4262,7 +4320,7 @@ bool emit_embedded_objects(const Reference<css::frame::XModel>& model,
     Reference<css::text::XTextViewCursorSupplier> cursor_supplier(
         model->getCurrentController(), UNO_QUERY);
     if (cursor_supplier.is()) cursor = cursor_supplier->getViewCursor();
-    CaretSpace caret_space(model);
+    CaretSpace caret_space(model, page_boxes);
     CaretSpace* space = &caret_space;
     for (sal_Int32 i = 0; i < objects->getCount(); i++) {
       std::string label = "embedded object " + std::to_string(i);
@@ -4637,7 +4695,7 @@ bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
   if (!cursor.is()) {
     warner.warn("no view cursor, layout positions will be missing");
   }
-  CaretSpace caret_space(model);
+  CaretSpace caret_space(model, probe != nullptr ? &probe->pages : nullptr);
 
   bool want_paragraphs = parts.wants(officev1::DOCUMENT_PART_PARAGRAPHS);
   bool want_tables = parts.wants(officev1::DOCUMENT_PART_TABLES);
@@ -4764,7 +4822,9 @@ bool emit_typed_content_with(const PartSelection& parts, SelectionProbe* probe,
       if (!emit_metadata(model, emit_fn, warner)) return false;
     }
     if (parts.wants(officev1::DOCUMENT_PART_EMBEDDED_OBJECTS)) {
-      if (!emit_embedded_objects(model, context, emit_fn, warner)) {
+      if (!emit_embedded_objects(model, context,
+                                 probe != nullptr ? &probe->pages : nullptr,
+                                 emit_fn, warner)) {
         return false;
       }
     }
@@ -5128,12 +5188,47 @@ void apply_form_fills(const Reference<css::frame::XModel>& model,
       if (!fieldmark.is()) continue;
       Reference<css::container::XNamed> named(fieldmark, UNO_QUERY);
       if (!named.is()) continue;
-      auto found = by_name.find(utf8(named->getName()));
+      // Matched by the name the extraction reports, which is the stable form
+      // of an import-generated name.
+      const std::string name = utf8(named->getName());
+      auto found = by_name.find(stable_mark_name(name));
+      if (found == by_name.end()) found = by_name.find(name);
       if (found == by_name.end()) continue;
       fill_one_fieldmark(fieldmark, found->second, warner);
     }
   } catch (const css::uno::Exception& error) {
     warner.warn("form fill fields", error);
+  }
+}
+
+// File-name fields print the path the worker loaded, a fresh temp directory
+// per request, on the rendered pages and in every export; two parses of the
+// same bytes would then differ in pixels and in what layout finds there.
+// Each one is pinned to the text the extraction already reports for it: the
+// upload's name in the field's own display format.
+void pin_file_name_fields(const Reference<css::frame::XModel>& model,
+                          Warner& warner) {
+  try {
+    Reference<css::text::XTextFieldsSupplier> fields(model, UNO_QUERY);
+    if (!fields.is()) return;
+    Reference<css::container::XEnumerationAccess> access = fields->getTextFields();
+    if (!access.is()) return;
+    Reference<css::container::XEnumeration> it = access->createEnumeration();
+    while (it->hasMoreElements()) {
+      Reference<css::text::XTextField> field(it->nextElement(), UNO_QUERY);
+      if (!field.is() || text_field_code(field) != "FileName") continue;
+      Reference<css::beans::XPropertySet> props(field, UNO_QUERY);
+      if (!props.is()) continue;
+      try {
+        rtl::OUString shown = oustring(file_name_field_text(props));
+        props->setPropertyValue("IsFixed", css::uno::Any(true));
+        props->setPropertyValue("CurrentPresentation", css::uno::Any(shown));
+      } catch (const css::uno::Exception& error) {
+        warner.warn("pin file name field", error);
+      }
+    }
+  } catch (const css::uno::Exception& error) {
+    warner.warn("pin file name fields", error);
   }
 }
 
@@ -6473,6 +6568,7 @@ void apply_document_options(const RenderOptions& options,
     if (!context.is()) return;
     Reference<css::frame::XModel> model = find_loaded_model(context);
     if (!model.is()) return;
+    pin_file_name_fields(model, warner);
     apply_tracked_changes(model, context, options.tracked_changes, warner);
     apply_form_fills(model, options.form_values, warner);
   } catch (const css::uno::Exception& error) {
