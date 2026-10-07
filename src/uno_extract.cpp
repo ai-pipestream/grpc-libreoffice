@@ -102,6 +102,7 @@
 #include <com/sun/star/lang/XServiceInfo.hpp>
 #include <com/sun/star/sheet/XCellRangeAddressable.hpp>
 #include <com/sun/star/sheet/CellFlags.hpp>
+#include <com/sun/star/sheet/FormulaResult.hpp>
 #include <com/sun/star/sheet/XCellRangesQuery.hpp>
 #include <com/sun/star/sheet/XCellRangeReferrer.hpp>
 #include <com/sun/star/sheet/XDataPilotDescriptor.hpp>
@@ -3826,10 +3827,23 @@ bool emit_calc_content(
             out_cell->set_number_format(key);
             const NumberFormatInfo& format = format_info(key);
             out_cell->set_number_format_string(format.code);
-            if ((format.category & css::util::NumberFormat::LOGICAL) != 0) {
+            // The format is the column's, not the cell's content: a text
+            // cell (a "Date" header over a date column) or a formula that
+            // yields text holds no number, and reading its value as a
+            // serial would report the null date as if the sheet held it.
+            bool holds_number = type == css::table::CellContentType_VALUE;
+            if (type == css::table::CellContentType_FORMULA
+                && cell_props.is()) {
+              sal_Int32 result = 0;
+              cell_props->getPropertyValue("FormulaResultType2") >>= result;
+              holds_number = result == css::sheet::FormulaResult::VALUE;
+            }
+            if (holds_number
+                && (format.category & css::util::NumberFormat::LOGICAL) != 0) {
               out_cell->set_is_boolean(true);
-            } else if ((format.category & css::util::NumberFormat::DATETIME)
-                       != 0) {
+            } else if (holds_number
+                       && (format.category & css::util::NumberFormat::DATETIME)
+                              != 0) {
               // DATETIME is DATE|TIME, so the mask catches all three. The
               // serial counts days from the null date; the wall-clock
               // components fall out of that sum with no timezone claimed.
