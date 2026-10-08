@@ -363,6 +363,16 @@ int main(int argc, char** argv) {
     return grlibre::kExitRenderFailure;
   }
 
+  // The office core's thread pool computes a sheet's optimal row heights in
+  // parallel, and that pass races: the same xlsx loaded three times gave
+  // three different heights for rows of wrapped text (one line in one load,
+  // two in the next), so the page size, its image and every row position
+  // changed from parse to parse. One pool thread makes the heights the same
+  // on every load. The worker is one document, and the server runs workers
+  // side by side, so the pool's own parallelism buys little here. An
+  // operator who sets MAX_CONCURRENCY keeps their value.
+  ::setenv("MAX_CONCURRENCY", "1", 0);
+
   std::string error;
   int code = grlibre::run_render(options, STDOUT_FILENO, &error);
   if (code != grlibre::kExitOk) {
