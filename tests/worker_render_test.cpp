@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -21,6 +22,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "ai/pipestream/office/v1/office_service.pb.h"
@@ -2195,6 +2197,102 @@ void verify_disk_work_dir_is_refused() {
   std::filesystem::remove_all(work_dir, ignored);
 }
 
+// A stored (uncompressed) zip of the given entries: enough of the format
+// for the office core to open an OOXML package built in the test.
+std::string stored_zip(const std::vector<std::pair<std::string, std::string>>& entries) {
+  auto crc32 = [](const std::string& data) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (const unsigned char byte : data) {
+      crc ^= byte;
+      for (int bit = 0; bit < 8; bit++) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+    return ~crc;
+  };
+  auto le16 = [](std::string* out, uint16_t v) {
+    out->push_back(static_cast<char>(v & 0xFF));
+    out->push_back(static_cast<char>(v >> 8));
+  };
+  auto le32 = [&](std::string* out, uint32_t v) {
+    le16(out, static_cast<uint16_t>(v & 0xFFFF));
+    le16(out, static_cast<uint16_t>(v >> 16));
+  };
+  std::string zip;
+  std::string directory;
+  for (const auto& [name, data] : entries) {
+    const uint32_t offset = static_cast<uint32_t>(zip.size());
+    const uint32_t crc = crc32(data);
+    const auto size = static_cast<uint32_t>(data.size());
+    le32(&zip, 0x04034b50u);
+    le16(&zip, 20); le16(&zip, 0); le16(&zip, 0); le16(&zip, 0); le16(&zip, 0x21);
+    le32(&zip, crc); le32(&zip, size); le32(&zip, size);
+    le16(&zip, static_cast<uint16_t>(name.size())); le16(&zip, 0);
+    zip += name;
+    zip += data;
+    le32(&directory, 0x02014b50u);
+    le16(&directory, 20); le16(&directory, 20); le16(&directory, 0); le16(&directory, 0);
+    le16(&directory, 0); le16(&directory, 0x21);
+    le32(&directory, crc); le32(&directory, size); le32(&directory, size);
+    le16(&directory, static_cast<uint16_t>(name.size()));
+    le16(&directory, 0); le16(&directory, 0); le16(&directory, 0); le16(&directory, 0);
+    le32(&directory, 0); le32(&directory, offset);
+    directory += name;
+  }
+  const uint32_t directory_offset = static_cast<uint32_t>(zip.size());
+  zip += directory;
+  le32(&zip, 0x06054b50u);
+  le16(&zip, 0); le16(&zip, 0);
+  le16(&zip, static_cast<uint16_t>(entries.size()));
+  le16(&zip, static_cast<uint16_t>(entries.size()));
+  le32(&zip, static_cast<uint32_t>(directory.size()));
+  le32(&zip, directory_offset);
+  le16(&zip, 0);
+  return zip;
+}
+
+// S3 eval finding: a note imported from an xlsx keeps its text as init data
+// until a caption is built, and the kit never builds one, so every comment
+// of a real workbook arrived with an author and an empty text. The text is
+// split over two runs the way Excel writes it (a bold author prefix, then
+// the note).
+void verify_xlsx_note_text() {
+  const std::string xlsx = stored_zip({
+      {"[Content_Types].xml",
+       R"(<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/comments1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml"/><Default Extension="vml" ContentType="application/vnd.openxmlformats-officedocument.vmlDrawing"/></Types>)"},
+      {"_rels/.rels",
+       R"(<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>)"},
+      {"xl/workbook.xml",
+       R"(<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>)"},
+      {"xl/_rels/workbook.xml.rels",
+       R"(<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>)"},
+      {"xl/worksheets/sheet1.xml",
+       R"(<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Cases</t></is></c></row><row r="2"><c r="A2"><v>12</v></c></row></sheetData><legacyDrawing r:id="rId2"/></worksheet>)"},
+      {"xl/worksheets/_rels/sheet1.xml.rels",
+       R"(<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing" Target="../drawings/vmlDrawing1.vml"/></Relationships>)"},
+      // Excel's hidden note box: the shape the office core reads the note's
+      // place from, never shown, so its caption is never built.
+      {"xl/drawings/vmlDrawing1.vml",
+       R"(<xml xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel"><v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe"><v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype><v:shape id="_x0000_s1025" type="#_x0000_t202" style="position:absolute;margin-left:60pt;margin-top:2pt;width:96pt;height:55pt;z-index:1;visibility:hidden" fillcolor="#ffffe1"><v:textbox><div style="text-align:left"></div></v:textbox><x:ClientData ObjectType="Note"><x:MoveWithCells/><x:SizeWithCells/><x:Anchor>1, 15, 0, 2, 3, 15, 4, 4</x:Anchor><x:AutoFill>False</x:AutoFill><x:Row>1</x:Row><x:Column>0</x:Column></x:ClientData></v:shape></xml>)"},
+      {"xl/comments1.xml",
+       R"(<?xml version="1.0" encoding="UTF-8"?><comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><authors><author>Monitor</author></authors><commentList><comment ref="A2" authorId="0"><text><r><rPr><b/></rPr><t xml:space="preserve">Monitor: </t></r><r><t>Excludes cases between NHS bodies.</t></r></text></comment></commentList></comments>)"},
+  });
+  std::vector<std::string> payloads;
+  auto outcome = run("pages", "xlsx", xlsx, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "note xlsx renders ok: " + outcome.detail);
+  std::vector<officev1::SheetCellComment> comments;
+  officev1::StreamPagesResponse event;
+  for (const std::string& payload : payloads) {
+    require(event.ParseFromString(payload), "note xlsx event parses");
+    if (event.has_sheet_cell_comment()) comments.push_back(event.sheet_cell_comment());
+  }
+  require(comments.size() == 1 && comments[0].row() == 1 && comments[0].column() == 0,
+          "the note is reported at its cell");
+  require(comments[0].text() == "Monitor: Excludes cases between NHS bodies.",
+          "the note carries its text, got '" + comments[0].text() + "'");
+  require(comments[0].date().empty(),
+          "an Excel note stores no date, so none is made up: got '" + comments[0].date() + "'");
+}
+
 void verify_corrupt_zip_is_load_failure() {
   // Plain ASCII garbage would not do here: the office core content-sniffs
   // it as text and loads it. A broken zip container is genuinely unloadable
@@ -4213,6 +4311,7 @@ int main() {
   verify_work_dir_stays_documentless();
   verify_disk_work_dir_is_refused();
   verify_corrupt_zip_is_load_failure();
+  verify_xlsx_note_text();
   verify_broken_package_needs_repair_opt_in();
   verify_encrypted_document_passwords();
   verify_html_renders_and_exits_promptly();

@@ -112,6 +112,7 @@
 #include <com/sun/star/sheet/XNamedRange.hpp>
 #include <com/sun/star/sheet/XPrintAreas.hpp>
 #include <com/sun/star/sheet/XSheetAnnotation.hpp>
+#include <com/sun/star/sheet/XSheetAnnotationShapeSupplier.hpp>
 #include <com/sun/star/sheet/XSheetAnnotations.hpp>
 #include <com/sun/star/sheet/XSheetAnnotationsSupplier.hpp>
 #include <com/sun/star/sheet/XSheetCellCursor.hpp>
@@ -3508,6 +3509,17 @@ bool emit_calc_content(
     const PartSelection& parts, const EmitFn& emit_fn, Warner& warner) {
   bool want_sheets = parts.wants(officev1::DOCUMENT_PART_SHEETS);
   bool want_images = parts.wants(officev1::DOCUMENT_PART_IMAGES);
+  // The import filter the document was loaded with (MS Excel 97, Calc
+  // Office Open XML, calc8, ...): it says whether a cell note's date came
+  // from the file.
+  bool excel_notes = false;
+  for (const css::beans::PropertyValue& arg : model->getArgs()) {
+    if (arg.Name != "FilterName") continue;
+    rtl::OUString filter;
+    arg.Value >>= filter;
+    const std::string name = utf8(filter);
+    excel_notes = name.contains("Excel") || name.contains("Office Open XML");
+  }
 
   // Number-format codes resolve once per key through this cache. Key 0 is
   // General and stays an empty code on the wire.
@@ -3572,6 +3584,13 @@ bool emit_calc_content(
         Reference<css::container::XIndexAccess> named;
         doc_props->getPropertyValue("NamedRanges") >>= named;
         if (named.is()) {
+          // A reference into another file resolves against the folder the
+          // document was loaded from, which is this request's private work
+          // directory: a fresh name on every parse, and nothing the caller
+          // should see. The reference keeps the file name the document
+          // gave, relative as it was written.
+          std::string folder = utf8(model->getURL());
+          folder.erase(folder.rfind('/') + 1);
           for (sal_Int32 i = 0; i < named->getCount(); i++) {
             Reference<css::sheet::XNamedRange> range(named->getByIndex(i),
                                                      UNO_QUERY);
@@ -3579,7 +3598,14 @@ bool emit_calc_content(
             officev1::StreamPagesResponse event;
             officev1::SheetNamedRange* out = event.mutable_sheet_named_range();
             out->set_name(utf8(range->getName()));
-            out->set_content(utf8(range->getContent()));
+            std::string content = utf8(range->getContent());
+            if (folder.size() > 1) {
+              for (size_t at = content.find(folder); at != std::string::npos;
+                   at = content.find(folder, at)) {
+                content.erase(at, folder.size());
+              }
+            }
+            out->set_content(content);
             out->set_type_flags(range->getType());
             out->set_sheet_index(-1);
             // A name that refers to cells resolves to them; a name holding
@@ -3896,12 +3922,27 @@ bool emit_calc_content(
               comment->set_row(position.Row);
               comment->set_column(position.Column);
               comment->set_author(utf8(annotation->getAuthor()));
-              comment->set_date(utf8(annotation->getDate()));
+              // Excel notes (xls and xlsx alike) store no date; the office
+              // core stamps an imported one with the moment of loading, a
+              // new value on every parse, so it is not passed on.
+              if (!excel_notes) comment->set_date(utf8(annotation->getDate()));
               comment->set_visible(annotation->getIsVisible());
               // Annotation text is guaranteed through XSimpleText, not
               // XText.
               Reference<css::text::XSimpleText> text(annotation, UNO_QUERY);
               if (text.is()) comment->set_text(utf8(text->getString()));
+              // A note imported from a file keeps its text as init data
+              // until its caption exists, and the kit never builds the
+              // caption, so the annotation reads empty. The annotation
+              // shape builds it, and reads the same text the file holds.
+              if (comment->text().empty()) {
+                Reference<css::sheet::XSheetAnnotationShapeSupplier> shapes(
+                    annotation, UNO_QUERY);
+                Reference<css::text::XSimpleText> caption(
+                    shapes.is() ? shapes->getAnnotationShape() : nullptr,
+                    UNO_QUERY);
+                if (caption.is()) comment->set_text(utf8(caption->getString()));
+              }
               if (!emit_fn(comment_event)) return false;
             }
           }
