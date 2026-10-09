@@ -310,6 +310,45 @@ Reference<css::frame::XModel> find_loaded_model(
   return model.is() ? model : fallback;
 }
 
+// The folder the loaded document sits in, as a file URL ending in '/': this
+// request's private work directory, a new name on every parse. The office
+// core resolves a relative hyperlink or a reference into another file
+// against it, so a value read off the document can carry that folder. Set
+// for the length of one typed walk (a worker loads one document).
+std::string& work_folder() {
+  static std::string folder;
+  return folder;
+}
+
+class WorkFolderScope {
+ public:
+  explicit WorkFolderScope(const Reference<css::frame::XModel>& model) {
+    const std::string url = model.is() ? utf8(model->getURL()) : std::string();
+    const size_t slash = url.rfind('/');
+    // Only a real file URL names a folder; "file:///" alone is the root.
+    if (url.starts_with("file://") && slash != std::string::npos &&
+        slash + 1 > std::string_view("file:///").size()) {
+      work_folder() = url.substr(0, slash + 1);
+    }
+  }
+  ~WorkFolderScope() { work_folder().clear(); }
+  WorkFolderScope(const WorkFolderScope&) = delete;
+  WorkFolderScope& operator=(const WorkFolderScope&) = delete;
+};
+
+// `text` with every mention of the work folder removed, so a link or
+// reference reads relative, the way the document wrote it, and the same on
+// every parse.
+std::string without_work_folder(std::string text) {
+  const std::string& folder = work_folder();
+  if (folder.empty()) return text;
+  for (size_t at = text.find(folder); at != std::string::npos;
+       at = text.find(folder, at)) {
+    text.erase(at, folder.size());
+  }
+  return text;
+}
+
 // Collects graphic-provider output in memory; nothing touches a filesystem.
 // The provider's stream helper unwraps an io::XStream and queries XSeekable
 // from it, so this implements the full seekable read/write surface over one
@@ -1724,7 +1763,9 @@ void fill_run_char_props(const Reference<css::beans::XPropertySet>& props,
     rtl::OUString url;
     props->getPropertyValue("HyperLinkURL") >>= url;
     if (!url.isEmpty()) {
-      run->set_hyperlink_url(utf8(url));
+      // A relative link resolved against the work folder reads relative
+      // again.
+      run->set_hyperlink_url(without_work_folder(utf8(url)));
       rtl::OUString target;
       props->getPropertyValue("HyperLinkTarget") >>= target;
       run->set_hyperlink_target(utf8(target));
@@ -3585,13 +3626,6 @@ bool emit_calc_content(
         Reference<css::container::XIndexAccess> named;
         doc_props->getPropertyValue("NamedRanges") >>= named;
         if (named.is()) {
-          // A reference into another file resolves against the folder the
-          // document was loaded from, which is this request's private work
-          // directory: a fresh name on every parse, and nothing the caller
-          // should see. The reference keeps the file name the document
-          // gave, relative as it was written.
-          std::string folder = utf8(model->getURL());
-          folder.erase(folder.rfind('/') + 1);
           for (sal_Int32 i = 0; i < named->getCount(); i++) {
             Reference<css::sheet::XNamedRange> range(named->getByIndex(i),
                                                      UNO_QUERY);
@@ -3599,14 +3633,9 @@ bool emit_calc_content(
             officev1::StreamPagesResponse event;
             officev1::SheetNamedRange* out = event.mutable_sheet_named_range();
             out->set_name(utf8(range->getName()));
-            std::string content = utf8(range->getContent());
-            if (folder.size() > 1) {
-              for (size_t at = content.find(folder); at != std::string::npos;
-                   at = content.find(folder, at)) {
-                content.erase(at, folder.size());
-              }
-            }
-            out->set_content(content);
+            // A reference into another file names the work folder; it
+            // keeps the file name the document gave instead.
+            out->set_content(without_work_folder(utf8(range->getContent())));
             out->set_type_flags(range->getType());
             out->set_sheet_index(-1);
             // A name that refers to cells resolves to them; a name holding
@@ -3838,7 +3867,8 @@ bool emit_calc_content(
                 break;
             }
             if (type == css::table::CellContentType_FORMULA) {
-              out_cell->set_formula(utf8(cell->getFormula()));
+              // A reference into another file names the work folder.
+              out_cell->set_formula(without_work_folder(utf8(cell->getFormula())));
             }
             if (type != css::table::CellContentType_TEXT) {
               out_cell->set_number(cell->getValue());
@@ -4873,6 +4903,7 @@ bool emit_typed_content_with(const PartSelection& parts, SelectionProbe* probe,
       warner.warn("loaded document not found on the desktop, typed content unavailable");
       return true;
     }
+    const WorkFolderScope work_folder_scope(model);
     if (parts.wants(officev1::DOCUMENT_PART_METADATA)) {
       if (!emit_metadata(model, emit_fn, warner)) return false;
     }
