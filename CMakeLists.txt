@@ -116,6 +116,11 @@ set(GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 set(PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto")
 set(OFFICE_PROTO "${PROTO_DIR}/ai/pipestream/office/v1/office_service.proto")
 set(DOCUMENT_PROTO "${PROTO_DIR}/ai/pipestream/document/v1/document.proto")
+# Vendored verbatim from gRParse beside document.proto, which imports them for
+# Document.analyses (the OpenNLP analyses; this service never fills them).
+set(OPENNLP_PROTOS
+  "${PROTO_DIR}/org/apache/opennlp/grpc/v1/opennlp_document.proto"
+  "${PROTO_DIR}/org/apache/opennlp/grpc/v1/opennlp_annotations.proto")
 add_custom_command(
   OUTPUT "${GENERATED_DIR}/ai/pipestream/office/v1/office_service.pb.cc"
          "${GENERATED_DIR}/ai/pipestream/office/v1/office_service.pb.h"
@@ -123,6 +128,10 @@ add_custom_command(
          "${GENERATED_DIR}/ai/pipestream/office/v1/office_service.grpc.pb.h"
          "${GENERATED_DIR}/ai/pipestream/document/v1/document.pb.cc"
          "${GENERATED_DIR}/ai/pipestream/document/v1/document.pb.h"
+         "${GENERATED_DIR}/org/apache/opennlp/grpc/v1/opennlp_document.pb.cc"
+         "${GENERATED_DIR}/org/apache/opennlp/grpc/v1/opennlp_document.pb.h"
+         "${GENERATED_DIR}/org/apache/opennlp/grpc/v1/opennlp_annotations.pb.cc"
+         "${GENERATED_DIR}/org/apache/opennlp/grpc/v1/opennlp_annotations.pb.h"
   COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_DIR}"
   COMMAND $<TARGET_FILE:protoc>
   ARGS --proto_path=${PROTO_DIR}
@@ -130,13 +139,15 @@ add_custom_command(
        --cpp_out=${GENERATED_DIR}
        --grpc_out=${GENERATED_DIR}
        --plugin=protoc-gen-grpc=$<TARGET_FILE:grpc_cpp_plugin>
-       ${OFFICE_PROTO} ${DOCUMENT_PROTO}
-  DEPENDS ${OFFICE_PROTO} ${DOCUMENT_PROTO} protoc grpc_cpp_plugin
+       ${OFFICE_PROTO} ${DOCUMENT_PROTO} ${OPENNLP_PROTOS}
+  DEPENDS ${OFFICE_PROTO} ${DOCUMENT_PROTO} ${OPENNLP_PROTOS} protoc grpc_cpp_plugin
   VERBATIM)
 add_library(office_proto
   "${GENERATED_DIR}/ai/pipestream/office/v1/office_service.pb.cc"
   "${GENERATED_DIR}/ai/pipestream/office/v1/office_service.grpc.pb.cc"
-  "${GENERATED_DIR}/ai/pipestream/document/v1/document.pb.cc")
+  "${GENERATED_DIR}/ai/pipestream/document/v1/document.pb.cc"
+  "${GENERATED_DIR}/org/apache/opennlp/grpc/v1/opennlp_document.pb.cc"
+  "${GENERATED_DIR}/org/apache/opennlp/grpc/v1/opennlp_annotations.pb.cc")
 target_include_directories(office_proto PUBLIC "${GENERATED_DIR}")
 target_link_libraries(office_proto PUBLIC grpc++)
 

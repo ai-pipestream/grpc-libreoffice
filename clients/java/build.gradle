@@ -32,6 +32,8 @@ sourceSets {
             srcDir '../../proto'
             include 'ai/pipestream/office/v1/office_service.proto'
             include 'ai/pipestream/document/v1/document.proto'
+            include 'org/apache/opennlp/grpc/v1/opennlp_document.proto'
+            include 'org/apache/opennlp/grpc/v1/opennlp_annotations.proto'
         }
     }
 }

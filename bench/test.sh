@@ -18,10 +18,14 @@ if [ ! -f gen/ai/pipestream/office/v1/office_service_pb2.py ]; then
   ./.venv/bin/python -m grpc_tools.protoc -I ../proto \
     --python_out=gen --grpc_python_out=gen \
     ../proto/ai/pipestream/document/v1/document.proto \
+    ../proto/org/apache/opennlp/grpc/v1/opennlp_document.proto \
+    ../proto/org/apache/opennlp/grpc/v1/opennlp_annotations.proto \
     ../proto/ai/pipestream/office/v1/office_service.proto
   touch gen/__init__.py gen/ai/__init__.py gen/ai/pipestream/__init__.py \
     gen/ai/pipestream/office/__init__.py gen/ai/pipestream/office/v1/__init__.py \
-    gen/ai/pipestream/document/__init__.py gen/ai/pipestream/document/v1/__init__.py
+    gen/ai/pipestream/document/__init__.py gen/ai/pipestream/document/v1/__init__.py \
+    gen/org/__init__.py gen/org/apache/__init__.py gen/org/apache/opennlp/__init__.py \
+    gen/org/apache/opennlp/grpc/__init__.py gen/org/apache/opennlp/grpc/v1/__init__.py
 fi
 
 exec ./.venv/bin/python -m pytest test_bench.py "$@"
