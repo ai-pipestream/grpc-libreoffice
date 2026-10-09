@@ -765,8 +765,9 @@ void verify_typed_content() {
 }
 
 // A flat ODS with two sheets: a data sheet exercising a merged header, a
-// numeric cell, a currency-formatted cell, a formula, and a cell comment,
-// plus a hidden second sheet. Flat XML keeps the fixture diskless and
+// numeric cell, a currency-formatted cell, a formula, a cell comment, and
+// text (plain and formula-made) under date and boolean formats, plus a
+// hidden second sheet. Flat XML keeps the fixture diskless and
 // reviewable.
 const char kTypedFods[] = R"(<?xml version="1.0" encoding="UTF-8"?>
 <office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
@@ -806,14 +807,14 @@ const char kTypedFods[] = R"(<?xml version="1.0" encoding="UTF-8"?>
     <table:table-cell table:style-name="ce1" office:value-type="currency" office:currency="USD" office:value="9.99"><text:p>$9.99</text:p></table:table-cell>
    </table:table-row>
    <table:table-row>
-    <table:table-cell/>
-    <table:table-cell/>
+    <table:table-cell table:style-name="ce3" office:value-type="string"><text:p>Flag</text:p></table:table-cell>
+    <table:table-cell table:style-name="ce2" table:formula="of:=&quot;x&quot;&amp;&quot;y&quot;" office:value-type="string" office:string-value="xy"><text:p>xy</text:p></table:table-cell>
     <table:table-cell table:formula="of:=[.B2]*[.C2]" office:value-type="float" office:value="419.58"><text:p>419.58</text:p></table:table-cell>
    </table:table-row>
    <table:table-row>
     <table:table-cell table:style-name="ce2" office:value-type="date" office:date-value="2023-03-15"><text:p>2023-03-15</text:p></table:table-cell>
     <table:table-cell table:style-name="ce3" office:value-type="boolean" office:boolean-value="true"><text:p>TRUE</text:p></table:table-cell>
-    <table:table-cell/>
+    <table:table-cell table:style-name="ce2" office:value-type="string"><text:p>Date</text:p></table:table-cell>
    </table:table-row>
   </table:table>
   <table:table table:name="Hidden" table:style-name="ta2">
@@ -885,6 +886,8 @@ void verify_typed_spreadsheet() {
   bool covered_cell_absent = true;
   bool date_ok = false;
   bool boolean_ok = false;
+  int formatted_text_cells = 0;
+  bool formatted_text_untyped = true;
   for (const officev1::SheetRow& row : rows) {
     require(row.sheet_index() != 0 || row.row() <= 3,
             "rows stay inside the used bounds");
@@ -909,6 +912,19 @@ void verify_typed_spreadsheet() {
       if (row.sheet_index() == 0 && row.row() == 3 && cell.column() == 1) {
         boolean_ok = cell.is_boolean() && cell.number() == 1.0;
       }
+      const bool formatted_text =
+          row.sheet_index() == 0
+          && ((row.row() == 2 && cell.column() <= 1)
+              || (row.row() == 3 && cell.column() == 2));
+      if (formatted_text) {
+        // Text keeps the column's format code but never borrows a date or
+        // a flag from it: its value is no serial.
+        formatted_text_cells++;
+        formatted_text_untyped = formatted_text_untyped && !cell.is_datetime()
+                                 && !cell.is_boolean()
+                                 && !cell.has_datetime()
+                                 && !cell.number_format_string().empty();
+      }
       if (row.sheet_index() == 0 && row.row() == 1 && cell.column() == 2) {
         currency_ok = cell.type() == officev1::SHEET_CELL_TYPE_VALUE &&
                       cell.number() == 9.99 && cell.number_format() != 0 &&
@@ -929,6 +945,8 @@ void verify_typed_spreadsheet() {
   require(named_range_ok,
           "a named range resolves to the cells it refers to");
   require(boolean_ok, "a logical cell is marked boolean, not just numeric");
+  require(formatted_text_cells == 3 && formatted_text_untyped,
+          "text under a date or boolean format is neither a date nor a flag");
   require(formula_ok, "formula cell keeps formula and computed number");
   require(comments.size() == 1 && comments[0].sheet_index() == 0 &&
               comments[0].row() == 1 && comments[0].column() == 0 &&
