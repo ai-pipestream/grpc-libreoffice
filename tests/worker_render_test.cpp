@@ -2311,6 +2311,78 @@ void verify_xlsx_note_text() {
           "an Excel note stores no date, so none is made up: got '" + comments[0].date() + "'");
 }
 
+// S3 eval finding, the repeat-parse class: the office core resolves a
+// relative link or a reference into another file against the folder the
+// document was loaded from, which is the request's private work directory
+// (file:///.../grlibre-XXXXXX/). Every parse then reported a new folder
+// name. A docx hyperlink to a sibling file and an xlsx formula and named
+// range that read from one must come back relative, as the files wrote them.
+void verify_relative_links_name_no_work_dir() {
+  const std::string docx = stored_zip({
+      {"[Content_Types].xml",
+       R"(<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>)"},
+      {"_rels/.rels",
+       R"(<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>)"},
+      {"word/_rels/document.xml.rels",
+       R"(<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="other.docx" TargetMode="External"/></Relationships>)"},
+      {"word/document.xml",
+       R"(<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body><w:p><w:r><w:t xml:space="preserve">See </w:t></w:r><w:hyperlink r:id="rId1"><w:r><w:t>the other file</w:t></w:r></w:hyperlink></w:p></w:body></w:document>)"},
+  });
+  std::vector<std::string> payloads;
+  auto outcome = run("pages", "docx", docx, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "relative-link docx renders ok: " + outcome.detail);
+  std::vector<std::string> urls;
+  officev1::StreamPagesResponse event;
+  for (const std::string& payload : payloads) {
+    require(event.ParseFromString(payload), "relative-link docx event parses");
+    if (!event.has_paragraph()) continue;
+    for (const officev1::TextRun& run : event.paragraph().runs()) {
+      if (!run.hyperlink_url().empty()) urls.push_back(run.hyperlink_url());
+    }
+  }
+  require(urls.size() == 1 && urls[0] == "other.docx",
+          "a relative hyperlink stays relative, got '" +
+              (urls.empty() ? std::string() : urls[0]) + "'");
+
+  const std::string xlsx = stored_zip({
+      {"[Content_Types].xml",
+       R"(<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/externalLinks/externalLink1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.externalLink+xml"/></Types>)"},
+      {"_rels/.rels",
+       R"(<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>)"},
+      {"xl/workbook.xml",
+       R"(<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets><externalReferences><externalReference r:id="rId2"/></externalReferences><definedNames><definedName name="Ext">[1]Sheet1!$A$1:$B$2</definedName></definedNames></workbook>)"},
+      {"xl/_rels/workbook.xml.rels",
+       R"(<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLink" Target="externalLinks/externalLink1.xml"/></Relationships>)"},
+      {"xl/worksheets/sheet1.xml",
+       R"(<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><f>[1]Sheet1!A1</f><v>7</v></c></row></sheetData></worksheet>)"},
+      {"xl/externalLinks/externalLink1.xml",
+       R"(<?xml version="1.0" encoding="UTF-8"?><externalLink xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><externalBook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"><sheetNames><sheetName val="Sheet1"/></sheetNames><sheetDataSet><sheetData sheetId="0"><row r="1"><cell r="A1"><v>7</v></cell></row></sheetData></sheetDataSet></externalBook></externalLink>)"},
+      {"xl/externalLinks/_rels/externalLink1.xml.rels",
+       R"(<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLinkPath" Target="other.xlsx" TargetMode="External"/></Relationships>)"},
+  });
+  payloads.clear();
+  outcome = run("pages", "xlsx", xlsx, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "external-reference xlsx renders ok: " + outcome.detail);
+  std::string formula;
+  std::string named;
+  for (const std::string& payload : payloads) {
+    require(event.ParseFromString(payload), "external-reference xlsx event parses");
+    if (event.has_sheet_named_range() && event.sheet_named_range().name() == "Ext") {
+      named = event.sheet_named_range().content();
+    }
+    if (!event.has_sheet_row()) continue;
+    for (const officev1::SheetCell& cell : event.sheet_row().cells()) {
+      if (!cell.formula().empty()) formula = cell.formula();
+    }
+  }
+  require(formula == "='other.xlsx'#$Sheet1.A1",
+          "a formula reading another file names it relative, got '" + formula + "'");
+  require(named == "'other.xlsx'#$Sheet1.$A$1:$B$2",
+          "a named range into another file names it relative, got '" + named + "'");
+}
+
 void verify_corrupt_zip_is_load_failure() {
   // Plain ASCII garbage would not do here: the office core content-sniffs
   // it as text and loads it. A broken zip container is genuinely unloadable
@@ -4330,6 +4402,7 @@ int main() {
   verify_disk_work_dir_is_refused();
   verify_corrupt_zip_is_load_failure();
   verify_xlsx_note_text();
+  verify_relative_links_name_no_work_dir();
   verify_broken_package_needs_repair_opt_in();
   verify_encrypted_document_passwords();
   verify_html_renders_and_exits_promptly();
