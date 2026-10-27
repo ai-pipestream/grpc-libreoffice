@@ -3183,6 +3183,73 @@ void verify_redaction_fails_closed() {
           "and the host's occurrence is redacted");
 }
 
+// A hyperlink inside a drawing shape's text is a URL field of the drawing
+// text, not a character attribute of the kind a Writer paragraph carries,
+// and the PDF export writes its target as a link annotation. A text frame
+// carries its link the Writer way, for contrast.
+constexpr char kShapeLinkFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ xmlns:xlink="http://www.w3.org/1999/xlink"
+ office:version="1.2"
+ office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:body>
+  <office:text>
+   <text:p>The SECRET-VALUE sits in the body.</text:p>
+   <text:p><draw:rect text:anchor-type="paragraph" svg:x="1cm" svg:y="3cm" svg:width="8cm" svg:height="2cm"><text:p>Shape <text:a xlink:type="simple" xlink:href="https://example.com/shape/SECRET-VALUE">link</text:a> here</text:p></draw:rect>Shape anchor.</text:p>
+   <text:p><draw:frame draw:name="Frame1" text:anchor-type="paragraph" svg:width="8cm" svg:height="2cm"><draw:text-box><text:p>Frame <text:a xlink:type="simple" xlink:href="https://example.com/frame/SECRET-VALUE">link</text:a> here</text:p></draw:text-box></draw:frame>Frame anchor.</text:p>
+  </office:text>
+ </office:body>
+</office:document>
+)";
+
+// Redaction drops a hyperlink target inside a drawing shape's text with
+// everything else: the exported PDF carries no link annotation naming it,
+// the shape's visible text survives, and no typed event names it either.
+void verify_redaction_drops_shape_text_links() {
+  const std::string secret = "SECRET-VALUE";
+  std::vector<std::string> baseline_payloads;
+  auto baseline = run("pdf", "fodt", kShapeLinkFodt, &baseline_payloads);
+  require(baseline.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "shape link fixture exports ok: " + baseline.detail);
+  const std::string before = fold_pdf(baseline_payloads);
+  require(before.contains("example.com/shape/SECRET-VALUE")
+              && before.contains("example.com/frame/SECRET-VALUE"),
+          "the unredacted PDF carries both link targets");
+  std::vector<std::string> baseline_pages;
+  auto painted = run("pages", "fodt", kShapeLinkFodt, &baseline_pages);
+  require(painted.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "shape link fixture renders ok: " + painted.detail);
+  officev1::StreamOptions extras;
+  *extras.add_redact_spans() =
+      span_over(fold_pages(baseline_pages), "SECRET-VALUE sits", secret.size());
+  {
+    std::vector<std::string> payloads;
+    auto outcome = run_with_extras("pdf", "fodt", kShapeLinkFodt, extras,
+                                   &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "redacted pdf ok: " + outcome.detail);
+    const std::string pdf = fold_pdf(payloads);
+    require(!pdf.contains(secret),
+            "no PDF byte run names the redacted text, link annotations "
+            "included");
+    const std::string text = pdf_text(pdf);
+    require(text.contains("Shape link here") && text.contains("Frame link here"),
+            "the link texts survive in the PDF text layer: " + text);
+  }
+  {
+    std::vector<std::string> payloads;
+    auto outcome = run_with_extras("pages", "fodt", kShapeLinkFodt, extras,
+                                   &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "redacted render ok: " + outcome.detail);
+    require(!typed_event_text(payloads).contains(secret),
+            "no typed event carries the redacted text");
+  }
+}
+
 // A text document that names SECRET-VALUE in its body and embeds one
 // object, frame_xml (a draw:frame), behind enough filler that the flat XML
 // type detector, which matches any office:mimetype token in the first four
@@ -4412,6 +4479,7 @@ int main() {
   verify_pdf_redaction_removes_text();
   verify_redaction_removes_text_everywhere();
   verify_redaction_fails_closed();
+  verify_redaction_drops_shape_text_links();
   verify_redaction_reaches_every_object();
   verify_pdf_page_range();
   verify_pdf_skip_hidden();
