@@ -5532,7 +5532,36 @@ struct TextSegment {
   Reference<css::beans::XPropertySet> props;
   bool field = false;
   CodePoints text;
+  // A hyperlink field whose target carries a piece: it is replaced by its
+  // visible text whether or not that text is covered, and the link goes.
+  bool drop_link = false;
 };
+
+// Whether a hyperlink field's target or target frame carries a piece. A
+// drawing text carries its links as URL fields, and the office core hands
+// out a copy of such a field, so the target cannot be rewritten in place:
+// in replace mode the caller drops the field for its visible text; in
+// verify mode the field refuses.
+bool link_field_carries_piece(const Reference<css::text::XTextField>& field,
+                              const std::string& region, RedactWalk& walk) {
+  Reference<css::beans::XPropertySet> props(field, UNO_QUERY);
+  if (!props.is() || text_field_code(field) != "URL") return false;
+  bool found = false;
+  for (const char* name : {"URL", "TargetFrame"}) {
+    try {
+      rtl::OUString value;
+      if ((props->getPropertyValue(rtl::OUString::createFromAscii(name))
+           >>= value)
+          && !covered_intervals(code_points(value), walk.pieces).empty()) {
+        found = true;
+      }
+    } catch (const css::beans::UnknownPropertyException&) {
+      // Expected probe result: a URL field without a target frame.
+    }
+  }
+  if (found && !walk.replacing()) walk.remains_in(region + " (a hyperlink field)");
+  return found;
+}
 
 // Checks (or rewrites) the strings a content control carries beside its
 // text: list entries, alias, and tag. Its text is walked as segments.
@@ -5616,7 +5645,9 @@ void collect_segments(const Reference<css::container::XEnumerationAccess>& porti
       } else if (shown.isEmpty() && field.is()) {
         shown = field->getPresentation(false);
       }
-      out->push_back({range, props, true, code_points(shown)});
+      const bool drop_link =
+          field.is() && link_field_carries_piece(field, region, walk);
+      out->push_back({range, props, true, code_points(shown), drop_link});
     } else if (type == "ContentControl" || type == "InContentMetadata") {
       Reference<css::uno::XInterface> nested;
       props->getPropertyValue(type) >>= nested;
@@ -5713,7 +5744,8 @@ void rewrite_segment(const TextSegment& segment, const Intervals& local,
 
 // Rewrites (or checks) one paragraph: its hyperlink targets, then every
 // covered stretch of its text, the rightmost first so no rewrite moves a
-// range still to come.
+// range still to come. A hyperlink field whose target carries a piece is
+// replaced by its visible text along the way.
 void redact_paragraph(const Reference<css::container::XEnumerationAccess>& paragraph,
                       const std::string& region, RedactWalk& walk) {
   std::vector<TextSegment> segments;
@@ -5732,9 +5764,11 @@ void redact_paragraph(const Reference<css::container::XEnumerationAccess>& parag
     joined += segment.text;
   }
   Intervals intervals = covered_intervals(joined, walk.pieces);
-  if (intervals.empty()) return;
+  const bool links_to_drop =
+      std::ranges::any_of(segments, &TextSegment::drop_link);
+  if (intervals.empty() && !links_to_drop) return;
   if (!walk.replacing()) {
-    walk.remains_in(region);
+    if (!intervals.empty()) walk.remains_in(region);
     return;
   }
   for (size_t s = segments.size(); s-- > 0;) {
@@ -5746,7 +5780,9 @@ void redact_paragraph(const Reference<css::container::XEnumerationAccess>& parag
       const size_t hi = std::min(last, end);
       if (lo < hi) local.emplace_back(lo - begin, hi - begin);
     }
-    if (!local.empty()) rewrite_segment(segments[s], local, region, walk);
+    if (!local.empty() || segments[s].drop_link) {
+      rewrite_segment(segments[s], local, region, walk);
+    }
   }
 }
 
