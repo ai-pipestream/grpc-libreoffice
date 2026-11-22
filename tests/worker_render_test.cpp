@@ -3183,6 +3183,146 @@ void verify_redaction_fails_closed() {
           "and the host's occurrence is redacted");
 }
 
+// A hyperlink inside a drawing shape's text is a URL field of the drawing
+// text, not a character attribute of the kind a Writer paragraph carries,
+// and the PDF export writes its target as a link annotation. A text frame
+// carries its link the Writer way, for contrast.
+constexpr char kShapeLinkFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ xmlns:xlink="http://www.w3.org/1999/xlink"
+ office:version="1.2"
+ office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:body>
+  <office:text>
+   <text:p>The SECRET-VALUE sits in the body.</text:p>
+   <text:p><draw:rect text:anchor-type="paragraph" svg:x="1cm" svg:y="3cm" svg:width="8cm" svg:height="2cm"><text:p>Shape <text:a xlink:type="simple" xlink:href="https://example.com/shape/SECRET-VALUE">link</text:a> here</text:p></draw:rect>Shape anchor.</text:p>
+   <text:p><draw:frame draw:name="Frame1" text:anchor-type="paragraph" svg:width="8cm" svg:height="2cm"><draw:text-box><text:p>Frame <text:a xlink:type="simple" xlink:href="https://example.com/frame/SECRET-VALUE">link</text:a> here</text:p></draw:text-box></draw:frame>Frame anchor.</text:p>
+  </office:text>
+ </office:body>
+</office:document>
+)";
+
+// Redaction drops a hyperlink target inside a drawing shape's text with
+// everything else: the exported PDF carries no link annotation naming it,
+// the shape's visible text survives, and no typed event names it either.
+void verify_redaction_drops_shape_text_links() {
+  const std::string secret = "SECRET-VALUE";
+  std::vector<std::string> baseline_payloads;
+  auto baseline = run("pdf", "fodt", kShapeLinkFodt, &baseline_payloads);
+  require(baseline.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "shape link fixture exports ok: " + baseline.detail);
+  const std::string before = fold_pdf(baseline_payloads);
+  require(before.contains("example.com/shape/SECRET-VALUE")
+              && before.contains("example.com/frame/SECRET-VALUE"),
+          "the unredacted PDF carries both link targets");
+  std::vector<std::string> baseline_pages;
+  auto painted = run("pages", "fodt", kShapeLinkFodt, &baseline_pages);
+  require(painted.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "shape link fixture renders ok: " + painted.detail);
+  officev1::StreamOptions extras;
+  *extras.add_redact_spans() =
+      span_over(fold_pages(baseline_pages), "SECRET-VALUE sits", secret.size());
+  {
+    std::vector<std::string> payloads;
+    auto outcome = run_with_extras("pdf", "fodt", kShapeLinkFodt, extras,
+                                   &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "redacted pdf ok: " + outcome.detail);
+    const std::string pdf = fold_pdf(payloads);
+    require(!pdf.contains(secret),
+            "no PDF byte run names the redacted text, link annotations "
+            "included");
+    const std::string text = pdf_text(pdf);
+    require(text.contains("Shape link here") && text.contains("Frame link here"),
+            "the link texts survive in the PDF text layer: " + text);
+  }
+  {
+    std::vector<std::string> payloads;
+    auto outcome = run_with_extras("pages", "fodt", kShapeLinkFodt, extras,
+                                   &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "redacted render ok: " + outcome.detail);
+    require(!typed_event_text(payloads).contains(secret),
+            "no typed event carries the redacted text");
+  }
+}
+
+// A text document whose list labels spell the name beside their numbers:
+// an automatic list style, a named list style, and the outline numbering
+// of headings each carry it as a number prefix.
+constexpr char kListLabelFodt[] = R"fodt(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ office:version="1.2"
+ office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:styles>
+  <text:list-style style:name="Named">
+   <text:list-level-style-number text:level="1" style:num-prefix="Named-SECRET-VALUE " style:num-suffix=")" style:num-format="a"/>
+  </text:list-style>
+  <text:outline-style style:name="Outline">
+   <text:outline-level-style text:level="1" style:num-prefix="Chapter-SECRET-VALUE " style:num-suffix=" " style:num-format="I"/>
+  </text:outline-style>
+ </office:styles>
+ <office:automatic-styles>
+  <text:list-style style:name="L1">
+   <text:list-level-style-number text:level="1" style:num-prefix="Auto-SECRET-VALUE " style:num-suffix="." style:num-format="1"/>
+  </text:list-style>
+ </office:automatic-styles>
+ <office:body>
+  <office:text>
+   <text:p>The SECRET-VALUE sits in the body.</text:p>
+   <text:h text:outline-level="1">A heading</text:h>
+   <text:list text:style-name="L1"><text:list-item><text:p>First auto item.</text:p></text:list-item></text:list>
+   <text:list text:style-name="Named"><text:list-item><text:p>First named item.</text:p></text:list-item></text:list>
+  </office:text>
+ </office:body>
+</office:document>
+)fodt";
+
+// List labels are painted and exported like any text, so redaction must
+// rewrite the label text of every numbering rule a document carries:
+// automatic and named list styles and the outline numbering alike. The
+// numbers themselves and the list text stay.
+void verify_redaction_rewrites_list_labels() {
+  const std::string secret = "SECRET-VALUE";
+  std::vector<std::string> baseline_payloads;
+  auto baseline = run("pdf", "fodt", kListLabelFodt, &baseline_payloads);
+  require(baseline.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "list label fixture exports ok: " + baseline.detail);
+  const std::string before = pdf_text(fold_pdf(baseline_payloads));
+  for (const char* label :
+       {"Auto-SECRET-VALUE 1.", "Named-SECRET-VALUE a)", "Chapter-SECRET-VALUE I"}) {
+    require(before.contains(label),
+            std::string("the unredacted PDF text layer carries ") + label);
+  }
+  std::vector<std::string> baseline_pages;
+  auto painted = run("pages", "fodt", kListLabelFodt, &baseline_pages);
+  require(painted.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "list label fixture renders ok: " + painted.detail);
+  officev1::StreamOptions extras;
+  *extras.add_redact_spans() =
+      span_over(fold_pages(baseline_pages), "SECRET-VALUE sits", secret.size());
+  std::vector<std::string> payloads;
+  auto outcome = run_with_extras("pdf", "fodt", kListLabelFodt, extras,
+                                 &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "redacted pdf ok: " + outcome.detail);
+  const std::string text = pdf_text(fold_pdf(payloads));
+  require(!text.contains(secret),
+          "no list label spells the redacted text in the PDF text layer: "
+              + text);
+  for (const char* kept : {"1.First auto item.", "a)First named item.",
+                           "I A heading"}) {
+    require(text.contains(kept),
+            std::string("the number and the list text survive: ") + kept
+                + " in " + text);
+  }
+}
+
 // A text document that names SECRET-VALUE in its body and embeds one
 // object, frame_xml (a draw:frame), behind enough filler that the flat XML
 // type detector, which matches any office:mimetype token in the first four
@@ -4412,6 +4552,8 @@ int main() {
   verify_pdf_redaction_removes_text();
   verify_redaction_removes_text_everywhere();
   verify_redaction_fails_closed();
+  verify_redaction_drops_shape_text_links();
+  verify_redaction_rewrites_list_labels();
   verify_redaction_reaches_every_object();
   verify_pdf_page_range();
   verify_pdf_skip_hidden();

@@ -57,6 +57,7 @@
 #include <com/sun/star/container/XNameAccess.hpp>
 #include <com/sun/star/container/XNameContainer.hpp>
 #include <com/sun/star/container/XIndexAccess.hpp>
+#include <com/sun/star/container/XIndexReplace.hpp>
 #include <com/sun/star/container/XNamed.hpp>
 #include <com/sun/star/drawing/XControlShape.hpp>
 #include <com/sun/star/office/XAnnotation.hpp>
@@ -160,6 +161,7 @@
 #include <com/sun/star/text/XTextColumns.hpp>
 #include <com/sun/star/text/XTextEmbeddedObjectsSupplier.hpp>
 #include <com/sun/star/text/XTextFrame.hpp>
+#include <com/sun/star/text/XChapterNumberingSupplier.hpp>
 #include <com/sun/star/text/XTextFramesSupplier.hpp>
 #include <com/sun/star/text/XTextCursor.hpp>
 #include <com/sun/star/text/XTextRange.hpp>
@@ -5532,7 +5534,36 @@ struct TextSegment {
   Reference<css::beans::XPropertySet> props;
   bool field = false;
   CodePoints text;
+  // A hyperlink field whose target carries a piece: it is replaced by its
+  // visible text whether or not that text is covered, and the link goes.
+  bool drop_link = false;
 };
+
+// Whether a hyperlink field's target or target frame carries a piece. A
+// drawing text carries its links as URL fields, and the office core hands
+// out a copy of such a field, so the target cannot be rewritten in place:
+// in replace mode the caller drops the field for its visible text; in
+// verify mode the field refuses.
+bool link_field_carries_piece(const Reference<css::text::XTextField>& field,
+                              const std::string& region, RedactWalk& walk) {
+  Reference<css::beans::XPropertySet> props(field, UNO_QUERY);
+  if (!props.is() || text_field_code(field) != "URL") return false;
+  bool found = false;
+  for (const char* name : {"URL", "TargetFrame"}) {
+    try {
+      rtl::OUString value;
+      if ((props->getPropertyValue(rtl::OUString::createFromAscii(name))
+           >>= value)
+          && !covered_intervals(code_points(value), walk.pieces).empty()) {
+        found = true;
+      }
+    } catch (const css::beans::UnknownPropertyException&) {
+      // Expected probe result: a URL field without a target frame.
+    }
+  }
+  if (found && !walk.replacing()) walk.remains_in(region + " (a hyperlink field)");
+  return found;
+}
 
 // Checks (or rewrites) the strings a content control carries beside its
 // text: list entries, alias, and tag. Its text is walked as segments.
@@ -5616,7 +5647,9 @@ void collect_segments(const Reference<css::container::XEnumerationAccess>& porti
       } else if (shown.isEmpty() && field.is()) {
         shown = field->getPresentation(false);
       }
-      out->push_back({range, props, true, code_points(shown)});
+      const bool drop_link =
+          field.is() && link_field_carries_piece(field, region, walk);
+      out->push_back({range, props, true, code_points(shown), drop_link});
     } else if (type == "ContentControl" || type == "InContentMetadata") {
       Reference<css::uno::XInterface> nested;
       props->getPropertyValue(type) >>= nested;
@@ -5711,11 +5744,73 @@ void rewrite_segment(const TextSegment& segment, const Intervals& local,
   }
 }
 
-// Rewrites (or checks) one paragraph: its hyperlink targets, then every
-// covered stretch of its text, the rightmost first so no rewrite moves a
-// range still to come.
+// The label text of every level of one set of numbering rules: the
+// prefix, suffix, and list format, which are painted and exported beside
+// the number like any text. Returns whether a level was rewritten; the
+// office core hands most rule sets out as copies, so the caller then sets
+// the rules back where they came from.
+bool redact_numbering_levels(const Reference<css::container::XIndexReplace>& rules,
+                             const std::string& region, RedactWalk& walk) {
+  bool changed = false;
+  for (sal_Int32 level = 0; rules.is() && level < rules->getCount(); level++) {
+    if (walk.refused()) return changed;
+    css::uno::Sequence<css::beans::PropertyValue> entries;
+    if (!(rules->getByIndex(level) >>= entries)) continue;
+    std::vector<css::beans::PropertyValue> rewritten;
+    for (const css::beans::PropertyValue& entry : entries) {
+      if (entry.Name != "Prefix" && entry.Name != "Suffix"
+          && entry.Name != "ListFormat") {
+        continue;
+      }
+      rtl::OUString value;
+      if (!(entry.Value >>= value)) continue;
+      if (std::optional<rtl::OUString> masked_value =
+              redact_value(value, region, walk)) {
+        rewritten.push_back({entry.Name, entry.Handle, css::uno::Any(*masked_value),
+                             entry.State});
+      }
+    }
+    if (rewritten.empty()) continue;
+    rules->replaceByIndex(
+        level, css::uno::Any(css::uno::Sequence<css::beans::PropertyValue>(
+                   rewritten.data(), static_cast<sal_Int32>(rewritten.size()))));
+    changed = true;
+  }
+  return changed;
+}
+
+// Rewrites (or checks) the numbering rules a property set carries under
+// name: a paragraph's list, or a list style's rules. A rewritten copy is
+// set back so the document's own rules change.
+void redact_numbering_property(const Reference<css::beans::XPropertySet>& props,
+                               const char* name, const std::string& region,
+                               RedactWalk& walk) {
+  if (!props.is() || walk.refused()) return;
+  const rtl::OUString property = rtl::OUString::createFromAscii(name);
+  try {
+    Reference<css::beans::XPropertySetInfo> info = props->getPropertySetInfo();
+    if (info.is() && !info->hasPropertyByName(property)) return;
+    Reference<css::container::XIndexReplace> rules;
+    if (!(props->getPropertyValue(property) >>= rules) || !rules.is()) return;
+    if (redact_numbering_levels(rules, region, walk) && walk.replacing()) {
+      props->setPropertyValue(property, css::uno::Any(rules));
+    }
+  } catch (const css::beans::UnknownPropertyException&) {
+    // Expected probe result: not every text family numbers its paragraphs.
+  } catch (const css::uno::Exception& error) {
+    if (!walk.replacing()) walk.refuse(region + " cannot be inspected");
+    walk.warner->warn("redaction of " + region + " failed", error);
+  }
+}
+
+// Rewrites (or checks) one paragraph: its list labels and hyperlink
+// targets, then every covered stretch of its text, the rightmost first so
+// no rewrite moves a range still to come. A hyperlink field whose target
+// carries a piece is replaced by its visible text along the way.
 void redact_paragraph(const Reference<css::container::XEnumerationAccess>& paragraph,
                       const std::string& region, RedactWalk& walk) {
+  redact_numbering_property(Reference<css::beans::XPropertySet>(paragraph, UNO_QUERY),
+                            "NumberingRules", region + " (a list label)", walk);
   std::vector<TextSegment> segments;
   collect_segments(paragraph, region, 0, walk, &segments);
   if (walk.refused() || segments.empty()) return;
@@ -5732,9 +5827,11 @@ void redact_paragraph(const Reference<css::container::XEnumerationAccess>& parag
     joined += segment.text;
   }
   Intervals intervals = covered_intervals(joined, walk.pieces);
-  if (intervals.empty()) return;
+  const bool links_to_drop =
+      std::ranges::any_of(segments, &TextSegment::drop_link);
+  if (intervals.empty() && !links_to_drop) return;
   if (!walk.replacing()) {
-    walk.remains_in(region);
+    if (!intervals.empty()) walk.remains_in(region);
     return;
   }
   for (size_t s = segments.size(); s-- > 0;) {
@@ -5746,7 +5843,9 @@ void redact_paragraph(const Reference<css::container::XEnumerationAccess>& parag
       const size_t hi = std::min(last, end);
       if (lo < hi) local.emplace_back(lo - begin, hi - begin);
     }
-    if (!local.empty()) rewrite_segment(segments[s], local, region, walk);
+    if (!local.empty() || segments[s].drop_link) {
+      rewrite_segment(segments[s], local, region, walk);
+    }
   }
 }
 
@@ -6123,6 +6222,38 @@ void redact_style_names(const Reference<css::frame::XModel>& model,
   }
 }
 
+// The numbering rules a document keeps beside its paragraphs: the outline
+// numbering of headings and every named list style. Lists with automatic
+// styles are reached through their paragraphs.
+void redact_numbering_rules(const Reference<css::text::XTextDocument>& text_doc,
+                            const Reference<css::frame::XModel>& model,
+                            RedactWalk& walk) {
+  Reference<css::text::XChapterNumberingSupplier> chapters(text_doc, UNO_QUERY);
+  if (chapters.is()) {
+    try {
+      redact_numbering_levels(chapters->getChapterNumberingRules(),
+                              "the outline numbering", walk);
+    } catch (const css::uno::Exception& error) {
+      if (!walk.replacing()) walk.refuse("the outline numbering cannot be inspected");
+      walk.warner->warn("redaction of the outline numbering failed", error);
+    }
+  }
+  Reference<css::style::XStyleFamiliesSupplier> supplier(model, UNO_QUERY);
+  if (!supplier.is() || walk.refused()) return;
+  Reference<css::container::XNameAccess> families = supplier->getStyleFamilies();
+  if (!families.is() || !families->hasByName("NumberingStyles")) return;
+  Reference<css::container::XNameAccess> styles;
+  families->getByName("NumberingStyles") >>= styles;
+  if (!styles.is()) return;
+  for (const rtl::OUString& name : styles->getElementNames()) {
+    if (walk.refused()) return;
+    Reference<css::beans::XPropertySet> style;
+    styles->getByName(name) >>= style;
+    redact_numbering_property(style, "NumberingRules", "a list style's label",
+                              walk);
+  }
+}
+
 // One full rewrite (or check) pass over a text document's text-bearing
 // regions. In replace mode the document indexes are regenerated last, from
 // headings that are already rewritten.
@@ -6131,6 +6262,7 @@ void redact_text_document(const Reference<css::text::XTextDocument>& text_doc,
                           RedactWalk& walk) {
   redact_document_properties(model, walk);
   redact_style_names(model, walk);
+  redact_numbering_rules(text_doc, model, walk);
   redact_comments(text_doc, walk);
   redact_text(text_doc->getText(), "the document body", 0, walk);
   redact_headers_footers(model, walk);
