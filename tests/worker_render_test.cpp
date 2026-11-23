@@ -29,6 +29,7 @@
 #include "docling_map.h"
 #include "document_passwords.h"
 #include "encrypted_docx_fixture.h"
+#include "pdf_page_range.h"
 #include "worker_runner.h"
 
 namespace {
@@ -1488,6 +1489,75 @@ void verify_document_category() {
             "the category is not repeated as a custom property");
   }
   require(metadata_events == 1, "one metadata event for the category fixture");
+}
+
+// A flat ODT whose dates fall before 1970: the creation date, a dated
+// custom property, and a comment.
+constexpr char kOldDatesFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0"
+ office:version="1.3"
+ office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:meta>
+  <meta:creation-date>1962-03-01T09:30:00</meta:creation-date>
+  <dc:date>2024-01-02T03:04:05</dc:date>
+  <meta:user-defined meta:name="Founded" meta:value-type="date">1962-03-01</meta:user-defined>
+ </office:meta>
+ <office:body>
+  <office:text>
+   <text:p>Minutes<office:annotation><dc:creator>Ada</dc:creator><dc:date>1965-07-04T12:00:00</dc:date><text:p>An old note</text:p></office:annotation> of the meeting.</text:p>
+  </office:text>
+ </office:body>
+</office:document>
+)";
+
+// A date is reported as the instant it is, however old: dates before 1970
+// are negative milliseconds, never the 0 that means "not set". A date the
+// document does not carry is left unset rather than sent as 0.
+void verify_dates_before_1970() {
+  std::vector<std::string> payloads;
+  auto outcome = run("pages", "fodt", kOldDatesFodt, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "old-dates fodt renders ok: " + outcome.detail);
+  bool metadata_seen = false;
+  bool comment_seen = false;
+  for (const std::string& payload : payloads) {
+    officev1::StreamPagesResponse event;
+    require(event.ParseFromString(payload), "old-dates event parses");
+    if (event.has_metadata()) {
+      metadata_seen = true;
+      const officev1::DocumentMetadata& meta = event.metadata();
+      require(meta.has_created_epoch_ms() &&
+                  meta.created_epoch_ms() == -247329000000LL,
+              "a 1962 creation date is its own negative instant, got "
+                  + std::to_string(meta.created_epoch_ms()));
+      require(meta.has_modified_epoch_ms() &&
+                  meta.modified_epoch_ms() == 1704164645000LL,
+              "a 2024 modification date is unchanged");
+      require(!meta.has_printed_epoch_ms(),
+              "a document never printed carries no print date, got "
+                  + std::to_string(meta.printed_epoch_ms()));
+      bool founded = false;
+      for (const officev1::UserProperty& property : meta.user_properties()) {
+        if (property.name() == "Founded") {
+          founded = property.has_epoch_ms() &&
+                    property.epoch_ms() == -247363200000LL;
+        }
+      }
+      require(founded, "a 1962 date property keeps its date");
+    }
+    if (event.has_comment() && event.comment().author() == "Ada") {
+      comment_seen = true;
+      require(event.comment().has_epoch_ms() &&
+                  event.comment().epoch_ms() == -141825600000LL,
+              "a 1965 comment keeps its time, got "
+                  + std::to_string(event.comment().epoch_ms()));
+    }
+  }
+  require(metadata_seen && comment_seen,
+          "the metadata and the comment are both emitted");
 }
 
 void verify_part_selection() {
@@ -3950,6 +4020,25 @@ void verify_pdf_page_range() {
   std::vector<std::string> pages = rasterize_pdf(fold_pdf(payloads));
   require(pages.size() == 1, "1:1 range exports exactly one page, got "
                                  + std::to_string(pages.size()));
+
+  // A range with only a first page runs through the real end of the
+  // document, however long: no page number stands in for "the end".
+  require(grlibre::pdf_page_range(5, 0) == "5-",
+          "an open-ended range has no last page, got "
+              + grlibre::pdf_page_range(5, 0));
+  require(grlibre::pdf_page_range(0, 3) == "1-3" &&
+              grlibre::pdf_page_range(2, 4) == "2-4" &&
+              grlibre::pdf_page_range(0, 0).empty(),
+          "closed ranges and the whole document are unchanged");
+  extras.set_first_page(2);
+  extras.set_last_page(0);
+  std::vector<std::string> tail_payloads;
+  auto tail = run_with_extras("pdf", "txt", doc, extras, &tail_payloads);
+  require(tail.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "open-ended pdf ok: " + tail.detail);
+  require(rasterize_pdf(fold_pdf(tail_payloads)).size() == full_pages.size() - 1,
+          "an open-ended range from page 2 exports every page after the "
+          "first");
 }
 
 // skip_hidden on the pdf path. The office core's pdf filter never exports
@@ -4807,6 +4896,21 @@ void verify_svg_fallback_raster_is_clamped() {
   require(width <= 2048 && height <= 2048,
           "the fallback raster obeys the per-side bound, got " +
               std::to_string(width) + "x" + std::to_string(height));
+
+  // A fallback raster that fails to encode is a failed render, never an
+  // SVG wrapper around an empty image sent as a good page.
+  {
+    FaultScope scope("svg-fallback-png-fails");
+    std::vector<std::string> failed;
+    auto broken = run_with_extras("pages", "fods", tall_sheet, extras, &failed,
+                                  "1");
+    require(broken.kind != grlibre::WorkerOutcome::Kind::kOk,
+            "a fallback raster that will not encode fails the render");
+    PagesRun broken_run = fold_pages(failed);
+    require(broken_run.pages.empty() && !broken_run.got_status,
+            "no page image and no status follow an encode failure, got "
+                + std::to_string(broken_run.pages.size()) + " pages");
+  }
 }
 
 // One text shape buried under `depth` nested groups, in a text document, a
@@ -5045,6 +5149,110 @@ void verify_linked_resources_are_not_fetched() {
               + std::to_string(counter.connections()) + " time(s)");
 }
 
+// A picture whose graphic the office core cannot give (a linked file that
+// is not there, a web link the profile blocks) is still a picture in the
+// document. It must reach the caller as an EmbeddedImage at its place, with
+// no bytes and an ExtractionGap naming the link, never be skipped with no
+// event and no warning.
+void verify_picture_without_graphic_is_reported() {
+  const std::string link = "file:///nonexistent/grlibre-missing-picture.png";
+  const std::string fodt = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ xmlns:xlink="http://www.w3.org/1999/xlink"
+ office:version="1.2"
+ office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:body>
+  <office:text>
+   <text:p>A missing picture follows.<draw:frame draw:name="Missing" text:anchor-type="as-char" svg:width="2cm" svg:height="2cm"><draw:image xlink:href=")"
+      + link + R"(" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/></draw:frame></text:p>
+  </office:text>
+ </office:body>
+</office:document>
+)";
+  const std::string fodg = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ xmlns:xlink="http://www.w3.org/1999/xlink"
+ office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.graphics">
+ <office:body><office:drawing>
+  <draw:page draw:name="page1">
+   <draw:frame draw:name="Missing" svg:x="2cm" svg:y="2cm" svg:width="2cm" svg:height="2cm"><draw:image xlink:href=")"
+      + link + R"(" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/></draw:frame>
+  </draw:page>
+ </office:drawing></office:body>
+</office:document>
+)";
+  for (const auto& [extension, doc] :
+       {std::pair<const char*, const std::string*>{"fodt", &fodt},
+        std::pair<const char*, const std::string*>{"fodg", &fodg}}) {
+    const std::string name = extension;
+    std::vector<std::string> payloads;
+    auto outcome = run("pages", extension, *doc, &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            name + ": a missing picture does not fail the render: "
+                + outcome.detail);
+    int images = 0;
+    const officev1::EmbeddedImage* missing = nullptr;
+    officev1::RenderStatus status;
+    std::vector<officev1::StreamPagesResponse> events(payloads.size());
+    for (size_t i = 0; i < payloads.size(); i++) {
+      require(events[i].ParseFromString(payloads[i]), "pages event parses");
+      if (events[i].has_embedded_image()) {
+        images++;
+        missing = &events[i].embedded_image();
+      }
+      if (events[i].has_status()) status = events[i].status();
+    }
+    require(images == 1 && missing != nullptr,
+            name + ": the missing picture is still an image event, got "
+                + std::to_string(images));
+    require(missing->name() == "Missing" && missing->data().empty(),
+            name + ": the event is the picture, with no bytes, got name "
+                + missing->name() + " and "
+                + std::to_string(missing->data().size()) + " bytes");
+    require(missing->width_twips() > 0 && missing->height_twips() > 0,
+            name + ": the event keeps the picture's size");
+    require(missing->has_gap() &&
+                gap_text(&missing->gap()).contains("has no graphic") &&
+                gap_text(&missing->gap()).contains(link),
+            name + ": the gap says why and names the link, got: "
+                + gap_text(missing->has_gap() ? &missing->gap() : nullptr));
+    require(status.incomplete_items() == 1,
+            name + ": the picture is counted incomplete, got "
+                + std::to_string(status.incomplete_items()));
+  }
+
+  // The office core handing back no graphic at all, on a slide (the third
+  // picture walk): the slide picture still goes out, marked.
+  std::vector<std::string> payloads;
+  grlibre::WorkerOutcome outcome;
+  {
+    FaultScope scope("picture-graphic-missing");
+    outcome = run("pages", "fodp", kTypedFodp, &payloads);
+  }
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "fodp: a picture with no graphic does not fail the render: "
+              + outcome.detail);
+  int marked = 0;
+  for (const std::string& payload : payloads) {
+    officev1::StreamPagesResponse event;
+    require(event.ParseFromString(payload), "pages event parses");
+    if (!event.has_embedded_image()) continue;
+    const officev1::EmbeddedImage& image = event.embedded_image();
+    require(image.data().empty() && image.has_gap() &&
+                gap_text(&image.gap()).contains("has no graphic"),
+            "fodp: a slide picture with no graphic is marked, got "
+                + std::to_string(image.data().size()) + " bytes and: "
+                + gap_text(image.has_gap() ? &image.gap() : nullptr));
+    marked++;
+  }
+  require(marked > 0, "fodp: the slide pictures are still image events");
+}
+
 // Embedded objects the walk used to miss in part. A chart whose category
 // axis holds numbers (years) keeps them as category labels.
 // An embedded workbook keeps every non-empty sheet, not just the first. An
@@ -5220,6 +5428,7 @@ int main() {
   verify_typed_presentation();
   verify_part_selection();
   verify_document_category();
+  verify_dates_before_1970();
   verify_embedded_objects();
   verify_embedded_object_coverage();
   verify_line_rects();
@@ -5257,6 +5466,7 @@ int main() {
   verify_shape_group_depth_is_capped();
   verify_document_macros_never_run();
   verify_linked_resources_are_not_fetched();
+  verify_picture_without_graphic_is_reported();
   verify_death_before_status_is_crash();
   verify_hung_worker_is_killed_at_deadline();
   verify_eof_without_exit_is_reaped();

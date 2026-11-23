@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <print>
@@ -187,6 +188,7 @@
 
 #include "fault_injection.h"
 #include "gif_palette.h"
+#include "pdf_page_range.h"
 #include "ai/pipestream/office/v1/office_service.pb.h"
 
 namespace grlibre {
@@ -521,18 +523,21 @@ class PdfChunkSink : public cppu::WeakImplHelper1<css::io::XOutputStream> {
   bool closed_ = false;
 };
 
-int64_t datetime_epoch_ms(const css::util::DateTime& value) {
-  if (value.Year == 0) return 0;
-  struct tm parts = {};
-  parts.tm_year = value.Year - 1900;
-  parts.tm_mon = value.Month - 1;
-  parts.tm_mday = value.Day;
-  parts.tm_hour = value.Hours;
-  parts.tm_min = value.Minutes;
-  parts.tm_sec = value.Seconds;
-  time_t seconds = timegm(&parts);
-  if (seconds < 0) return 0;
-  return static_cast<int64_t>(seconds) * 1000 +
+// Milliseconds from the Unix epoch to a UTC date-time, negative before
+// 1970; nullopt when the office core reports no date (year 0) or one that
+// is not a calendar date.
+std::optional<int64_t> datetime_epoch_ms(const css::util::DateTime& value) {
+  if (value.Year == 0) return std::nullopt;
+  const std::chrono::year_month_day day{
+      std::chrono::year{value.Year},
+      std::chrono::month{static_cast<unsigned>(value.Month)},
+      std::chrono::day{static_cast<unsigned>(value.Day)}};
+  if (!day.ok()) return std::nullopt;
+  const auto midnight = std::chrono::sys_days{day}.time_since_epoch();
+  return std::chrono::duration_cast<std::chrono::milliseconds>(midnight).count() +
+         static_cast<int64_t>(value.Hours) * 3600000 +
+         static_cast<int64_t>(value.Minutes) * 60000 +
+         static_cast<int64_t>(value.Seconds) * 1000 +
          static_cast<int64_t>(value.NanoSeconds / 1000000);
 }
 
@@ -585,13 +590,23 @@ void set_user_property_value(const rtl::OUString& name,
   } else if (value >>= flag) {
     out->set_flag(flag);
   } else if (value >>= datetime) {
-    out->set_epoch_ms(datetime_epoch_ms(datetime));
+    if (std::optional<int64_t> epoch = datetime_epoch_ms(datetime)) {
+      out->set_epoch_ms(*epoch);
+    } else {
+      warner.warn("user property " + utf8(name) +
+                  " holds an empty date and was emitted without a value");
+    }
   } else if (value >>= date) {
     css::util::DateTime midnight;
     midnight.Year = date.Year;
     midnight.Month = date.Month;
     midnight.Day = date.Day;
-    out->set_epoch_ms(datetime_epoch_ms(midnight));
+    if (std::optional<int64_t> epoch = datetime_epoch_ms(midnight)) {
+      out->set_epoch_ms(*epoch);
+    } else {
+      warner.warn("user property " + utf8(name) +
+                  " holds an empty date and was emitted without a value");
+    }
   } else {
     warner.warn("user property " + utf8(name) +
                 " has an unmapped type and was emitted without a value");
@@ -647,13 +662,19 @@ bool emit_metadata(const Reference<css::frame::XModel>& model,
   for (const rtl::OUString& keyword : props->getKeywords()) {
     metadata->add_keywords(utf8(keyword));
   }
-  metadata->set_created_epoch_ms(datetime_epoch_ms(props->getCreationDate()));
-  metadata->set_modified_epoch_ms(datetime_epoch_ms(props->getModificationDate()));
+  if (std::optional<int64_t> epoch = datetime_epoch_ms(props->getCreationDate())) {
+    metadata->set_created_epoch_ms(*epoch);
+  }
+  if (std::optional<int64_t> epoch = datetime_epoch_ms(props->getModificationDate())) {
+    metadata->set_modified_epoch_ms(*epoch);
+  }
   metadata->set_modified_by(utf8(props->getModifiedBy()));
   metadata->set_generator(utf8(props->getGenerator()));
   metadata->set_editing_cycles(props->getEditingCycles());
   metadata->set_editing_duration_seconds(props->getEditingDuration());
-  metadata->set_printed_epoch_ms(datetime_epoch_ms(props->getPrintDate()));
+  if (std::optional<int64_t> epoch = datetime_epoch_ms(props->getPrintDate())) {
+    metadata->set_printed_epoch_ms(*epoch);
+  }
   metadata->set_printed_by(utf8(props->getPrintedBy()));
   css::lang::Locale locale = props->getLanguage();
   std::string language = utf8(locale.Language);
@@ -1150,7 +1171,9 @@ class MarkerCollector {
       out->set_initials(utf8(text));
       css::util::DateTime when;
       props->getPropertyValue("DateTimeValue") >>= when;
-      out->set_epoch_ms(datetime_epoch_ms(when));
+      if (std::optional<int64_t> epoch = datetime_epoch_ms(when)) {
+        out->set_epoch_ms(*epoch);
+      }
     } catch (const css::beans::UnknownPropertyException&) {
       // Expected probe result: initials and creation time are optional.
     }
@@ -1326,7 +1349,9 @@ class MarkerCollector {
     out->set_comment(utf8(text));
     css::util::DateTime when;
     props->getPropertyValue("RedlineDateTime") >>= when;
-    out->set_epoch_ms(datetime_epoch_ms(when));
+    if (std::optional<int64_t> epoch = datetime_epoch_ms(when)) {
+      out->set_epoch_ms(*epoch);
+    }
     try {
       css::uno::Sequence<css::beans::PropertyValue> successor;
       props->getPropertyValue("RedlineSuccessorData") >>= successor;
@@ -1348,7 +1373,9 @@ class MarkerCollector {
         } else if (entry.Name == "RedlineDateTime") {
           css::util::DateTime under_when;
           entry.Value >>= under_when;
-          under->set_epoch_ms(datetime_epoch_ms(under_when));
+          if (std::optional<int64_t> epoch = datetime_epoch_ms(under_when)) {
+            under->set_epoch_ms(*epoch);
+          }
         }
       }
       // A successor block whose fields were all empty is no successor.
@@ -2525,6 +2552,73 @@ void encode_graphic(const Reference<css::graphic::XGraphic>& graphic,
   }
 }
 
+// Reads a picture shape's Graphic. A failed read is a loss on the picture,
+// not a reason to skip it: the caller still emits the picture's event.
+Reference<css::graphic::XGraphic> picture_graphic(
+    const Reference<css::beans::XPropertySet>& props, const std::string& label,
+    Warner& warner) {
+  Reference<css::graphic::XGraphic> graphic;
+  try {
+    props->getPropertyValue("Graphic") >>= graphic;
+  } catch (const css::uno::Exception& error) {
+    warner.lose_no_text(label + " graphic query failed: "
+                        + utf8(error.Message));
+  }
+  return graphic;
+}
+
+// Where a linked picture points, or empty for an embedded one. The office
+// core keeps the link on the graphic (OriginURL) and, for Writer pictures,
+// on the shape too; a link it never loaded leaves only the shape's.
+std::string picture_link(const Reference<css::beans::XPropertySet>& props,
+                         const Reference<css::graphic::XGraphic>& graphic) {
+  rtl::OUString url;
+  for (const Reference<css::beans::XPropertySet>& source :
+       {Reference<css::beans::XPropertySet>(graphic, UNO_QUERY), props}) {
+    if (!source.is()) continue;
+    for (const char* name : {"OriginURL", "GraphicURL"}) {
+      try {
+        Reference<css::beans::XPropertySetInfo> info =
+            source->getPropertySetInfo();
+        if (info.is() && !info->hasPropertyByName(oustring(name))) continue;
+        if ((source->getPropertyValue(oustring(name)) >>= url) &&
+            !url.isEmpty()) {
+          return utf8(url);
+        }
+      } catch (const css::uno::Exception&) {
+        // Expected probe result: the property is absent or not a string.
+      }
+    }
+  }
+  return std::string();
+}
+
+// Fills a picture's bytes. A picture whose graphic the office core cannot
+// give (a linked file that is not there, a web link the profile blocks, a
+// format it could not decode) hands back no graphic or one that encodes to
+// nothing; the picture is still in the document, so its event goes out with
+// no bytes and a loss that says why and names the link. `since` is the
+// loss mark taken before the graphic was read, so a failed read is not
+// reported twice.
+void encode_picture(const Reference<css::beans::XPropertySet>& props,
+                    const Reference<css::graphic::XGraphic>& graphic,
+                    const Reference<css::graphic::XGraphicProvider>& provider,
+                    const std::string& label, size_t since,
+                    std::string* mime_type, std::string* data,
+                    Warner& warner) {
+  if (graphic.is() && !fault_injected("picture-graphic-missing")) {
+    encode_graphic(graphic, provider, label, mime_type, data, warner);
+  }
+  if (!data->empty() || warner.losses() > since) return;
+  mime_type->clear();
+  const std::string link = picture_link(props, graphic);
+  warner.lose_no_text(label + " has no graphic"
+                      + (link.empty() ? std::string(": the office core gave "
+                                                    "none for it")
+                                      : ": it links to " + link
+                                            + ", which was not loaded"));
+}
+
 // Shared state of one Writer draw-page walk, threaded through the group
 // recursion so image and shape numbering stay document-global.
 struct WriterShapeWalk {
@@ -2745,14 +2839,9 @@ bool emit_writer_shapes(const Reference<css::container::XIndexAccess>& shapes,
     if (services->supportsService("com.sun.star.text.TextGraphicObject") ||
         services->supportsService("com.sun.star.drawing.GraphicObjectShape")) {
       if (!walk->want_images) continue;
-      Reference<css::graphic::XGraphic> graphic;
-      try {
-        props->getPropertyValue("Graphic") >>= graphic;
-      } catch (const css::uno::Exception& error) {
-        warner.warn(label + " graphic query failed", error);
-        continue;
-      }
-      if (!graphic.is()) continue;
+      const size_t losses = warner.losses();
+      Reference<css::graphic::XGraphic> graphic =
+          picture_graphic(props, label, warner);
 
       officev1::StreamPagesResponse event;
       officev1::EmbeddedImage* out = event.mutable_embedded_image();
@@ -2764,8 +2853,7 @@ bool emit_writer_shapes(const Reference<css::container::XIndexAccess>& shapes,
       fill_alt_text(props, out->mutable_title(), out->mutable_description());
       std::string image_label = "image " + std::to_string(walk->image_index);
 
-      const size_t losses = warner.losses();
-      encode_graphic(graphic, walk->provider, image_label,
+      encode_picture(props, graphic, walk->provider, image_label, losses,
                      out->mutable_mime_type(), out->mutable_data(), warner);
       warner.mark_gap(losses, out);
 
@@ -3139,30 +3227,24 @@ bool emit_shapes(const Reference<css::drawing::XShapes>& shapes,
     }
     if (want_images &&
         shape_type == "com.sun.star.drawing.GraphicObjectShape" && props.is()) {
-      Reference<css::graphic::XGraphic> graphic;
-      try {
-        props->getPropertyValue("Graphic") >>= graphic;
-      } catch (const css::uno::Exception& error) {
-        warner.warn(label + " graphic query failed", error);
-      }
-      if (graphic.is()) {
-        officev1::StreamPagesResponse image_event;
-        officev1::EmbeddedImage* image = image_event.mutable_embedded_image();
-        image->set_index((*image_counter)++);
-        image->set_page_index(page_index);
-        image->set_name(out->name());
-        image->set_title(out->title());
-        image->set_description(out->description());
-        image->set_width_twips(out->width_twips());
-        image->set_height_twips(out->height_twips());
-        const size_t losses = warner.losses();
-        encode_graphic(graphic, provider,
-                       "image " + std::to_string(image->index()),
-                       image->mutable_mime_type(), image->mutable_data(),
-                       warner);
-        warner.mark_gap(losses, image);
-        if (!emit_fn(image_event)) return false;
-      }
+      const size_t losses = warner.losses();
+      Reference<css::graphic::XGraphic> graphic =
+          picture_graphic(props, label, warner);
+      officev1::StreamPagesResponse image_event;
+      officev1::EmbeddedImage* image = image_event.mutable_embedded_image();
+      image->set_index((*image_counter)++);
+      image->set_page_index(page_index);
+      image->set_name(out->name());
+      image->set_title(out->title());
+      image->set_description(out->description());
+      image->set_width_twips(out->width_twips());
+      image->set_height_twips(out->height_twips());
+      encode_picture(props, graphic, provider,
+                     "image " + std::to_string(image->index()), losses,
+                     image->mutable_mime_type(), image->mutable_data(),
+                     warner);
+      warner.mark_gap(losses, image);
+      if (!emit_fn(image_event)) return false;
     }
   }
   return true;
@@ -3377,33 +3459,26 @@ bool emit_slide_shape(const Reference<css::drawing::XShape>& shape,
   // pictures arrive as empty placeholders.
   if (image_counter != nullptr && props.is() &&
       shape_type.ends_with(".GraphicObjectShape")) {
-    Reference<css::graphic::XGraphic> graphic;
-    try {
-      props->getPropertyValue("Graphic") >>= graphic;
-    } catch (const css::uno::Exception& error) {
-      warner.warn(label + " graphic query failed", error);
-    }
-    if (graphic.is()) {
-      officev1::StreamPagesResponse image_event;
-      officev1::EmbeddedImage* image = image_event.mutable_embedded_image();
-      image->set_index((*image_counter)++);
-      // Slide geometry is page-local, and the slide index is the page.
-      image->set_page_index(notes ? -1 : slide_index);
-      Reference<css::container::XNamed> named(shape, UNO_QUERY);
-      if (named.is()) image->set_name(utf8(named->getName()));
-      image->set_title(out->title());
-      image->set_description(out->description());
-      *image->mutable_anchor() = out->position();
-      image->set_width_twips(out->width_twips());
-      image->set_height_twips(out->height_twips());
-      const size_t losses = warner.losses();
-      encode_graphic(graphic, provider,
-                     "image " + std::to_string(image->index()),
-                     image->mutable_mime_type(), image->mutable_data(),
-                     warner);
-      warner.mark_gap(losses, image);
-      if (!emit_fn(image_event)) return false;
-    }
+    const size_t losses = warner.losses();
+    Reference<css::graphic::XGraphic> graphic =
+        picture_graphic(props, label, warner);
+    officev1::StreamPagesResponse image_event;
+    officev1::EmbeddedImage* image = image_event.mutable_embedded_image();
+    image->set_index((*image_counter)++);
+    // Slide geometry is page-local, and the slide index is the page.
+    image->set_page_index(notes ? -1 : slide_index);
+    Reference<css::container::XNamed> named(shape, UNO_QUERY);
+    if (named.is()) image->set_name(utf8(named->getName()));
+    image->set_title(out->title());
+    image->set_description(out->description());
+    *image->mutable_anchor() = out->position();
+    image->set_width_twips(out->width_twips());
+    image->set_height_twips(out->height_twips());
+    encode_picture(props, graphic, provider,
+                   "image " + std::to_string(image->index()), losses,
+                   image->mutable_mime_type(), image->mutable_data(), warner);
+    warner.mark_gap(losses, image);
+    if (!emit_fn(image_event)) return false;
   }
 
   Reference<css::drawing::XShapes> children;
@@ -3468,7 +3543,9 @@ bool emit_slide_annotations(const Reference<css::drawing::XDrawPage>& slide,
       out->set_char_end(-1);
       out->set_author(utf8(annotation->getAuthor()));
       out->set_initials(utf8(annotation->getInitials()));
-      out->set_epoch_ms(datetime_epoch_ms(annotation->getDateTime()));
+      if (std::optional<int64_t> epoch = datetime_epoch_ms(annotation->getDateTime())) {
+        out->set_epoch_ms(*epoch);
+      }
       css::geometry::RealPoint2D position = annotation->getPosition();
       // Annotation positions are in millimeters (the office core's
       // RealPoint2D convention for annotations), converted to twips like
@@ -5243,9 +5320,8 @@ bool export_pdf_stream(const std::string& filter_name, size_t chunk_limit,
     filter_data.getArray()[slot].Name = "ExportBookmarks";
     filter_data.getArray()[slot++].Value <<= true;
     if (ranged) {
-      const int first = pdf.first_page > 0 ? pdf.first_page : 1;
-      const int last = pdf.last_page > 0 ? pdf.last_page : 9999;
-      std::string range = std::to_string(first) + "-" + std::to_string(last);
+      const std::string range =
+          grlibre::pdf_page_range(pdf.first_page, pdf.last_page);
       filter_data.getArray()[slot].Name = "PageRange";
       filter_data.getArray()[slot++].Value <<=
           rtl::OUString::createFromAscii(range.c_str());
