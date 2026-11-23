@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <print>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "docling_map.h"
@@ -2090,6 +2091,173 @@ void verify_run_styling() {
           "styling: the span covers exactly its run");
 }
 
+// One embedded chart object of the given kind, with categories and series
+// (label, y values, x values, sizes), its tabular projection laid out the
+// way the worker lays it out: a label row on top, categories down the
+// first column, then one column per series y value list, or for scatter
+// and bubble charts an x, a y and (bubble) a size column per series.
+officev1::StreamPagesResponse chart_event(
+    officev1::EmbeddedChartKind kind, const std::vector<std::string>& categories,
+    const std::vector<std::tuple<std::string, std::vector<double>,
+                                 std::vector<double>, std::vector<double>>>&
+        series,
+    const std::vector<std::vector<std::string>>& grid) {
+  officev1::StreamPagesResponse event;
+  officev1::EmbeddedObject* object = event.mutable_embedded_object();
+  object->set_kind(officev1::EMBEDDED_OBJECT_KIND_CHART);
+  object->set_page_index(0);
+  object->set_width_twips(5000);
+  object->set_height_twips(3000);
+  officev1::EmbeddedChart* chart = object->mutable_chart();
+  chart->set_kind(kind);
+  chart->set_title("Growth");
+  for (const std::string& category : categories) chart->add_categories(category);
+  for (const auto& [label, y, x, sizes] : series) {
+    officev1::EmbeddedChartSeries* out = chart->add_series();
+    out->set_label(label);
+    for (double value : y) out->add_values_y(value);
+    for (double value : x) out->add_values_x(value);
+    for (double value : sizes) out->add_sizes(value);
+  }
+  officev1::TableData* tabular = chart->mutable_tabular();
+  tabular->set_rows(static_cast<int32_t>(grid.size()));
+  tabular->set_columns(grid.empty() ? 0 : static_cast<int32_t>(grid[0].size()));
+  for (size_t row = 0; row < grid.size(); row++) {
+    for (size_t column = 0; column < grid[row].size(); column++) {
+      officev1::TableCellData* cell = tabular->add_cells();
+      cell->set_row(static_cast<int32_t>(row));
+      cell->set_column(static_cast<int32_t>(column));
+      cell->set_text(grid[row][column]);
+    }
+  }
+  return event;
+}
+
+// A chart keeps every series on its way into the Document. A column chart
+// with three series becomes three bar annotations in series order, a pie
+// with two series two pie annotations, and a scatter chart with two series
+// two scatter annotations rather than one merged point list; bubble sizes
+// ride ChartPoint.size. The tabular projection carries every value as a
+// typed number beside its text, with the label row and the category column
+// marked as headers, so a series name is one header cell away and no value
+// is held only as rounded text.
+void verify_chart_series_kept() {
+  using Series = std::tuple<std::string, std::vector<double>,
+                            std::vector<double>, std::vector<double>>;
+  grlibre::DoclingMapper mapper;
+  mapper.consume(chart_event(
+      officev1::EMBEDDED_CHART_KIND_COLUMN, {"Q1", "Q2"},
+      {Series{"2023", {1234567.89, 2.5}, {}, {}},
+       Series{"2024", {3.0, 4.0}, {}, {}},
+       Series{"2025", {5.0, 6.0}, {}, {}}},
+      {{"", "2023", "2024", "2025"},
+       {"Q1", "1234567.89", "3", "5"},
+       {"Q2", "2.5", "4", "6"}}));
+  mapper.consume(chart_event(
+      officev1::EMBEDDED_CHART_KIND_PIE, {"A", "B"},
+      {Series{"left", {1.0, 2.0}, {}, {}}, Series{"right", {3.0, 4.0}, {}, {}}},
+      {{"", "left", "right"}, {"A", "1", "3"}, {"B", "2", "4"}}));
+  mapper.consume(chart_event(
+      officev1::EMBEDDED_CHART_KIND_SCATTER, {},
+      {Series{"low", {1.0, 2.0}, {10.0, 20.0}, {}},
+       Series{"high", {7.0, 8.0}, {30.0, 40.0}, {}}},
+      {{"", "low (x)", "low (y)", "high (x)", "high (y)"},
+       {"1", "10", "1", "30", "7"},
+       {"2", "20", "2", "40", "8"}}));
+  mapper.consume(chart_event(
+      officev1::EMBEDDED_CHART_KIND_BUBBLE, {},
+      {Series{"bubbles", {1.0, 2.0}, {10.0, 20.0}, {0.5, 1.5}}},
+      {{"", "bubbles (x)", "bubbles (y)", "bubbles (size)"},
+       {"1", "10", "1", "0.5"},
+       {"2", "20", "2", "1.5"}}));
+  mapper.consume(status_event(""));
+  const docv1::Document& document = mapper.document();
+  require(document.pictures_size() == 4, "four charts, four pictures");
+
+  auto annotations_of = [&](int picture) -> const auto& {
+    return document.pictures(picture).annotations();
+  };
+
+  // Column chart: three series, three bar annotations, in order.
+  {
+    std::vector<const docv1::PictureBarChartData*> bars;
+    const docv1::PictureTabularChartData* tabular = nullptr;
+    for (const auto& annotation : annotations_of(0)) {
+      if (annotation.has_bar_chart()) bars.push_back(&annotation.bar_chart());
+      if (annotation.has_tabular_chart()) tabular = &annotation.tabular_chart();
+    }
+    require(bars.size() == 3,
+            "every series of a column chart keeps a bar annotation, got "
+                + std::to_string(bars.size()));
+    require(bars[0]->bars(0).values() == 1234567.89 &&
+                bars[1]->bars(1).values() == 4.0 &&
+                bars[2]->bars(0).label() == "Q1" &&
+                bars[2]->bars(1).values() == 6.0,
+            "each bar annotation holds its own series' values");
+    require(tabular != nullptr, "the tabular projection is attached");
+    bool exact = false;
+    bool headers = false;
+    bool categories = false;
+    for (const docv1::TableCell& cell : tabular->chart_data().table_cells()) {
+      const int row = cell.start_row_offset_idx();
+      const int column = cell.start_col_offset_idx();
+      if (row == 1 && column == 1) {
+        exact = cell.has_value() && cell.value().has_number() &&
+                cell.value().number() == 1234567.89 &&
+                cell.text() == "1234567.89";
+      }
+      if (row == 0 && column == 3) {
+        headers = cell.column_header() && cell.text() == "2025";
+      }
+      if (row == 2 && column == 0) {
+        categories = cell.row_header() && cell.text() == "Q2" &&
+                     !cell.has_value();
+      }
+    }
+    require(exact, "a tabular value cell carries the exact typed number");
+    require(headers, "the label row is a column header naming the series");
+    require(categories, "the category column is a row header, untyped");
+  }
+  // Pie: two series, two pie annotations.
+  {
+    int pies = 0;
+    double right_b = 0;
+    for (const auto& annotation : annotations_of(1)) {
+      if (!annotation.has_pie_chart()) continue;
+      pies++;
+      if (pies == 2) right_b = annotation.pie_chart().slices(1).value();
+    }
+    require(pies == 2 && right_b == 4.0,
+            "every series of a pie chart keeps a pie annotation");
+  }
+  // Scatter: two series, two annotations, points not merged.
+  {
+    std::vector<const docv1::PictureScatterChartData*> scatters;
+    for (const auto& annotation : annotations_of(2)) {
+      if (annotation.has_scatter_chart()) {
+        scatters.push_back(&annotation.scatter_chart());
+      }
+    }
+    require(scatters.size() == 2 && scatters[0]->points_size() == 2 &&
+                scatters[1]->points_size() == 2 &&
+                scatters[1]->points(0).value().first() == 30.0 &&
+                scatters[1]->points(0).value().second() == 7.0 &&
+                !scatters[1]->points(0).has_size(),
+            "each scatter series keeps its own annotation and points");
+  }
+  // Bubble: sizes ride ChartPoint.size.
+  {
+    const docv1::PictureScatterChartData* bubbles = nullptr;
+    for (const auto& annotation : annotations_of(3)) {
+      if (annotation.has_scatter_chart()) bubbles = &annotation.scatter_chart();
+    }
+    require(bubbles != nullptr && bubbles->points_size() == 2 &&
+                bubbles->points(1).has_size() &&
+                bubbles->points(1).size() == 1.5,
+            "bubble sizes are kept on the points");
+  }
+}
+
 int main() {
   verify_writer_stream();
   verify_calc_stream();
@@ -2109,6 +2277,7 @@ int main() {
   verify_document_meta();
   verify_typed_declarations();
   verify_run_styling();
+  verify_chart_series_kept();
   std::println("docling_map_test passed");
   return 0;
 }
