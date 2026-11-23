@@ -2090,6 +2090,136 @@ void verify_run_styling() {
           "styling: the span covers exactly its run");
 }
 
+// What the worker reads about where an item lives reaches the Document. An
+// image, an embedded object, a text frame and a shape anchored in a page
+// header or footer repeat on every page of that style: they are furniture,
+// filed under #/furniture, never body content at the first page's caret.
+// The same kinds anchored in the body stay body. A paragraph that restarts
+// page numbering labels its page and the pages after it with the printed
+// numbers; pages before the restart keep no label.
+void verify_header_footer_items_and_page_labels() {
+  grlibre::DoclingMapper mapper;
+  mapper.consume(info_event("text", 4, 15840));
+  for (bool header : {true, false}) {
+    const std::string where = header ? "Header" : "Body";
+    {
+      officev1::StreamPagesResponse event;
+      officev1::EmbeddedImage* image = event.mutable_embedded_image();
+      image->set_name(where + "Logo");
+      image->set_page_index(0);
+      image->set_mime_type("image/png");
+      image->set_data("PNG");
+      image->set_in_header_footer(header);
+      mapper.consume(event);
+    }
+    {
+      officev1::StreamPagesResponse event;
+      officev1::EmbeddedObject* object = event.mutable_embedded_object();
+      object->set_kind(officev1::EMBEDDED_OBJECT_KIND_FORMULA);
+      object->set_name(where + "Formula");
+      object->set_formula(where + " formula");
+      object->set_page_index(0);
+      object->set_in_header_footer(header);
+      mapper.consume(event);
+    }
+    {
+      officev1::StreamPagesResponse event;
+      officev1::TextFrame* frame = event.mutable_text_frame();
+      frame->set_name(where + "Frame");
+      frame->set_page_index(0);
+      officev1::TextRun* run = frame->add_runs();
+      run->set_text(where + " frame text");
+      frame->set_in_header_footer(header);
+      mapper.consume(event);
+    }
+    {
+      officev1::StreamPagesResponse event;
+      officev1::Shape* shape = event.mutable_shape();
+      shape->set_name(where + "Shape");
+      shape->set_page_index(0);
+      officev1::TextRun* run = shape->add_runs();
+      run->set_text(where + " shape text");
+      shape->set_in_header_footer(header);
+      mapper.consume(event);
+    }
+  }
+  // Pages 1 and 2 (indexes 0, 1) number as printed by ordinal; a paragraph
+  // on index 2 restarts numbering at 10, so the last two pages print 10, 11.
+  for (int page : {0, 2}) {
+    officev1::StreamPagesResponse event;
+    officev1::Paragraph* paragraph = event.mutable_paragraph();
+    paragraph->set_index(page);
+    paragraph->set_page_index(page);
+    paragraph->set_page_number_offset(page == 2 ? 10 : -1);
+    add_run(paragraph, "page " + std::to_string(page), page * 10);
+    mapper.consume(event);
+  }
+  mapper.consume(status_event(""));
+  const docv1::Document& document = mapper.document();
+
+  auto layer_of_picture = [&](const std::string& name) {
+    for (const docv1::PictureItem& picture : document.pictures()) {
+      if (picture.shape().name() == name) {
+        return std::pair(picture.content_layer(), picture.parent().ref());
+      }
+    }
+    return std::pair(docv1::CONTENT_LAYER_UNSPECIFIED, std::string("missing"));
+  };
+  auto layer_of_text = [&](const std::string& text) {
+    for (const docv1::BaseTextItem& item : document.texts()) {
+      const docv1::TextItemBase& base = base_of(item);
+      if (base.text() == text) {
+        return std::pair(base.content_layer(), base.parent().ref());
+      }
+    }
+    return std::pair(docv1::CONTENT_LAYER_UNSPECIFIED, std::string("missing"));
+  };
+  auto group_of = [&](const std::string& ref) -> const docv1::GroupItem* {
+    for (const docv1::GroupItem& group : document.groups()) {
+      if (group.self_ref() == ref) return &group;
+    }
+    return nullptr;
+  };
+
+  for (bool header : {true, false}) {
+    const std::string where = header ? "Header" : "Body";
+    const docv1::ContentLayer layer =
+        header ? docv1::CONTENT_LAYER_FURNITURE : docv1::CONTENT_LAYER_BODY;
+    const std::string root = header ? "#/furniture" : "#/body";
+
+    auto [image_layer, image_parent] = layer_of_picture(where + "Logo");
+    require(image_layer == layer && image_parent == root,
+            where + " image: layer " + std::to_string(image_layer)
+                + " under " + image_parent);
+    auto [formula_layer, formula_parent] = layer_of_text(where + " formula");
+    require(formula_layer == layer && formula_parent == root,
+            where + " formula: layer " + std::to_string(formula_layer)
+                + " under " + formula_parent);
+    for (const std::string& text :
+         {where + " frame text", where + " shape text"}) {
+      auto [text_layer, text_parent] = layer_of_text(text);
+      const docv1::GroupItem* group = group_of(text_parent);
+      require(text_layer == layer && group != nullptr &&
+                  group->content_layer() == layer &&
+                  group->parent().ref() == root,
+              text + ": layer " + std::to_string(text_layer) + " in group "
+                  + text_parent + " under "
+                  + (group == nullptr ? std::string("none")
+                                      : group->parent().ref()));
+    }
+  }
+
+  const auto& pages = document.pages();
+  require(pages.contains(1) && !pages.at(1).has_page_label() &&
+              pages.contains(2) && !pages.at(2).has_page_label(),
+          "pages before the restart keep no printed label");
+  require(pages.contains(3) && pages.at(3).page_label() == "10" &&
+              pages.contains(4) && pages.at(4).page_label() == "11",
+          "the restart page and the page after it print 10 and 11, got "
+              + (pages.contains(3) ? pages.at(3).page_label() : "none") + ", "
+              + (pages.contains(4) ? pages.at(4).page_label() : "none"));
+}
+
 int main() {
   verify_writer_stream();
   verify_calc_stream();
@@ -2109,6 +2239,7 @@ int main() {
   verify_document_meta();
   verify_typed_declarations();
   verify_run_styling();
+  verify_header_footer_items_and_page_labels();
   std::println("docling_map_test passed");
   return 0;
 }
