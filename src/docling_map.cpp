@@ -1160,6 +1160,16 @@ void DoclingMapper::on_status(const officev1::RenderStatus& status) {
   // cross-reference can name an anchor from a later page.
   resolve_anchors();
   resolve_page_styles();
+  // Every warning, the worker's and the fold's own, rides the Document
+  // itself, so a Document stored or forwarded without its response
+  // envelope still says what went wrong while it was read.
+  for (const std::string& warning : warnings_) {
+    docv1::CollectorWarning* out = document_.add_warnings();
+    docv1::CollectorSource* source = out->mutable_source();
+    source->set_collector("libreoffice");
+    source->set_model("lok");
+    out->set_message(warning);
+  }
   finished_ = true;
 }
 
