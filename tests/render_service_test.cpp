@@ -1012,6 +1012,32 @@ int main() {
             "both calls count as failed, neither as rendered");
   }
 
+  // An option the worker cannot apply reaches the caller as
+  // FAILED_PRECONDITION with the reason and nothing streamed: skip_hidden
+  // on a workbook whose sheet visibility cannot be read (the worker's
+  // test-only fault point stands in for the office core failing the read).
+  {
+    require(::setenv("GRLIBRE_TEST_FAULT", "describe-parts-visibility-throws",
+                     1) == 0,
+            "set the fault point");
+    const long rejected_before = service.rejected.load();
+    officev1::StreamOptions hide;
+    hide.set_skip_hidden(true);
+    auto refused = stream_pages(channel, "a,b\nc,d\n", "sheet.csv", true,
+                                false, 0, 0, 0, 0, 0, &hide);
+    ::unsetenv("GRLIBRE_TEST_FAULT");
+    require(refused.status.error_code() == grpc::StatusCode::FAILED_PRECONDITION,
+            "an option that cannot be applied is FAILED_PRECONDITION, got: "
+                + refused.status.error_message());
+    require(refused.status.error_message().contains("skip_hidden refused"),
+            "the status carries the worker's reason, got: "
+                + refused.status.error_message());
+    require(refused.pages == 0 && !refused.got_status,
+            "a refused option streams nothing");
+    require(service.rejected.load() == rejected_before + 1,
+            "the refused call counts as rejected");
+  }
+
   // A repairable broken package (a stored-entry OOXML zip truncated before
   // its central directory) maps to the repair statuses: refusal naming the
   // opt-in by default; opted-in repair is attempted and never UNIMPLEMENTED.

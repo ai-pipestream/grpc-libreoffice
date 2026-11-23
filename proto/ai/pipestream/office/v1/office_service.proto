@@ -25,7 +25,10 @@ option java_package = "ai.pipestream.office.v1";
 //   RESOURCE_EXHAUSTED - the document exceeds the configured byte cap.
 //   FAILED_PRECONDITION- the document package is broken and would need
 //                        LibreOffice's repair path, which the request did
-//                        not opt into (allow_package_repair).
+//                        not opt into (allow_package_repair); or an option
+//                        of the request could not be applied to this
+//                        document (skip_hidden, paint_used_range), in
+//                        which case nothing was emitted.
 //   UNIMPLEMENTED      - reserved; this version implements the repair path
 //                        when allow_package_repair is set.
 //   DEADLINE_EXCEEDED  - the worker exceeded the per-document timeout and
@@ -207,11 +210,16 @@ message StreamOptions {
   PageVectorFormat vector_format = 11;
   // When true, hidden sheets and hidden slides are omitted from page
   // images and from DocumentInfo.page_count / page_rects. Typed content
-  // for hidden parts is still extracted. First true wins.
+  // for hidden parts is still extracted. First true wins. Applied or
+  // refused: when the visibility of a sheet or slide cannot be read, the
+  // call fails with FAILED_PRECONDITION before anything is emitted rather
+  // than paint a part that may be hidden.
   bool skip_hidden = 12;
   // When true, spreadsheet page images are cropped to the used cell range
   // instead of the full sheet canvas. No effect on other document classes.
-  // First true wins.
+  // First true wins. Applied or refused: when a sheet's used range cannot
+  // be read, the call fails with FAILED_PRECONDITION before anything is
+  // emitted rather than paint the full canvas.
   bool paint_used_range = 13;
   // When true, each presentation slide is followed by its notes page as an
   // extra PageImage (and an extra DocumentInfo.page_rects entry). Notes

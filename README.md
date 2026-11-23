@@ -177,8 +177,9 @@ flag, unresolvable format, out-of-range options, or the core cannot load
 the document), `RESOURCE_EXHAUSTED` (over the byte cap, or the server-wide
 upload buffer is full), `UNIMPLEMENTED` (PDF input, see below),
 `FAILED_PRECONDITION` (broken package needing repair without the
-`allow_package_repair` opt-in, or a redaction that cannot be applied to the
-whole document), `DEADLINE_EXCEEDED` (per-document timeout or the caller's
+`allow_package_repair` opt-in, a redaction that cannot be applied to the
+whole document, or `skip_hidden` / `paint_used_range` on a document whose
+sheet or slide visibility or used range cannot be read), `DEADLINE_EXCEEDED` (per-document timeout or the caller's
 deadline, worker killed), `CANCELLED` (the caller cancelled; a running
 worker is killed), `INTERNAL` (worker crash, or requested typed content
 that could not be extracted). Health checking and

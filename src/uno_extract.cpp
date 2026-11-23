@@ -7076,6 +7076,7 @@ void describe_parts(std::vector<PartLayout>* parts,
     Reference<css::uno::XComponentContext> context = process_context();
     if (!context.is()) return;
     Reference<css::frame::XModel> model = find_loaded_model(context);
+    if (fault_injected("describe-parts-no-model")) model.clear();
     if (!model.is()) return;
     Reference<css::sheet::XSpreadsheetDocument> calc(model, UNO_QUERY);
     if (calc.is()) {
@@ -7089,11 +7090,21 @@ void describe_parts(std::vector<PartLayout>* parts,
         Reference<css::beans::XPropertySet> props(sheet, UNO_QUERY);
         if (props.is()) {
           try {
-            props->getPropertyValue("IsVisible") >>= layout.visible;
-          } catch (const css::uno::Exception&) {
+            if (fault_injected("describe-parts-visibility-throws")) {
+              throw css::uno::RuntimeException(
+                  "injected fault: the visibility read throws");
+            }
+            layout.visibility_known =
+                (props->getPropertyValue("IsVisible") >>= layout.visible);
+          } catch (const css::uno::Exception& error) {
+            warner.warn("visibility of sheet " + std::to_string(i), error);
           }
         }
         try {
+          if (fault_injected("describe-parts-used-range-throws")) {
+            throw css::uno::RuntimeException(
+                "injected fault: the used-range read throws");
+          }
           Reference<css::sheet::XSheetCellCursor> cursor =
               sheet->createCursor();
           Reference<css::sheet::XUsedAreaCursor> area(cursor, UNO_QUERY);
@@ -7154,6 +7165,7 @@ void describe_parts(std::vector<PartLayout>* parts,
             layout.used_y = y;
             layout.used_width = width;
             layout.used_height = height;
+            layout.used_range_known = addressable.is() && col_rows.is();
           }
         } catch (const css::uno::Exception& error) {
           warner.warn("used range for sheet " + std::to_string(i), error);
@@ -7170,15 +7182,26 @@ void describe_parts(std::vector<PartLayout>* parts,
       PartLayout layout;
       Reference<css::beans::XPropertySet> props(list->getByIndex(i), UNO_QUERY);
       if (props.is()) {
+        // A slide answers Visible; older page classes answer Hidden. A
+        // page class with neither property (a drawing page) has no hidden
+        // state, which is an answer: shown. Any other failure leaves the
+        // visibility unknown.
         try {
-          props->getPropertyValue("Visible") >>= layout.visible;
-        } catch (const css::uno::Exception&) {
+          layout.visibility_known =
+              (props->getPropertyValue("Visible") >>= layout.visible);
+        } catch (const css::beans::UnknownPropertyException&) {
           try {
             bool hidden = false;
-            props->getPropertyValue("Hidden") >>= hidden;
+            layout.visibility_known =
+                (props->getPropertyValue("Hidden") >>= hidden);
             layout.visible = !hidden;
-          } catch (const css::uno::Exception&) {
+          } catch (const css::beans::UnknownPropertyException&) {
+            layout.visibility_known = true;
+          } catch (const css::uno::Exception& error) {
+            warner.warn("visibility of page " + std::to_string(i), error);
           }
+        } catch (const css::uno::Exception& error) {
+          warner.warn("visibility of page " + std::to_string(i), error);
         }
       }
       parts->push_back(layout);
