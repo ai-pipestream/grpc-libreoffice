@@ -5121,6 +5121,32 @@ void verify_picture_without_graphic_is_reported() {
             name + ": the picture is counted incomplete, got "
                 + std::to_string(status.incomplete_items()));
   }
+
+  // The office core handing back no graphic at all, on a slide (the third
+  // picture walk): the slide picture still goes out, marked.
+  std::vector<std::string> payloads;
+  grlibre::WorkerOutcome outcome;
+  {
+    FaultScope scope("picture-graphic-missing");
+    outcome = run("pages", "fodp", kTypedFodp, &payloads);
+  }
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "fodp: a picture with no graphic does not fail the render: "
+              + outcome.detail);
+  int marked = 0;
+  for (const std::string& payload : payloads) {
+    officev1::StreamPagesResponse event;
+    require(event.ParseFromString(payload), "pages event parses");
+    if (!event.has_embedded_image()) continue;
+    const officev1::EmbeddedImage& image = event.embedded_image();
+    require(image.data().empty() && image.has_gap() &&
+                gap_text(&image.gap()).contains("has no graphic"),
+            "fodp: a slide picture with no graphic is marked, got "
+                + std::to_string(image.data().size()) + " bytes and: "
+                + gap_text(image.has_gap() ? &image.gap() : nullptr));
+    marked++;
+  }
+  require(marked > 0, "fodp: the slide pictures are still image events");
 }
 
 int main() {

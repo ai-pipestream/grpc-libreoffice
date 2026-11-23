@@ -1192,7 +1192,10 @@ message EmbeddedImage {
   // MIME type of data. The original embedded format when the graphic
   // provider can round-trip it, otherwise "image/png".
   string mime_type = 4;
-  // The image bytes.
+  // The image bytes. Empty only when gap is present: a picture the office
+  // core gave no graphic for (a linked file that was not loaded, a format it
+  // could not decode) still arrives, with its name and size, no data, and a
+  // gap that says why and names the link.
   bytes data = 5;
   // Caret position of the image's text anchor in the live layout. Unset for
   // images on drawing pages, whose geometry arrives on the matching
