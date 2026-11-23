@@ -2398,6 +2398,65 @@ void verify_chart_series_kept() {
   }
 }
 
+// An embedded workbook with several sheets keeps every sheet in the
+// Document: one group for the object, then one sheet group per sheet,
+// named after it, holding that sheet's table. A single-sheet workbook stays
+// one table, as before.
+void verify_embedded_workbook_sheets() {
+  grlibre::DoclingMapper mapper;
+  mapper.consume(info_event("text", 1, 15840));
+  {
+    officev1::StreamPagesResponse event;
+    officev1::EmbeddedObject* object = event.mutable_embedded_object();
+    object->set_kind(officev1::EMBEDDED_OBJECT_KIND_SPREADSHEET);
+    object->set_name("Book");
+    object->set_page_index(0);
+    object->set_width_twips(1000);
+    object->set_height_twips(500);
+    for (const auto& [name, text] :
+         {std::pair<std::string, std::string>{"Summary", "K"},
+          std::pair<std::string, std::string>{"Detail", "M"}}) {
+      officev1::EmbeddedSheet* sheet = object->add_inner_sheets();
+      sheet->set_name(name);
+      sheet->mutable_table()->set_rows(1);
+      sheet->mutable_table()->set_columns(1);
+      officev1::TableCellData* cell = sheet->mutable_table()->add_cells();
+      cell->set_text(text);
+    }
+    *object->mutable_inner_table() = object->inner_sheets(0).table();
+    mapper.consume(event);
+  }
+  mapper.consume(status_event(""));
+  const docv1::Document& document = mapper.document();
+
+  std::string book_ref;
+  for (const docv1::GroupItem& group : document.groups()) {
+    if (group.name() == "Book") book_ref = group.self_ref();
+  }
+  require(!book_ref.empty(), "the workbook is one group named after it");
+  std::string found;
+  for (const docv1::GroupItem& group : document.groups()) {
+    if (group.label() != docv1::GROUP_LABEL_SHEET) continue;
+    require(group.parent().ref() == book_ref,
+            "sheet " + group.name() + " sits in the workbook group");
+    for (const docv1::TableItem& table : document.tables()) {
+      if (table.parent().ref() != group.self_ref()) continue;
+      found += group.name() + "="
+               + (table.data().table_cells_size() > 0
+                      ? table.data().table_cells(0).text()
+                      : std::string("?"))
+               + ";";
+    }
+  }
+  require(found == "Summary=K;Detail=M;",
+          "every sheet keeps its table, got: " + found);
+  bool attached = false;
+  for (const docv1::SubDocumentRef& attachment : document.attachments()) {
+    if (attachment.name() == "Book") attached = attachment.item_ref() == book_ref;
+  }
+  require(attached, "the workbook's attachment points at its group");
+}
+
 int main() {
   verify_writer_stream();
   verify_calc_stream();
@@ -2419,6 +2478,7 @@ int main() {
   verify_run_styling();
   verify_header_footer_items_and_page_labels();
   verify_chart_series_kept();
+  verify_embedded_workbook_sheets();
   std::println("docling_map_test passed");
   return 0;
 }

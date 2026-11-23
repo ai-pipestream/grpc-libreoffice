@@ -4519,28 +4519,48 @@ void fill_chart(const Reference<css::chart2::XChartDocument>& chart_doc,
   fill_chart_tabular(out);
 }
 
-// Projects an embedded spreadsheet's first non-empty sheet used range into
-// a plain cell grid.
-void fill_inner_table(
+// Projects every non-empty sheet of an embedded spreadsheet into a plain
+// cell grid of its used range, in sheet order. The first one is also the
+// object's inner_table. A sheet that fails part way is a loss on the object.
+void fill_inner_sheets(
     const Reference<css::sheet::XSpreadsheetDocument>& inner_doc,
-    const std::string& label, officev1::TableData* out, Warner& warner) {
+    const std::string& label, officev1::EmbeddedObject* out, Warner& warner) {
+  Reference<css::container::XIndexAccess> sheets;
   try {
-    Reference<css::container::XIndexAccess> sheets(inner_doc->getSheets(),
-                                                   UNO_QUERY);
-    if (!sheets.is()) return;
-    for (sal_Int32 s = 0; s < sheets->getCount(); s++) {
+    sheets = Reference<css::container::XIndexAccess>(inner_doc->getSheets(),
+                                                     UNO_QUERY);
+  } catch (const css::uno::Exception& error) {
+    warner.lose(label + " sheets are not reachable", error);
+    return;
+  }
+  if (!sheets.is()) {
+    warner.lose(label + " offers no sheets");
+    return;
+  }
+  for (sal_Int32 s = 0; s < sheets->getCount(); s++) {
+    const std::string sheet_label = label + " sheet " + std::to_string(s);
+    try {
       Reference<css::sheet::XSpreadsheet> sheet(sheets->getByIndex(s),
                                                 UNO_QUERY);
-      if (!sheet.is()) continue;
+      if (!sheet.is()) {
+        warner.lose(sheet_label + " is not a sheet");
+        continue;
+      }
       Reference<css::sheet::XSheetCellCursor> cursor = sheet->createCursor();
       Reference<css::sheet::XUsedAreaCursor> area(cursor, UNO_QUERY);
       Reference<css::sheet::XCellRangeAddressable> addressable(cursor,
                                                                UNO_QUERY);
-      if (!area.is() || !addressable.is()) continue;
+      if (!area.is() || !addressable.is()) {
+        warner.lose(sheet_label + " has no used-area cursor");
+        continue;
+      }
       area->gotoStartOfUsedArea(false);
       area->gotoEndOfUsedArea(true);
       css::table::CellRangeAddress used = addressable->getRangeAddress();
-      bool any = false;
+      officev1::EmbeddedSheet projected;
+      Reference<css::container::XNamed> named(sheet, UNO_QUERY);
+      if (named.is()) projected.set_name(utf8(named->getName()));
+      officev1::TableData* table = projected.mutable_table();
       for (sal_Int32 r = used.StartRow; r <= used.EndRow; r++) {
         for (sal_Int32 c = used.StartColumn; c <= used.EndColumn; c++) {
           Reference<css::table::XCell> cell = sheet->getCellByPosition(c, r);
@@ -4549,22 +4569,20 @@ void fill_inner_table(
             continue;
           }
           Reference<css::text::XText> text(cell, UNO_QUERY);
-          officev1::TableCellData* out_cell = out->add_cells();
+          officev1::TableCellData* out_cell = table->add_cells();
           out_cell->set_row(r - used.StartRow);
           out_cell->set_column(c - used.StartColumn);
           if (text.is()) out_cell->set_text(utf8(text->getString()));
-          any = true;
         }
       }
-      if (any) {
-        out->set_rows(used.EndRow - used.StartRow + 1);
-        out->set_columns(used.EndColumn - used.StartColumn + 1);
-        return;  // The first non-empty sheet is the projection.
-      }
-      out->clear_cells();
+      if (table->cells_size() == 0) continue;
+      table->set_rows(used.EndRow - used.StartRow + 1);
+      table->set_columns(used.EndColumn - used.StartColumn + 1);
+      if (out->inner_sheets_size() == 0) *out->mutable_inner_table() = *table;
+      *out->add_inner_sheets() = std::move(projected);
+    } catch (const css::uno::Exception& error) {
+      warner.lose(sheet_label + " extraction failed", error);
     }
-  } catch (const css::uno::Exception& error) {
-    warner.warn(label + " inner table walk failed", error);
   }
 }
 
@@ -4586,7 +4604,7 @@ void classify_embedded(const Reference<css::frame::XModel>& inner,
   Reference<css::sheet::XSpreadsheetDocument> inner_sheet(inner, UNO_QUERY);
   if (inner_sheet.is()) {
     out->set_kind(officev1::EMBEDDED_OBJECT_KIND_SPREADSHEET);
-    fill_inner_table(inner_sheet, label, out->mutable_inner_table(), warner);
+    fill_inner_sheets(inner_sheet, label, out, warner);
     return;
   }
   Reference<css::lang::XServiceInfo> info(inner, UNO_QUERY);
@@ -4706,13 +4724,14 @@ bool emit_embedded_objects(const Reference<css::frame::XModel>& model,
   if (!supplier.is()) return true;
   Reference<css::drawing::XDrawPages> pages = supplier->getDrawPages();
   if (!pages.is()) return true;
-  for (sal_Int32 p = 0; p < pages->getCount(); p++) {
-    Reference<css::container::XIndexAccess> shapes(pages->getByIndex(p),
-                                                   UNO_QUERY);
-    if (!shapes.is()) continue;
+  // Walks one shape collection, descending into group shapes so an object
+  // grouped with its caption is found; returns false when emit_fn stops.
+  auto walk = [&](auto&& self,
+                  const Reference<css::container::XIndexAccess>& shapes,
+                  int32_t p, const std::string& path, int depth) -> bool {
     for (sal_Int32 i = 0; i < shapes->getCount(); i++) {
       std::string label = "page " + std::to_string(p) + " embedded object " +
-                          std::to_string(i);
+                          path + std::to_string(i);
       Reference<css::beans::XPropertySet> props;
       try {
         props = Reference<css::beans::XPropertySet>(shapes->getByIndex(i),
@@ -4723,8 +4742,23 @@ bool emit_embedded_objects(const Reference<css::frame::XModel>& model,
       }
       if (!props.is()) continue;
       Reference<css::lang::XServiceInfo> services(props, UNO_QUERY);
-      if (!services.is() ||
-          !services->supportsService("com.sun.star.drawing.OLE2Shape")) {
+      if (!services.is()) continue;
+      if (services->supportsService("com.sun.star.drawing.GroupShape")) {
+        Reference<css::container::XIndexAccess> children(props, UNO_QUERY);
+        if (!children.is()) continue;
+        if (depth >= kMaxShapeGroupDepth) {
+          warner.warn_once("shape groups nested deeper than "
+                           + std::to_string(kMaxShapeGroupDepth)
+                           + " levels were not searched for embedded objects");
+          continue;
+        }
+        if (!self(self, children, p, path + std::to_string(i) + "/",
+                  depth + 1)) {
+          return false;
+        }
+        continue;
+      }
+      if (!services->supportsService("com.sun.star.drawing.OLE2Shape")) {
         continue;
       }
       officev1::StreamPagesResponse event;
@@ -4785,6 +4819,13 @@ bool emit_embedded_objects(const Reference<css::frame::XModel>& model,
       if (!emit_fn(event)) return false;
       emitted++;
     }
+    return true;
+  };
+  for (sal_Int32 p = 0; p < pages->getCount(); p++) {
+    Reference<css::container::XIndexAccess> shapes(pages->getByIndex(p),
+                                                   UNO_QUERY);
+    if (!shapes.is()) continue;
+    if (!walk(walk, shapes, static_cast<int32_t>(p), "", 0)) return false;
   }
   return true;
 }
