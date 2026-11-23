@@ -5173,6 +5173,7 @@ void dispatch_uno(const Reference<css::frame::XModel>& model,
             "com.sun.star.frame.DispatchHelper", context),
         UNO_QUERY);
     Reference<css::frame::XController> controller = model->getCurrentController();
+    if (fault_injected("tracked-changes-no-dispatcher")) helper.clear();
     if (!helper.is() || !controller.is()) return;
     Reference<css::frame::XDispatchProvider> provider(
         controller->getFrame(), UNO_QUERY);
@@ -6828,6 +6829,7 @@ void apply_document_options(const RenderOptions& options,
     Reference<css::uno::XComponentContext> context = process_context();
     if (!context.is()) return;
     Reference<css::frame::XModel> model = find_loaded_model(context);
+    if (fault_injected("document-options-no-model")) model.clear();
     if (!model.is()) return;
     pin_file_name_fields(model, warner);
     apply_tracked_changes(model, context, options.tracked_changes, warner);
