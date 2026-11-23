@@ -313,6 +313,13 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
         std::string png =
             encode_png(pixels.data(), size.width_px, size.height_px, bgra);
         if (fault_injected("svg-fallback-png-fails")) png.clear();
+        if (png.empty()) {
+          // An SVG around an empty image would read as a good page.
+          encoder_ok = false;
+          *error = "page " + std::to_string(page_number)
+              + ": the fallback raster for SVG output could not be encoded";
+          break;
+        }
         svg = svg_from_png(png, size.width_px, size.height_px);
       }
       if (svg.empty() || !svg.contains("<svg")) {
