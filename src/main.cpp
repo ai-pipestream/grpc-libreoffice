@@ -51,20 +51,34 @@ std::string sibling_binary(const char* name) {
   return slash == std::string::npos ? name : path.substr(0, slash + 1) + name;
 }
 
-std::string detect_libreoffice_version() {
-  FILE* pipe = ::popen("soffice --version 2>/dev/null", "r");
-  if (pipe == nullptr) return "unknown";
+// The version of the LibreOffice the workers load, asked of that install's
+// own soffice rather than whichever one PATH finds. Empty when it cannot be
+// read; the caller fails startup on that rather than report "unknown".
+std::string detect_libreoffice_version(const std::string& install_path) {
+  // Single-quoted for the shell popen runs, with any quote in the path
+  // closed, escaped, and reopened.
+  std::string quoted = "'";
+  for (char c : install_path + "/soffice") {
+    if (c == '\'') {
+      quoted += "'\\''";
+    } else {
+      quoted += c;
+    }
+  }
+  quoted += "'";
+  FILE* pipe = ::popen((quoted + " --version 2>/dev/null").c_str(), "r");
+  if (pipe == nullptr) return {};
   char line[256] = {0};
   if (std::fgets(line, sizeof line, pipe) == nullptr) {
     ::pclose(pipe);
-    return "unknown";
+    return {};
   }
   ::pclose(pipe);
   std::string version(line);
   while (!version.empty() && (version.back() == '\n' || version.back() == '\r')) {
     version.pop_back();
   }
-  return version.empty() ? "unknown" : version;
+  return version;
 }
 
 std::unique_ptr<grpc::Server> g_server;
@@ -127,9 +141,29 @@ int main() {
   }
   const char* worker = std::getenv("GRLIBRE_WORKER");
   config.worker_path = worker != nullptr ? worker : sibling_binary("grlibre-worker");
-  config.libreoffice_version = detect_libreoffice_version();
+  config.libreoffice_version = detect_libreoffice_version(config.install_path);
 
   grlibre::RenderServiceImpl service(config);
+
+  // Readiness is proven, not assumed: one real render through the worker
+  // and the office install has to come back whole before the server
+  // listens. The health service reports SERVING from the moment the server
+  // starts, so a deployment that cannot render must never get that far.
+  const auto probe_started = std::chrono::steady_clock::now();
+  if (const std::string failure = service.startup_probe(); !failure.empty()) {
+    std::println(stderr, "Startup failed: {}", failure);
+    return 1;
+  }
+  if (config.libreoffice_version.empty()) {
+    std::println(stderr,
+                 "Startup failed: cannot read the LibreOffice version from "
+                 "{}/soffice --version",
+                 config.install_path);
+    return 1;
+  }
+  std::println("startup probe rendered a document in {} ms",
+               std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - probe_started).count());
 
   grpc::EnableDefaultHealthCheckService(true);
   grpc::reflection::InitProtoReflectionServerBuilderPlugin();

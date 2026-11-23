@@ -434,6 +434,28 @@ int main() {
   config.render_dpi = 96;
   grlibre::RenderServiceImpl service(config);
 
+  // The startup probe passes on a working configuration and names what is
+  // wrong on a broken one, without counting as a served document.
+  {
+    const std::string probed = service.startup_probe();
+    require(probed.empty(), "the startup probe passes here: " + probed);
+    grlibre::ServiceConfig no_office = config;
+    no_office.install_path = "/nonexistent/libreoffice/program";
+    grlibre::RenderServiceImpl broken(no_office);
+    require(broken.startup_probe().contains("/nonexistent/libreoffice/program"),
+            "the probe names a missing LibreOffice install");
+    // A directory that holds no office core: the worker itself must fail.
+    grlibre::ServiceConfig empty_office = config;
+    empty_office.install_path = "/tmp";
+    grlibre::RenderServiceImpl hollow(empty_office);
+    const std::string hollow_probe = hollow.startup_probe();
+    require(hollow_probe.contains("failed") && hollow_probe.contains("/tmp"),
+            "the probe fails on a directory with no office core in it, got: "
+                + hollow_probe);
+    require(service.rendered.load() == 0 && service.failed.load() == 0,
+            "probes are not counted as served documents");
+  }
+
   int port = 0;
   grpc::ServerBuilder builder;
   builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
