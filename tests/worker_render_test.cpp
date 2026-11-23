@@ -5045,6 +5045,162 @@ void verify_linked_resources_are_not_fetched() {
               + std::to_string(counter.connections()) + " time(s)");
 }
 
+// Embedded objects the walk used to miss in part. A chart whose category
+// axis holds numbers (years) keeps them as category labels.
+// An embedded workbook keeps every non-empty sheet, not just the first. An
+// object inside a group shape on a drawing page is still found.
+void verify_embedded_object_coverage() {
+  const std::string math = R"(<draw:object>
+   <math xmlns="http://www.w3.org/1998/Math/MathML" display="block">
+    <semantics><mrow><mi>x</mi></mrow><annotation encoding="StarMath 5.0">x</annotation></semantics>
+   </math>
+  </draw:object>)";
+  const std::string fodt = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+ xmlns:chart="urn:oasis:names:tc:opendocument:xmlns:chart:1.0"
+ office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:body><office:text>
+  <text:p>Objects follow.</text:p>
+  <text:p>The flat XML type detector matches any office:mimetype token in
+   the first four thousand bytes of the file, so this filler paragraph
+   keeps the nested objects' mimetypes beyond that window and the document
+   reliably detected as text. It carries no assertions of its own; it only
+   pads the byte offset of the objects below, which is why it rambles on
+   for a few more words than any reasonable paragraph would otherwise need
+   to, and then for a few more again, just to be safe about the window.</text:p>
+  <text:p>The flat XML type detector matches any office:mimetype token in
+   the first four thousand bytes of the file, so this filler paragraph
+   keeps the nested objects' mimetypes beyond that window and the document
+   reliably detected as text. It carries no assertions of its own; it only
+   pads the byte offset of the objects below, which is why it rambles on
+   for a few more words than any reasonable paragraph would otherwise need
+   to, and then for a few more again, just to be safe about the window.</text:p>
+  <text:p>The flat XML type detector matches any office:mimetype token in
+   the first four thousand bytes of the file, so this filler paragraph
+   keeps the nested objects' mimetypes beyond that window and the document
+   reliably detected as text. It carries no assertions of its own; it only
+   pads the byte offset of the objects below, which is why it rambles on
+   for a few more words than any reasonable paragraph would otherwise need
+   to, and then for a few more again, just to be safe about the window.</text:p>
+  <text:p><draw:frame draw:name="Years" svg:width="8cm" svg:height="6cm"><draw:object>
+   <office:document office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.chart">
+    <office:body><office:chart>
+     <chart:chart chart:class="chart:bar">
+      <chart:plot-area>
+       <chart:axis chart:dimension="x" chart:name="primary-x"><chart:categories table:cell-range-address="local-table.$A$2:.$A$4"/></chart:axis>
+       <chart:axis chart:dimension="y" chart:name="primary-y"/>
+       <chart:series chart:values-cell-range-address="local-table.$B$2:.$B$4" chart:label-cell-address="local-table.$B$1"><chart:data-point chart:repeated="3"/></chart:series>
+      </chart:plot-area>
+      <table:table table:name="local-table">
+       <table:table-header-columns><table:table-column/></table:table-header-columns>
+       <table:table-columns><table:table-column/></table:table-columns>
+       <table:table-header-rows>
+        <table:table-row><table:table-cell/><table:table-cell office:value-type="string"><text:p>Sales</text:p></table:table-cell></table:table-row>
+       </table:table-header-rows>
+       <table:table-rows>
+        <table:table-row><table:table-cell office:value-type="float" office:value="2020"><text:p>2020</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="1"><text:p>1</text:p></table:table-cell></table:table-row>
+        <table:table-row><table:table-cell office:value-type="float" office:value="2021"><text:p>2021</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="2"><text:p>2</text:p></table:table-cell></table:table-row>
+        <table:table-row><table:table-cell office:value-type="float" office:value="2022.5"><text:p>2022.5</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="3"><text:p>3</text:p></table:table-cell></table:table-row>
+       </table:table-rows>
+      </table:table>
+     </chart:chart>
+    </office:chart></office:body>
+   </office:document>
+  </draw:object></draw:frame></text:p>
+  <text:p><draw:frame draw:name="Book" svg:width="6cm" svg:height="3cm"><draw:object>
+   <office:document office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.spreadsheet">
+    <office:body><office:spreadsheet>
+     <table:table table:name="Summary">
+      <table:table-row><table:table-cell office:value-type="string"><text:p>K</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="7"><text:p>7</text:p></table:table-cell></table:table-row>
+     </table:table>
+     <table:table table:name="Empty"><table:table-row><table:table-cell/></table:table-row></table:table>
+     <table:table table:name="Detail">
+      <table:table-row><table:table-cell office:value-type="string"><text:p>M</text:p></table:table-cell></table:table-row>
+      <table:table-row><table:table-cell office:value-type="string"><text:p>N</text:p></table:table-cell></table:table-row>
+     </table:table>
+    </office:spreadsheet></office:body>
+   </office:document>
+  </draw:object></draw:frame></text:p>
+ </office:text></office:body>
+</office:document>
+)";
+  std::vector<officev1::EmbeddedObject> objects;
+  auto objects_of = [&](const char* extension, const std::string& doc) {
+    std::vector<std::string> payloads;
+    auto outcome = run("pages", extension, doc, &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            std::string(extension) + " renders ok: " + outcome.detail);
+    objects.clear();
+    for (const std::string& payload : payloads) {
+      officev1::StreamPagesResponse event;
+      require(event.ParseFromString(payload), "embedded event parses");
+      if (event.has_embedded_object()) {
+        objects.push_back(event.embedded_object());
+      }
+    }
+  };
+
+  objects_of("fodt", fodt);
+  const officev1::EmbeddedObject* years = nullptr;
+  const officev1::EmbeddedObject* book = nullptr;
+  for (const officev1::EmbeddedObject& object : objects) {
+    if (object.name() == "Years") years = &object;
+    if (object.name() == "Book") book = &object;
+  }
+  require(years != nullptr && book != nullptr,
+          "both embedded objects are found, got "
+              + std::to_string(objects.size()));
+  const officev1::EmbeddedChart& chart = years->chart();
+  std::string categories;
+  for (const std::string& category : chart.categories()) {
+    categories += category + ";";
+  }
+  require(categories == "2020;2021;2022.5;",
+          "numeric categories are kept as their text, got: " + categories);
+
+  std::string sheets;
+  for (const officev1::EmbeddedSheet& sheet : book->inner_sheets()) {
+    sheets += sheet.name() + "=" + std::to_string(sheet.table().rows()) + "x"
+              + std::to_string(sheet.table().columns()) + ";";
+  }
+  require(sheets == "Summary=1x2;Detail=2x1;",
+          "every non-empty sheet of the embedded workbook is kept, got: "
+              + sheets);
+  require(book->inner_table().rows() == 1 &&
+              book->inner_table().columns() == 2,
+          "inner_table stays the first non-empty sheet");
+
+  const std::string fodg = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.graphics">
+ <office:body><office:drawing>
+  <draw:page draw:name="page1">
+   <draw:frame draw:name="Loose" svg:x="1cm" svg:y="1cm" svg:width="3cm" svg:height="1cm">)"
+      + math + R"(</draw:frame>
+   <draw:g draw:name="Caption">
+    <draw:rect draw:name="Box" svg:x="1cm" svg:y="4cm" svg:width="4cm" svg:height="1cm"/>
+    <draw:frame draw:name="Grouped" svg:x="1cm" svg:y="6cm" svg:width="3cm" svg:height="1cm">)"
+      + math + R"(</draw:frame>
+   </draw:g>
+  </draw:page>
+ </office:drawing></office:body>
+</office:document>
+)";
+  objects_of("fodg", fodg);
+  std::string names;
+  for (const officev1::EmbeddedObject& object : objects) {
+    names += object.name() + ";";
+  }
+  require(names == "Loose;Grouped;",
+          "an embedded object inside a group shape is found, got: " + names);
+}
+
 int main() {
   if (!std::filesystem::exists(lo_install_path())) {
     std::println(stderr, "SKIP: no LibreOffice at {}", lo_install_path());
@@ -5065,6 +5221,7 @@ int main() {
   verify_part_selection();
   verify_document_category();
   verify_embedded_objects();
+  verify_embedded_object_coverage();
   verify_line_rects();
   verify_docling_mapping();
   verify_marks_content();

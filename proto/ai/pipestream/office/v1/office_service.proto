@@ -1302,7 +1302,8 @@ message EmbeddedChart {
   // The primary y axis title; empty when unset.
   string y_axis_title = 5;
   // Category labels from the category axis, in order; empty for charts
-  // without a category axis, such as scatter.
+  // without a category axis, such as scatter. A numeric category axis
+  // (years held as numbers) has its numbers here as text.
   repeated string categories = 6;
   // The chart's data series, in order.
   repeated EmbeddedChartSeries series = 7;
@@ -1312,6 +1313,15 @@ message EmbeddedChart {
   // contract does not model. Reuses TableData; its caret start and end
   // points are left unset.
   TableData tabular = 8;
+}
+
+// EmbeddedSheet is one non-empty sheet of an embedded spreadsheet.
+message EmbeddedSheet {
+  // The sheet's name.
+  string name = 1;
+  // The sheet's used range as a cell grid. Reuses TableData; its caret
+  // start and end points are left unset.
+  TableData table = 2;
 }
 
 // EmbeddedObject is one embedded object discovered in the loaded document:
@@ -1349,9 +1359,10 @@ message EmbeddedObject {
   bytes replacement_image = 11;
   // The extracted chart; set only when kind is EMBEDDED_OBJECT_KIND_CHART.
   EmbeddedChart chart = 12;
-  // The embedded spreadsheet's used range as a cell grid; set only when
-  // kind is EMBEDDED_OBJECT_KIND_SPREADSHEET. Reuses TableData; its caret
-  // start and end points are left unset.
+  // The used range of the embedded spreadsheet's first non-empty sheet as
+  // a cell grid; set only when kind is EMBEDDED_OBJECT_KIND_SPREADSHEET.
+  // Every non-empty sheet, this one included, is in inner_sheets. Reuses
+  // TableData; its caret start and end points are left unset.
   TableData inner_table = 13;
   // The StarMath command string; set only when kind is
   // EMBEDDED_OBJECT_KIND_FORMULA.
@@ -1365,6 +1376,9 @@ message EmbeddedObject {
   // object: the event holds what was read before the failure and
   // nothing after it. Absent when it was read in full.
   ExtractionGap gap = 16;
+  // Every non-empty sheet of an embedded spreadsheet, in sheet order; set
+  // only when kind is EMBEDDED_OBJECT_KIND_SPREADSHEET.
+  repeated EmbeddedSheet inner_sheets = 17;
 }
 
 // SheetCellType is the office core's cell content classification, mirroring
