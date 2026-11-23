@@ -28,6 +28,7 @@
 #include "ai/pipestream/office/v1/office_service.pb.h"
 #include "document_passwords.h"
 #include "event_frame.h"
+#include "fault_injection.h"
 #include "png_encode.h"
 #include "uno_extract.h"
 
@@ -311,6 +312,14 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
                             static_cast<int>(page.height));
         std::string png =
             encode_png(pixels.data(), size.width_px, size.height_px, bgra);
+        if (fault_injected("svg-fallback-png-fails")) png.clear();
+        if (png.empty()) {
+          // An SVG around an empty image would read as a good page.
+          encoder_ok = false;
+          *error = "page " + std::to_string(page_number)
+              + ": the fallback raster for SVG output could not be encoded";
+          break;
+        }
         svg = svg_from_png(png, size.width_px, size.height_px);
       }
       if (svg.empty() || !svg.contains("<svg")) {
@@ -771,6 +780,7 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     bool redaction_breached = false;
     TypedContentResult typed = TypedContentResult::kComplete;
     std::string extraction_failure;
+    int incomplete_items = 0;
     if (ok) {
       typed = emit_typed_content(
           options.parts, probe_ptr,
@@ -785,7 +795,7 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
             output_bytes += static_cast<long>(event.ByteSizeLong());
             return emit(out_fd, event);
           },
-          &typed_warnings, &extraction_failure);
+          &typed_warnings, &extraction_failure, &incomplete_items);
       ok = typed != TypedContentResult::kEmitFailed;
     }
     if (probe_ptr != nullptr) document->registerCallback(nullptr, nullptr);
@@ -809,6 +819,7 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
       }
       status->set_input_bytes(options.input_bytes);
       status->set_output_bytes(output_bytes);
+      status->set_incomplete_items(incomplete_items);
       status->set_render_millis(std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - started).count());
       ok = emit(out_fd, final_event);

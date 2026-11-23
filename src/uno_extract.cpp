@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <print>
@@ -187,6 +188,7 @@
 
 #include "fault_injection.h"
 #include "gif_palette.h"
+#include "pdf_page_range.h"
 #include "ai/pipestream/office/v1/office_service.pb.h"
 
 namespace grlibre {
@@ -282,6 +284,45 @@ class Warner {
   // Why the walk failed; empty while it has not.
   const std::string& failure() const { return failure_; }
 
+  // Reports that the item being read lost content part way: counted like
+  // warn(), and kept so the event being built carries it as its
+  // ExtractionGap (see mark_gap).
+  void lose(const std::string& message) {
+    losses_.push_back(message);
+    warn(message);
+  }
+
+  void lose(const std::string& context, const css::uno::Exception& error) {
+    lose(context + ": " + utf8(error.Message));
+  }
+
+  // A loss that drops no text (an image that cannot be encoded at all):
+  // kept for the event's ExtractionGap like lose(), but not counted, so a
+  // walk that compares count() (the redaction checks) is not failed by it.
+  void lose_no_text(const std::string& message) {
+    losses_.push_back(message);
+    report(message);
+  }
+
+  // Losses reported so far; take it before reading an item and hand it to
+  // mark_gap once the item is read.
+  size_t losses() const { return losses_.size(); }
+
+  // Events marked with an ExtractionGap so far.
+  int gaps() const { return gaps_; }
+
+  // Sets out's ExtractionGap to the losses reported since `since`, and
+  // leaves it unset when there were none.
+  template <typename Event>
+  void mark_gap(size_t since, Event* out) {
+    if (losses_.size() <= since) return;
+    gaps_++;
+    auto* gap = out->mutable_gap();
+    for (size_t i = since; i < losses_.size(); i++) {
+      gap->add_problems(losses_[i]);
+    }
+  }
+
  private:
   void report(const std::string& message) {
     std::println(stderr, "grlibre-worker: typed content: {}", message);
@@ -292,6 +333,8 @@ class Warner {
   std::set<std::string> warned_;
   std::string failure_;
   size_t count_ = 0;
+  std::vector<std::string> losses_;
+  int gaps_ = 0;
 };
 
 // The office core bootstrapped UNO in this process when LibreOfficeKit
@@ -480,18 +523,21 @@ class PdfChunkSink : public cppu::WeakImplHelper1<css::io::XOutputStream> {
   bool closed_ = false;
 };
 
-int64_t datetime_epoch_ms(const css::util::DateTime& value) {
-  if (value.Year == 0) return 0;
-  struct tm parts = {};
-  parts.tm_year = value.Year - 1900;
-  parts.tm_mon = value.Month - 1;
-  parts.tm_mday = value.Day;
-  parts.tm_hour = value.Hours;
-  parts.tm_min = value.Minutes;
-  parts.tm_sec = value.Seconds;
-  time_t seconds = timegm(&parts);
-  if (seconds < 0) return 0;
-  return static_cast<int64_t>(seconds) * 1000 +
+// Milliseconds from the Unix epoch to a UTC date-time, negative before
+// 1970; nullopt when the office core reports no date (year 0) or one that
+// is not a calendar date.
+std::optional<int64_t> datetime_epoch_ms(const css::util::DateTime& value) {
+  if (value.Year == 0) return std::nullopt;
+  const std::chrono::year_month_day day{
+      std::chrono::year{value.Year},
+      std::chrono::month{static_cast<unsigned>(value.Month)},
+      std::chrono::day{static_cast<unsigned>(value.Day)}};
+  if (!day.ok()) return std::nullopt;
+  const auto midnight = std::chrono::sys_days{day}.time_since_epoch();
+  return std::chrono::duration_cast<std::chrono::milliseconds>(midnight).count() +
+         static_cast<int64_t>(value.Hours) * 3600000 +
+         static_cast<int64_t>(value.Minutes) * 60000 +
+         static_cast<int64_t>(value.Seconds) * 1000 +
          static_cast<int64_t>(value.NanoSeconds / 1000000);
 }
 
@@ -544,13 +590,23 @@ void set_user_property_value(const rtl::OUString& name,
   } else if (value >>= flag) {
     out->set_flag(flag);
   } else if (value >>= datetime) {
-    out->set_epoch_ms(datetime_epoch_ms(datetime));
+    if (std::optional<int64_t> epoch = datetime_epoch_ms(datetime)) {
+      out->set_epoch_ms(*epoch);
+    } else {
+      warner.warn("user property " + utf8(name) +
+                  " holds an empty date and was emitted without a value");
+    }
   } else if (value >>= date) {
     css::util::DateTime midnight;
     midnight.Year = date.Year;
     midnight.Month = date.Month;
     midnight.Day = date.Day;
-    out->set_epoch_ms(datetime_epoch_ms(midnight));
+    if (std::optional<int64_t> epoch = datetime_epoch_ms(midnight)) {
+      out->set_epoch_ms(*epoch);
+    } else {
+      warner.warn("user property " + utf8(name) +
+                  " holds an empty date and was emitted without a value");
+    }
   } else {
     warner.warn("user property " + utf8(name) +
                 " has an unmapped type and was emitted without a value");
@@ -606,13 +662,19 @@ bool emit_metadata(const Reference<css::frame::XModel>& model,
   for (const rtl::OUString& keyword : props->getKeywords()) {
     metadata->add_keywords(utf8(keyword));
   }
-  metadata->set_created_epoch_ms(datetime_epoch_ms(props->getCreationDate()));
-  metadata->set_modified_epoch_ms(datetime_epoch_ms(props->getModificationDate()));
+  if (std::optional<int64_t> epoch = datetime_epoch_ms(props->getCreationDate())) {
+    metadata->set_created_epoch_ms(*epoch);
+  }
+  if (std::optional<int64_t> epoch = datetime_epoch_ms(props->getModificationDate())) {
+    metadata->set_modified_epoch_ms(*epoch);
+  }
   metadata->set_modified_by(utf8(props->getModifiedBy()));
   metadata->set_generator(utf8(props->getGenerator()));
   metadata->set_editing_cycles(props->getEditingCycles());
   metadata->set_editing_duration_seconds(props->getEditingDuration());
-  metadata->set_printed_epoch_ms(datetime_epoch_ms(props->getPrintDate()));
+  if (std::optional<int64_t> epoch = datetime_epoch_ms(props->getPrintDate())) {
+    metadata->set_printed_epoch_ms(*epoch);
+  }
   metadata->set_printed_by(utf8(props->getPrintedBy()));
   css::lang::Locale locale = props->getLanguage();
   std::string language = utf8(locale.Language);
@@ -1109,7 +1171,9 @@ class MarkerCollector {
       out->set_initials(utf8(text));
       css::util::DateTime when;
       props->getPropertyValue("DateTimeValue") >>= when;
-      out->set_epoch_ms(datetime_epoch_ms(when));
+      if (std::optional<int64_t> epoch = datetime_epoch_ms(when)) {
+        out->set_epoch_ms(*epoch);
+      }
     } catch (const css::beans::UnknownPropertyException&) {
       // Expected probe result: initials and creation time are optional.
     }
@@ -1285,7 +1349,9 @@ class MarkerCollector {
     out->set_comment(utf8(text));
     css::util::DateTime when;
     props->getPropertyValue("RedlineDateTime") >>= when;
-    out->set_epoch_ms(datetime_epoch_ms(when));
+    if (std::optional<int64_t> epoch = datetime_epoch_ms(when)) {
+      out->set_epoch_ms(*epoch);
+    }
     try {
       css::uno::Sequence<css::beans::PropertyValue> successor;
       props->getPropertyValue("RedlineSuccessorData") >>= successor;
@@ -1307,7 +1373,9 @@ class MarkerCollector {
         } else if (entry.Name == "RedlineDateTime") {
           css::util::DateTime under_when;
           entry.Value >>= under_when;
-          under->set_epoch_ms(datetime_epoch_ms(under_when));
+          if (std::optional<int64_t> epoch = datetime_epoch_ms(under_when)) {
+            under->set_epoch_ms(*epoch);
+          }
         }
       }
       // A successor block whose fields were all empty is no successor.
@@ -1953,6 +2021,11 @@ void fill_runs(const Reference<css::container::XEnumerationAccess>& paragraph,
         }
         continue;
       }
+      if (fault_injected("text-portion-throws") &&
+          range->getString() == "bold") {
+        throw css::uno::RuntimeException(
+            oustring("test fault: the portion stopped answering"));
+      }
       officev1::TextRun* run = runs->Add();
       run->set_text(utf8(range->getString()));
       int64_t length = codepoints(run->text());
@@ -1966,7 +2039,7 @@ void fill_runs(const Reference<css::container::XEnumerationAccess>& paragraph,
       fill_run_char_props(props, run);
       if (marks != nullptr) marks->on_run_text(run->text());
     } catch (const css::uno::Exception& error) {
-      warner.warn(label + " portion " + std::to_string(portion_index - 1) +
+      warner.lose(label + " portion " + std::to_string(portion_index - 1) +
                       " lost its run",
                   error);
     }
@@ -2204,6 +2277,7 @@ bool emit_table(const Reference<css::text::XTextTable>& table, int32_t index,
   out->set_index(index);
   out->set_page_index(-1);
   std::string label = "table " + std::to_string(index);
+  const size_t losses = warner.losses();
   try {
     out->set_rows(table->getRows()->getCount());
     out->set_columns(table->getColumns()->getCount());
@@ -2222,9 +2296,13 @@ bool emit_table(const Reference<css::text::XTextTable>& table, int32_t index,
         parts.wants(officev1::DOCUMENT_PART_LINE_RECTS) &&
         names.getLength() <= 64;
     for (const rtl::OUString& name : names) {
+      if (fault_injected("table-cell-walk-throws") && out->cells_size() == 1) {
+        throw css::uno::RuntimeException(
+            oustring("test fault: the cell walk stopped answering"));
+      }
       Reference<css::text::XText> cell(table->getCellByName(name), UNO_QUERY);
       if (!cell.is()) {
-        warner.warn(label + " cell " + utf8(name) + " is not a text cell");
+        warner.lose(label + " cell " + utf8(name) + " is not a text cell");
         continue;
       }
       officev1::TableCellData* cell_out = out->add_cells();
@@ -2282,8 +2360,9 @@ bool emit_table(const Reference<css::text::XTextTable>& table, int32_t index,
       out->set_page_index(page_index);
     }
   } catch (const css::uno::Exception& error) {
-    warner.warn(label + " extraction failed", error);
+    warner.lose(label + " extraction failed", error);
   }
+  warner.mark_gap(losses, out);
   return emit_fn(event);
 }
 
@@ -2418,7 +2497,11 @@ void encode_graphic(const Reference<css::graphic::XGraphic>& graphic,
                     const Reference<css::graphic::XGraphicProvider>& provider,
                     const std::string& label, std::string* mime_type,
                     std::string* data, Warner& warner) {
-  if (!provider.is()) return;
+  if (!provider.is()) {
+    warner.lose_no_text(label + " could not be encoded: the office core "
+                        "offers no graphic provider");
+    return;
+  }
   rtl::OUString mime;
   try {
     Reference<css::beans::XPropertySet> graphic_props(graphic, UNO_QUERY);
@@ -2437,6 +2520,10 @@ void encode_graphic(const Reference<css::graphic::XGraphic>& graphic,
   args[1].Name = "MimeType";
   args[1].Value <<= mime;
   try {
+    if (fault_injected("image-encode-fails")) {
+      throw css::uno::RuntimeException(
+          oustring("test fault: the source format writer failed"));
+    }
     provider->storeGraphic(graphic, store_args);
     *mime_type = utf8(mime);
     *data = sink->bytes();
@@ -2451,11 +2538,16 @@ void encode_graphic(const Reference<css::graphic::XGraphic>& graphic,
     args[0].Value <<= Reference<css::io::XStream>(png_sink.get());
     args[1].Value <<= rtl::OUString("image/png");
     try {
+      if (fault_injected("image-encode-fails")) {
+        throw css::uno::RuntimeException(
+            oustring("test fault: the png writer failed"));
+      }
       provider->storeGraphic(graphic, store_args);
       *mime_type = "image/png";
       *data = png_sink->bytes();
     } catch (const css::uno::Exception& error) {
-      warner.note(label + " could not be encoded at all", error);
+      warner.lose_no_text(label + " could not be encoded at all: "
+                          + utf8(error.Message));
     }
   }
 }
@@ -2699,8 +2791,10 @@ bool emit_writer_shapes(const Reference<css::container::XIndexAccess>& shapes,
       fill_alt_text(props, out->mutable_title(), out->mutable_description());
       std::string image_label = "image " + std::to_string(walk->image_index);
 
+      const size_t losses = warner.losses();
       encode_graphic(graphic, walk->provider, image_label,
                      out->mutable_mime_type(), out->mutable_data(), warner);
+      warner.mark_gap(losses, out);
 
       try {
         Reference<css::text::XTextContent> content(props, UNO_QUERY);
@@ -2886,6 +2980,7 @@ bool emit_text_frames(const Reference<css::text::XTextDocument>& text_doc,
     officev1::TextFrame* out = event.mutable_text_frame();
     out->set_index(i);
     out->set_page_index(-1);
+    const size_t losses = warner.losses();
     try {
       Reference<css::text::XTextFrame> frame(frames->getByIndex(i), UNO_QUERY);
       if (!frame.is()) {
@@ -2937,11 +3032,16 @@ bool emit_text_frames(const Reference<css::text::XTextDocument>& text_doc,
         props->getPropertyValue("ChainPrevName") >>= chain;
         out->set_chain_prev(utf8(chain));
       }
+      if (fault_injected("text-frame-throws")) {
+        throw css::uno::RuntimeException(
+            oustring("test fault: the frame text stopped answering"));
+      }
       flatten_text_runs(frame->getText(), label, out->mutable_runs(), marks,
                         warner);
     } catch (const css::uno::Exception& error) {
-      warner.warn(label + " extraction failed", error);
+      warner.lose(label + " extraction failed", error);
     }
+    warner.mark_gap(losses, out);
     if (!emit_fn(event)) return false;
     if (table_parts == nullptr) continue;
     std::vector<Reference<css::text::XTextTable>> tables;
@@ -3082,10 +3182,12 @@ bool emit_shapes(const Reference<css::drawing::XShapes>& shapes,
         image->set_description(out->description());
         image->set_width_twips(out->width_twips());
         image->set_height_twips(out->height_twips());
+        const size_t losses = warner.losses();
         encode_graphic(graphic, provider,
                        "image " + std::to_string(image->index()),
                        image->mutable_mime_type(), image->mutable_data(),
                        warner);
+        warner.mark_gap(losses, image);
         if (!emit_fn(image_event)) return false;
       }
     }
@@ -3321,10 +3423,12 @@ bool emit_slide_shape(const Reference<css::drawing::XShape>& shape,
       *image->mutable_anchor() = out->position();
       image->set_width_twips(out->width_twips());
       image->set_height_twips(out->height_twips());
+      const size_t losses = warner.losses();
       encode_graphic(graphic, provider,
                      "image " + std::to_string(image->index()),
                      image->mutable_mime_type(), image->mutable_data(),
                      warner);
+      warner.mark_gap(losses, image);
       if (!emit_fn(image_event)) return false;
     }
   }
@@ -3391,7 +3495,9 @@ bool emit_slide_annotations(const Reference<css::drawing::XDrawPage>& slide,
       out->set_char_end(-1);
       out->set_author(utf8(annotation->getAuthor()));
       out->set_initials(utf8(annotation->getInitials()));
-      out->set_epoch_ms(datetime_epoch_ms(annotation->getDateTime()));
+      if (std::optional<int64_t> epoch = datetime_epoch_ms(annotation->getDateTime())) {
+        out->set_epoch_ms(*epoch);
+      }
       css::geometry::RealPoint2D position = annotation->getPosition();
       // Annotation positions are in millimeters (the office core's
       // RealPoint2D convention for annotations), converted to twips like
@@ -3866,6 +3972,7 @@ bool emit_calc_content(
         for (sal_Int32 c = used.StartColumn; c <= used.EndColumn; c++) {
           std::string cell_label = label + " cell r" + std::to_string(r) +
                                    " c" + std::to_string(c);
+          const size_t losses = warner.losses();
           try {
             Reference<css::table::XCell> cell = sheet->getCellByPosition(c, r);
             if (!cell.is()) continue;
@@ -3873,6 +3980,11 @@ bool emit_calc_content(
             if (type == css::table::CellContentType_EMPTY) continue;
             officev1::SheetCell* out_cell = row->add_cells();
             out_cell->set_column(c);
+            if (fault_injected("sheet-cell-throws") && r == used.StartRow &&
+                c == used.StartColumn) {
+              throw css::uno::RuntimeException(
+                  oustring("test fault: the cell stopped answering"));
+            }
             switch (type) {
               case css::table::CellContentType_VALUE:
                 out_cell->set_type(officev1::SHEET_CELL_TYPE_VALUE);
@@ -3967,7 +4079,16 @@ bool emit_calc_content(
               }
             }
           } catch (const css::uno::Exception& error) {
-            warner.warn(cell_label + " extraction failed", error);
+            warner.lose(cell_label + " extraction failed", error);
+          }
+          if (warner.losses() > losses) {
+            // A cell that failed before it was added is still reported, at
+            // its address with no type, so the row never reads as complete.
+            if (row->cells_size() == 0 ||
+                row->cells(row->cells_size() - 1).column() != c) {
+              row->add_cells()->set_column(c);
+            }
+            warner.mark_gap(losses, row->mutable_cells(row->cells_size() - 1));
           }
         }
         if (row->cells_size() > 0) {
@@ -4473,6 +4594,7 @@ bool emit_embedded_objects(const Reference<css::frame::XModel>& model,
       officev1::EmbeddedObject* out = event.mutable_embedded_object();
       out->set_index(emitted);
       out->set_page_index(-1);
+      const size_t losses = warner.losses();
       try {
         Reference<css::beans::XPropertySet> props(objects->getByIndex(i),
                                                   UNO_QUERY);
@@ -4523,8 +4645,9 @@ bool emit_embedded_objects(const Reference<css::frame::XModel>& model,
           }
         }
       } catch (const css::uno::Exception& error) {
-        warner.warn(label + " extraction failed", error);
+        warner.lose(label + " extraction failed", error);
       }
+      warner.mark_gap(losses, out);
       if (!emit_fn(event)) return false;
       emitted++;
     }
@@ -4560,6 +4683,7 @@ bool emit_embedded_objects(const Reference<css::frame::XModel>& model,
       officev1::EmbeddedObject* out = event.mutable_embedded_object();
       out->set_index(emitted);
       out->set_page_index(static_cast<int32_t>(p));
+      const size_t losses = warner.losses();
       try {
         Reference<css::container::XNamed> named(props, UNO_QUERY);
         if (named.is()) out->set_name(utf8(named->getName()));
@@ -4607,8 +4731,9 @@ bool emit_embedded_objects(const Reference<css::frame::XModel>& model,
                          out->mutable_replacement_image(), warner);
         }
       } catch (const css::uno::Exception& error) {
-        warner.warn(label + " extraction failed", error);
+        warner.lose(label + " extraction failed", error);
       }
+      warner.mark_gap(losses, out);
       if (!emit_fn(event)) return false;
       emitted++;
     }
@@ -4637,6 +4762,7 @@ bool emit_notes(const Reference<css::text::XTextDocument>& text_doc,
     out->set_index(i);
     out->set_endnote(endnotes);
     out->set_page_index(-1);
+    const size_t losses = warner.losses();
     try {
       Reference<css::text::XFootnote> note(notes->getByIndex(i), UNO_QUERY);
       if (!note.is()) {
@@ -4656,8 +4782,9 @@ bool emit_notes(const Reference<css::text::XTextDocument>& text_doc,
       flatten_text_runs(Reference<css::text::XText>(note, UNO_QUERY), label,
                         out->mutable_runs(), marks, warner);
     } catch (const css::uno::Exception& error) {
-      warner.warn(label + " extraction failed", error);
+      warner.lose(label + " extraction failed", error);
     }
+    warner.mark_gap(losses, out);
     if (!emit_fn(event)) return false;
   }
   return true;
@@ -4678,6 +4805,7 @@ bool emit_document_indexes(const Reference<css::text::XTextDocument>& text_doc,
     officev1::DocumentIndex* out = event.mutable_document_index();
     out->set_index(i);
     out->set_page_index(-1);
+    const size_t losses = warner.losses();
     try {
       Reference<css::text::XDocumentIndex> doc_index(indexes->getByIndex(i),
                                                      UNO_QUERY);
@@ -4719,8 +4847,9 @@ bool emit_document_indexes(const Reference<css::text::XTextDocument>& text_doc,
         }
       }
     } catch (const css::uno::Exception& error) {
-      warner.warn(label + " extraction failed", error);
+      warner.lose(label + " extraction failed", error);
     }
+    warner.mark_gap(losses, out);
     if (!emit_fn(event)) return false;
   }
   return true;
@@ -4897,11 +5026,13 @@ bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
       }
       if (!want_paragraphs && marks == nullptr) continue;
       officev1::StreamPagesResponse event;
+      const size_t losses = warner.losses();
       if (!fill_paragraph(element, paragraph_index, paragraph_cursor,
                           &caret_space, &annotation_offset, line_probe, marks,
                           event.mutable_paragraph(), warner)) {
         continue;
       }
+      warner.mark_gap(losses, event.mutable_paragraph());
       if (want_paragraphs && !emit_fn(event)) return false;
       if (marks != nullptr && marks->failed()) return false;
       paragraph_index++;
@@ -5058,11 +5189,12 @@ TypedContentResult emit_typed_content(const PartSelection& parts,
                                       SelectionProbe* probe,
                                       const EmitFn& emit_fn,
                                       std::vector<std::string>* warnings,
-                                      std::string* failure) {
+                                      std::string* failure,
+                                      int* incomplete_items) {
   Warner warner(warnings);
-  if (!emit_typed_content_with(parts, probe, emit_fn, warner)) {
-    return TypedContentResult::kEmitFailed;
-  }
+  const bool emitted = emit_typed_content_with(parts, probe, emit_fn, warner);
+  *incomplete_items = warner.gaps();
+  if (!emitted) return TypedContentResult::kEmitFailed;
   if (!warner.failure().empty()) {
     *failure = warner.failure();
     return TypedContentResult::kFailed;
@@ -5099,9 +5231,8 @@ bool export_pdf_stream(const std::string& filter_name, size_t chunk_limit,
     filter_data.getArray()[slot].Name = "ExportBookmarks";
     filter_data.getArray()[slot++].Value <<= true;
     if (ranged) {
-      const int first = pdf.first_page > 0 ? pdf.first_page : 1;
-      const int last = pdf.last_page > 0 ? pdf.last_page : 9999;
-      std::string range = std::to_string(first) + "-" + std::to_string(last);
+      const std::string range =
+          grlibre::pdf_page_range(pdf.first_page, pdf.last_page);
       filter_data.getArray()[slot].Name = "PageRange";
       filter_data.getArray()[slot++].Value <<=
           rtl::OUString::createFromAscii(range.c_str());
