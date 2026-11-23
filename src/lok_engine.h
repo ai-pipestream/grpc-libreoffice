@@ -135,6 +135,11 @@ inline constexpr int kExitPasswordRequired = 10;
 // streamed; no terminal RenderStatus follows them, and the worker leaves
 // the reason in kRefusalFile under its work dir.
 inline constexpr int kExitExtractionFailed = 11;
+// An option of the request could not be applied (skip_hidden with a part
+// whose visibility cannot be read, paint_used_range with an unreadable used
+// range); the worker emitted nothing and leaves the reason in kRefusalFile
+// under its work dir.
+inline constexpr int kExitOptionRefused = 12;
 // Where a worker that refuses a request or fails an extraction leaves its
 // human-readable reason, relative to the work dir, for the parent to put in
 // the call's status.

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -156,6 +157,7 @@
 #include <com/sun/star/text/XTextField.hpp>
 #include <com/sun/star/text/XTextFieldsSupplier.hpp>
 #include <com/sun/star/text/XPageCursor.hpp>
+#include <com/sun/star/text/XParagraphCursor.hpp>
 #include <com/sun/star/text/XText.hpp>
 #include <com/sun/star/text/XTextContent.hpp>
 #include <com/sun/star/text/XTextDocument.hpp>
@@ -5190,159 +5192,334 @@ bool is_repairable_broken_package(const std::string& bytes) {
 
 namespace {
 
-void dispatch_uno(const Reference<css::frame::XModel>& model,
-                  const Reference<css::uno::XComponentContext>& context,
-                  const char* command, Warner& warner) {
-  try {
-    Reference<css::lang::XMultiComponentFactory> manager =
-        context->getServiceManager();
-    Reference<css::frame::XDispatchHelper> helper(
-        manager->createInstanceWithContext(
-            "com.sun.star.frame.DispatchHelper", context),
-        UNO_QUERY);
-    Reference<css::frame::XController> controller = model->getCurrentController();
-    if (!helper.is() || !controller.is()) return;
-    Reference<css::frame::XDispatchProvider> provider(
-        controller->getFrame(), UNO_QUERY);
-    if (!provider.is()) return;
-    helper->executeDispatch(provider, oustring(command), oustring("_self"), 0,
-                            css::uno::Sequence<css::beans::PropertyValue>());
-  } catch (const css::uno::Exception& error) {
-    warner.warn(std::string("dispatch ") + command, error);
+// Why a requested document option could not be applied. The first reason is
+// the refusal the caller reads; later ones would only repeat it.
+class OptionRefusal {
+ public:
+  void refuse(std::string why) {
+    if (reason_.empty()) reason_ = std::move(why);
   }
+  bool refused() const { return !reason_.empty(); }
+  const std::string& reason() const { return reason_; }
+
+ private:
+  std::string reason_;
+};
+
+// Whether a tracked_changes value asks for anything to be done.
+bool wants_tracked_changes(int display) {
+  return display != officev1::TRACKED_CHANGE_DISPLAY_UNSPECIFIED &&
+         display != officev1::TRACKED_CHANGE_DISPLAY_AS_IS;
 }
 
-void apply_tracked_changes(const Reference<css::frame::XModel>& model,
-                           const Reference<css::uno::XComponentContext>& context,
-                           int display, Warner& warner) {
-  if (display <= 0 ||
-      display == officev1::TRACKED_CHANGE_DISPLAY_AS_IS) {
+// Runs one tracked-change command against the document's own frame. A
+// command with nothing to dispatch it changes nothing, so every missing
+// piece is a refusal rather than a silent return.
+void dispatch_tracked_change_command(
+    const Reference<css::frame::XModel>& model,
+    const Reference<css::uno::XComponentContext>& context, const char* command,
+    OptionRefusal& refusal) {
+  const std::string label =
+      std::string("tracked_changes could not be applied: ") + command;
+  Reference<css::lang::XMultiComponentFactory> manager =
+      context->getServiceManager();
+  Reference<css::frame::XDispatchHelper> helper(
+      manager->createInstanceWithContext("com.sun.star.frame.DispatchHelper",
+                                         context),
+      UNO_QUERY);
+  if (fault_injected("tracked-changes-no-dispatcher")) helper.clear();
+  if (!helper.is()) {
+    refusal.refuse(label + " has no dispatcher in the office core");
     return;
   }
+  Reference<css::frame::XController> controller = model->getCurrentController();
+  if (!controller.is()) {
+    refusal.refuse(label + " has no document view to run in");
+    return;
+  }
+  Reference<css::frame::XDispatchProvider> provider(controller->getFrame(),
+                                                    UNO_QUERY);
+  if (!provider.is()) {
+    refusal.refuse(label + " has no document frame to run in");
+    return;
+  }
+  helper->executeDispatch(provider, oustring(command), oustring("_self"), 0,
+                          css::uno::Sequence<css::beans::PropertyValue>());
+}
+
+// How many tracked changes the document still records; nullopt when the
+// document does not expose its redline list.
+std::optional<int> count_redlines(const Reference<css::frame::XModel>& model) {
+  Reference<css::document::XRedlinesSupplier> supplier(model, UNO_QUERY);
+  if (!supplier.is()) return std::nullopt;
+  Reference<css::container::XEnumerationAccess> redlines(
+      supplier->getRedlines(), UNO_QUERY);
+  if (!redlines.is()) return std::nullopt;
+  Reference<css::container::XEnumeration> it = redlines->createEnumeration();
+  int count = 0;
+  while (it.is() && it->hasMoreElements()) {
+    it->nextElement();
+    count++;
+  }
+  return count;
+}
+
+// Applies the requested tracked-change display, then checks the document
+// took it: accepting or rejecting every change must leave no change behind,
+// and markup display must read back as on. Only text documents carry
+// redlines, so the option asks nothing of the other document classes.
+void apply_tracked_changes(const Reference<css::frame::XModel>& model,
+                           const Reference<css::uno::XComponentContext>& context,
+                           int display, OptionRefusal& refusal) {
+  if (!wants_tracked_changes(display)) return;
+  if (display != officev1::TRACKED_CHANGE_DISPLAY_FINAL &&
+      display != officev1::TRACKED_CHANGE_DISPLAY_ORIGINAL &&
+      display != officev1::TRACKED_CHANGE_DISPLAY_SHOW_MARKUP) {
+    refusal.refuse("tracked_changes could not be applied: value "
+                   + std::to_string(display)
+                   + " is not a display mode this service knows");
+    return;
+  }
+  Reference<css::text::XTextDocument> text_doc(model, UNO_QUERY);
+  if (!text_doc.is()) return;
   try {
-    Reference<css::frame::XController> controller = model->getCurrentController();
-    Reference<css::beans::XPropertySet> view(controller, UNO_QUERY);
-    if (display == officev1::TRACKED_CHANGE_DISPLAY_FINAL) {
-      dispatch_uno(model, context, ".uno:AcceptAllTrackedChanges", warner);
-      if (view.is()) {
-        view->setPropertyValue("ShowRedlineChanges", css::uno::Any(false));
+    if (display == officev1::TRACKED_CHANGE_DISPLAY_SHOW_MARKUP) {
+      Reference<css::beans::XPropertySet> view(model->getCurrentController(),
+                                               UNO_QUERY);
+      if (!view.is()) {
+        refusal.refuse("tracked_changes could not be applied: the document "
+                       "has no view to show markup in");
+        return;
       }
-    } else if (display == officev1::TRACKED_CHANGE_DISPLAY_ORIGINAL) {
-      dispatch_uno(model, context, ".uno:RejectAllTrackedChanges", warner);
-    } else if (display == officev1::TRACKED_CHANGE_DISPLAY_SHOW_MARKUP) {
-      if (view.is()) {
-        view->setPropertyValue("ShowRedlineChanges", css::uno::Any(true));
+      view->setPropertyValue("ShowRedlineChanges", css::uno::Any(true));
+      bool shown = false;
+      view->getPropertyValue("ShowRedlineChanges") >>= shown;
+      if (!shown) {
+        refusal.refuse("tracked_changes could not be applied: the document "
+                       "view did not switch markup display on");
       }
+      return;
+    }
+    const bool accept = display == officev1::TRACKED_CHANGE_DISPLAY_FINAL;
+    dispatch_tracked_change_command(
+        model, context,
+        accept ? ".uno:AcceptAllTrackedChanges" : ".uno:RejectAllTrackedChanges",
+        refusal);
+    if (refusal.refused()) return;
+    std::optional<int> remaining = count_redlines(model);
+    if (!remaining.has_value()) {
+      refusal.refuse("tracked_changes could not be applied: the document's "
+                     "tracked changes cannot be listed to confirm the result");
+    } else if (*remaining != 0) {
+      refusal.refuse(std::string("tracked_changes could not be applied: ")
+                     + std::to_string(*remaining) + " tracked changes remain "
+                     "after " + (accept ? "accepting" : "rejecting")
+                     + " all of them");
     }
   } catch (const css::uno::Exception& error) {
-    warner.warn("tracked-change display", error);
+    refusal.refuse("tracked_changes could not be applied: "
+                   + utf8(error.Message));
   }
 }
 
-bool parse_bool_value(const std::string& value) {
+// Reads a checkbox value: true/1/yes/on or false/0/no/off, any letter case.
+// Anything else is no flag at all, never a quiet false.
+std::optional<bool> parse_flag(const std::string& value) {
   std::string lower = value;
   for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  return lower == "true" || lower == "1" || lower == "yes" || lower == "on";
-}
-
-void fill_one_fieldmark(const Reference<css::text::XFormField>& fieldmark,
-                        const std::string& value, Warner& warner) {
-  try {
-    Reference<css::container::XNameContainer> parameters =
-        fieldmark->getParameters();
-    if (parameters.is() && parameters->hasByName("Checkbox_Checked")) {
-      parameters->replaceByName("Checkbox_Checked",
-                                css::uno::Any(parse_bool_value(value)));
-      return;
-    }
-    if (parameters.is() && (parameters->hasByName("Dropdown_Selected") ||
-                            parameters->hasByName("Dropdown_ListEntry"))) {
-      sal_Int32 selected = -1;
-      try {
-        selected = static_cast<sal_Int32>(std::stol(value));
-      } catch (...) {
-        css::uno::Any entries;
-        try {
-          parameters->getByName("Dropdown_ListEntry") >>= entries;
-        } catch (const css::uno::Exception&) {
-        }
-        css::uno::Sequence<rtl::OUString> list;
-        if (entries >>= list) {
-          for (sal_Int32 i = 0; i < list.getLength(); i++) {
-            if (utf8(list[i]) == value) {
-              selected = i;
-              break;
-            }
-          }
-        }
-      }
-      if (selected >= 0) {
-        parameters->replaceByName("Dropdown_Selected", css::uno::Any(selected));
-      }
-      return;
-    }
-    Reference<css::text::XTextContent> content(fieldmark, UNO_QUERY);
-    if (content.is()) {
-      Reference<css::text::XTextRange> range = content->getAnchor();
-      if (range.is()) range->setString(oustring(value));
-    }
-  } catch (const css::uno::Exception& error) {
-    warner.warn("form fill fieldmark", error);
+  if (lower == "true" || lower == "1" || lower == "yes" || lower == "on") {
+    return true;
   }
+  if (lower == "false" || lower == "0" || lower == "no" || lower == "off") {
+    return false;
+  }
+  return std::nullopt;
 }
 
-void apply_form_fills(const Reference<css::frame::XModel>& model,
-                      const std::vector<std::pair<std::string, std::string>>& values,
-                      Warner& warner) {
-  if (values.empty()) return;
-  std::map<std::string, std::string> by_name(values.begin(), values.end());
-  try {
+// Resolves a list value to an entry index: the entry's own text first, then
+// a whole-string zero-based index inside the list.
+std::optional<sal_Int32> list_entry_index(
+    const std::string& value,
+    const css::uno::Sequence<rtl::OUString>& entries) {
+  for (sal_Int32 i = 0; i < entries.getLength(); i++) {
+    if (utf8(entries[i]) == value) return i;
+  }
+  sal_Int32 index = -1;
+  const char* end = value.data() + value.size();
+  auto parsed = std::from_chars(value.data(), end, index);
+  if (parsed.ec != std::errc() || parsed.ptr != end) return std::nullopt;
+  if (index < 0 || index >= entries.getLength()) return std::nullopt;
+  return index;
+}
+
+// The result text of a text fieldmark and the positions that bound it: what
+// sits between the field's separator and its end mark, read through the
+// same portion enumeration the extraction walks. Writing anywhere wider
+// lands outside the field or takes the field marks with it.
+struct FieldmarkResult {
+  // True when both ends of the field were met in its paragraph.
+  bool found = false;
+  // The text the field lives in.
+  Reference<css::text::XText> text;
+  // Where the result starts.
+  Reference<css::text::XTextRange> start;
+  // Where the result ends: just before the field's end mark.
+  Reference<css::text::XTextRange> end;
+  // The result text as it stands.
+  std::string value;
+};
+
+FieldmarkResult locate_fieldmark_result(
+    const Reference<css::text::XFormField>& fieldmark) {
+  FieldmarkResult result;
+  Reference<css::text::XTextContent> content(fieldmark, UNO_QUERY);
+  Reference<css::container::XNamed> named(fieldmark, UNO_QUERY);
+  if (!content.is() || !named.is()) return result;
+  const rtl::OUString name = named->getName();
+  Reference<css::text::XTextRange> anchor = content->getAnchor();
+  if (!anchor.is()) return result;
+  result.text = anchor->getText();
+  if (!result.text.is()) return result;
+  Reference<css::text::XParagraphCursor> cursor(
+      result.text->createTextCursorByRange(anchor->getStart()), UNO_QUERY);
+  if (!cursor.is()) return result;
+  cursor->gotoStartOfParagraph(false);
+  cursor->gotoEndOfParagraph(true);
+  Reference<css::container::XEnumerationAccess> paragraphs(cursor, UNO_QUERY);
+  if (!paragraphs.is()) return result;
+  Reference<css::container::XEnumeration> paragraph_it =
+      paragraphs->createEnumeration();
+  bool inside = false;
+  while (paragraph_it.is() && paragraph_it->hasMoreElements()) {
+    Reference<css::container::XEnumerationAccess> portions(
+        paragraph_it->nextElement(), UNO_QUERY);
+    if (!portions.is()) continue;
+    Reference<css::container::XEnumeration> portion_it =
+        portions->createEnumeration();
+    while (portion_it.is() && portion_it->hasMoreElements()) {
+      Reference<css::text::XTextRange> range(portion_it->nextElement(),
+                                             UNO_QUERY);
+      Reference<css::beans::XPropertySet> props(range, UNO_QUERY);
+      if (!range.is() || !props.is()) continue;
+      rtl::OUString type;
+      props->getPropertyValue("TextPortionType") >>= type;
+      if (!inside) {
+        if (type != "TextFieldStart") continue;
+        Reference<css::container::XNamed> mark;
+        props->getPropertyValue("Bookmark") >>= mark;
+        if (!mark.is() || mark->getName() != name) continue;
+        inside = true;
+        continue;
+      }
+      if (type == "TextFieldSeparator") {
+        // What came before the separator is the field's command.
+        result.start.clear();
+        result.value.clear();
+      } else if (type == "TextFieldEnd") {
+        result.end = range->getStart();
+        if (!result.start.is()) result.start = result.end;
+        result.found = true;
+        return result;
+      } else if (type == "Text") {
+        if (!result.start.is()) result.start = range->getStart();
+        result.value += utf8(range->getString());
+      }
+    }
+  }
+  return result;
+}
+
+// Writes the request's form values into the loaded document and proves
+// each one landed. Every requested name must reach at least one draw-page
+// control or fieldmark, every value must be one its field can take, and a
+// second walk reads each written field back. Anything short of that is a
+// refusal: a render that shows an unfilled form as if it had been filled is
+// worse than no render.
+class FormFiller {
+ public:
+  FormFiller(const std::vector<std::pair<std::string, std::string>>& values,
+             OptionRefusal& refusal)
+      : refusal_(refusal) {
+    for (const auto& value : values) {
+      auto inserted = by_name_.insert(value);
+      if (!inserted.second && inserted.first->second != value.second) {
+        refusal_.refuse("form_values could not be applied: '" + value.first
+                        + "' is given two different values");
+      }
+    }
+  }
+
+  void run(const Reference<css::frame::XModel>& model) {
+    if (refusal_.refused()) return;
+    try {
+      // A document that records changes would keep the stored value as a
+      // tracked deletion beside the written one, and both would be painted
+      // and extracted. The fill is the caller's input, not an edit to
+      // track, so recording is off while it is written and restored after.
+      Reference<css::beans::XPropertySet> document_props(model, UNO_QUERY);
+      Reference<css::beans::XPropertySetInfo> info =
+          document_props.is() ? document_props->getPropertySetInfo() : nullptr;
+      bool recording = false;
+      const bool records = info.is() && info->hasPropertyByName("RecordChanges");
+      if (records) {
+        document_props->getPropertyValue("RecordChanges") >>= recording;
+        if (recording) {
+          document_props->setPropertyValue("RecordChanges",
+                                           css::uno::Any(false));
+        }
+      }
+      walk(model, Pass::kWrite);
+      if (records && recording) {
+        document_props->setPropertyValue("RecordChanges", css::uno::Any(true));
+      }
+      if (refusal_.refused()) return;
+      for (const auto& value : by_name_) {
+        if (matched_.count(value.first) == 0) {
+          refusal_.refuse("form_values could not be applied: no form field "
+                          "is named '" + value.first + "'");
+          return;
+        }
+      }
+      walk(model, Pass::kVerify);
+    } catch (const css::uno::Exception& error) {
+      refusal_.refuse("form_values could not be applied: "
+                      + utf8(error.Message));
+    }
+  }
+
+ private:
+  enum class Pass {
+    // Writes each matched field.
+    kWrite,
+    // Reads each matched field back against the value written.
+    kVerify,
+  };
+
+  void walk(const Reference<css::frame::XModel>& model, Pass pass) {
     Reference<css::drawing::XDrawPagesSupplier> pages(model, UNO_QUERY);
+    Reference<css::drawing::XDrawPageSupplier> page(model, UNO_QUERY);
     if (pages.is()) {
       Reference<css::drawing::XDrawPages> list = pages->getDrawPages();
       for (sal_Int32 i = 0; list.is() && i < list->getCount(); i++) {
         Reference<css::drawing::XShapes> shapes(list->getByIndex(i), UNO_QUERY);
-        if (!shapes.is()) continue;
-        for (sal_Int32 s = 0; s < shapes->getCount(); s++) {
-          Reference<css::drawing::XControlShape> control(
-              shapes->getByIndex(s), UNO_QUERY);
-          if (!control.is()) continue;
-          Reference<css::beans::XPropertySet> props(control->getControl(),
-                                                    UNO_QUERY);
-          if (!props.is()) continue;
-          rtl::OUString name;
-          try {
-            props->getPropertyValue("Name") >>= name;
-          } catch (const css::uno::Exception&) {
-            continue;
-          }
-          auto found = by_name.find(utf8(name));
-          if (found == by_name.end()) continue;
-          try {
-            props->setPropertyValue("Text", css::uno::Any(oustring(found->second)));
-          } catch (const css::uno::Exception&) {
-          }
-          try {
-            props->setPropertyValue("State",
-                                    css::uno::Any(static_cast<sal_Int16>(
-                                        parse_bool_value(found->second) ? 1 : 0)));
-          } catch (const css::uno::Exception&) {
-          }
-        }
+        if (shapes.is()) walk_controls(shapes, 0, pass);
       }
+    } else if (page.is()) {
+      Reference<css::drawing::XShapes> shapes(page->getDrawPage(), UNO_QUERY);
+      if (shapes.is()) walk_controls(shapes, 0, pass);
     }
-  } catch (const css::uno::Exception& error) {
-    warner.warn("form fill controls", error);
-  }
-  try {
-    Reference<css::text::XTextDocument> text_doc(model, UNO_QUERY);
-    if (!text_doc.is()) return;
-    Reference<css::text::XTextFieldsSupplier> fields(text_doc, UNO_QUERY);
+    Reference<css::text::XTextFieldsSupplier> fields(model, UNO_QUERY);
     if (!fields.is()) return;
-    Reference<css::container::XEnumerationAccess> access = fields->getTextFields();
+    Reference<css::container::XEnumerationAccess> access =
+        fields->getTextFields();
     if (!access.is()) return;
+    // Collected before any write: a write edits the text the enumeration
+    // walks.
+    std::vector<std::pair<Reference<css::text::XFormField>,
+                          std::map<std::string, std::string>::const_iterator>>
+        targets;
     Reference<css::container::XEnumeration> it = access->createEnumeration();
-    while (it->hasMoreElements()) {
+    while (it.is() && it->hasMoreElements()) {
       Reference<css::text::XFormField> fieldmark(it->nextElement(), UNO_QUERY);
       if (!fieldmark.is()) continue;
       Reference<css::container::XNamed> named(fieldmark, UNO_QUERY);
@@ -5350,15 +5527,232 @@ void apply_form_fills(const Reference<css::frame::XModel>& model,
       // Matched by the name the extraction reports, which is the stable form
       // of an import-generated name.
       const std::string name = utf8(named->getName());
-      auto found = by_name.find(stable_mark_name(name));
-      if (found == by_name.end()) found = by_name.find(name);
-      if (found == by_name.end()) continue;
-      fill_one_fieldmark(fieldmark, found->second, warner);
+      auto found = by_name_.find(stable_mark_name(name));
+      if (found == by_name_.end()) found = by_name_.find(name);
+      if (found == by_name_.end()) continue;
+      targets.emplace_back(fieldmark, found);
     }
-  } catch (const css::uno::Exception& error) {
-    warner.warn("form fill fields", error);
+    for (const auto& target : targets) {
+      matched_.insert(target.second->first);
+      visit_fieldmark(target.first, target.second->first,
+                      target.second->second, pass);
+    }
   }
-}
+
+  // Visits the controls of one shape container, grouped ones included.
+  // Children past kMaxShapeGroupDepth are not descended; a name that only
+  // lives there stays unmatched and refuses the request.
+  void walk_controls(const Reference<css::drawing::XShapes>& shapes, int depth,
+                     Pass pass) {
+    for (sal_Int32 s = 0; s < shapes->getCount(); s++) {
+      css::uno::Any item = shapes->getByIndex(s);
+      Reference<css::drawing::XControlShape> control(item, UNO_QUERY);
+      if (control.is()) {
+        visit_control(control, pass);
+        continue;
+      }
+      Reference<css::drawing::XShapes> children(item, UNO_QUERY);
+      if (children.is() && depth < kMaxShapeGroupDepth) {
+        walk_controls(children, depth + 1, pass);
+      }
+    }
+  }
+
+  void visit_control(const Reference<css::drawing::XControlShape>& control,
+                     Pass pass) {
+    Reference<css::beans::XPropertySet> props(control->getControl(), UNO_QUERY);
+    if (!props.is()) return;
+    Reference<css::beans::XPropertySetInfo> info = props->getPropertySetInfo();
+    auto has_property = [&](const char* name) {
+      return info.is() &&
+             info->hasPropertyByName(rtl::OUString::createFromAscii(name));
+    };
+    if (!has_property("Name")) return;
+    rtl::OUString control_name;
+    props->getPropertyValue("Name") >>= control_name;
+    auto found = by_name_.find(utf8(control_name));
+    if (found == by_name_.end()) return;
+    matched_.insert(found->first);
+    const std::string& value = found->second;
+    const std::string label =
+        "form_values could not be applied: control '" + found->first + "'";
+    try {
+      if (has_property("State")) {
+        std::optional<bool> flag = parse_flag(value);
+        if (!flag.has_value()) {
+          refusal_.refuse(label + " is a checkbox or option button and takes "
+                          "true or false");
+          return;
+        }
+        const sal_Int16 wanted = *flag ? 1 : 0;
+        if (pass == Pass::kWrite) {
+          props->setPropertyValue("State", css::uno::Any(wanted));
+          return;
+        }
+        sal_Int16 state = -1;
+        props->getPropertyValue("State") >>= state;
+        if (state != wanted) {
+          refusal_.refuse(label + " does not hold the state that was written");
+        }
+        return;
+      }
+      if (has_property("SelectedItems") && has_property("StringItemList")) {
+        css::uno::Sequence<rtl::OUString> entries;
+        props->getPropertyValue("StringItemList") >>= entries;
+        std::optional<sal_Int32> index = list_entry_index(value, entries);
+        if (!index.has_value() || *index > SAL_MAX_INT16) {
+          refusal_.refuse(label + " is a list and the value is neither one of "
+                          "its entries nor an entry index");
+          return;
+        }
+        const sal_Int16 wanted = static_cast<sal_Int16>(*index);
+        if (pass == Pass::kWrite) {
+          props->setPropertyValue(
+              "SelectedItems",
+              css::uno::Any(css::uno::Sequence<sal_Int16>{wanted}));
+          return;
+        }
+        css::uno::Sequence<sal_Int16> selected;
+        props->getPropertyValue("SelectedItems") >>= selected;
+        if (selected.getLength() != 1 || selected[0] != wanted) {
+          refusal_.refuse(label + " does not hold the selection that was "
+                          "written");
+        }
+        return;
+      }
+      if (has_property("Text")) {
+        if (pass == Pass::kWrite) {
+          props->setPropertyValue("Text", css::uno::Any(oustring(value)));
+          return;
+        }
+        rtl::OUString text;
+        props->getPropertyValue("Text") >>= text;
+        if (utf8(text) != value) {
+          refusal_.refuse(label + " does not hold the text that was written");
+        }
+        return;
+      }
+      refusal_.refuse(label + " holds no text, state, or list selection to "
+                      "write");
+    } catch (const css::uno::Exception& error) {
+      refusal_.refuse(label + " could not be written: " + utf8(error.Message));
+    }
+  }
+
+  void visit_fieldmark(const Reference<css::text::XFormField>& fieldmark,
+                       const std::string& name, const std::string& value,
+                       Pass pass) {
+    const std::string label =
+        "form_values could not be applied: field '" + name + "'";
+    try {
+      const std::string type = utf8(fieldmark->getFieldType());
+      switch (form_field_kind(type)) {
+        case officev1::FORM_FIELD_KIND_CHECKBOX: {
+          std::optional<bool> flag = parse_flag(value);
+          if (!flag.has_value()) {
+            refusal_.refuse(label + " is a checkbox and takes true or false");
+            return;
+          }
+          Reference<css::container::XNameContainer> parameters =
+              fieldmark->getParameters();
+          if (!parameters.is()) {
+            refusal_.refuse(label + " exposes no parameters to write");
+            return;
+          }
+          if (pass == Pass::kWrite) {
+            put_parameter(parameters, "Checkbox_Checked", css::uno::Any(*flag));
+            return;
+          }
+          bool checked = false;
+          if (!parameters->hasByName("Checkbox_Checked") ||
+              !(parameters->getByName("Checkbox_Checked") >>= checked) ||
+              checked != *flag) {
+            refusal_.refuse(label + " does not hold the state that was "
+                            "written");
+          }
+          return;
+        }
+        case officev1::FORM_FIELD_KIND_DROPDOWN: {
+          Reference<css::container::XNameContainer> parameters =
+              fieldmark->getParameters();
+          if (!parameters.is()) {
+            refusal_.refuse(label + " exposes no parameters to write");
+            return;
+          }
+          css::uno::Sequence<rtl::OUString> entries;
+          if (parameters->hasByName("Dropdown_ListEntry")) {
+            parameters->getByName("Dropdown_ListEntry") >>= entries;
+          }
+          std::optional<sal_Int32> index = list_entry_index(value, entries);
+          if (!index.has_value()) {
+            refusal_.refuse(label + " is a dropdown and the value is neither "
+                            "one of its entries nor an entry index");
+            return;
+          }
+          if (pass == Pass::kWrite) {
+            put_parameter(parameters, "Dropdown_Selected",
+                          css::uno::Any(*index));
+            return;
+          }
+          sal_Int32 selected = -1;
+          if (!parameters->hasByName("Dropdown_Selected") ||
+              !(parameters->getByName("Dropdown_Selected") >>= selected) ||
+              selected != *index) {
+            refusal_.refuse(label + " does not hold the selection that was "
+                            "written");
+          }
+          return;
+        }
+        case officev1::FORM_FIELD_KIND_TEXT: {
+          FieldmarkResult located = locate_fieldmark_result(fieldmark);
+          if (!located.found) {
+            refusal_.refuse(label + " has no result text inside one paragraph "
+                            "to write");
+            return;
+          }
+          if (pass == Pass::kWrite) {
+            Reference<css::text::XTextCursor> edit =
+                located.text->createTextCursorByRange(located.start);
+            if (!edit.is()) {
+              refusal_.refuse(label + " cannot be edited");
+              return;
+            }
+            edit->gotoRange(located.end, true);
+            edit->setString(oustring(value));
+            return;
+          }
+          if (located.value != value) {
+            refusal_.refuse(label + " does not hold the text that was "
+                            "written");
+          }
+          return;
+        }
+        default:
+          refusal_.refuse(label + " is a " + type
+                          + " field, which this service cannot fill");
+          return;
+      }
+    } catch (const css::uno::Exception& error) {
+      refusal_.refuse(label + " could not be written: " + utf8(error.Message));
+    }
+  }
+
+  // Stores one fieldmark parameter, whether or not the field carried it.
+  static void put_parameter(
+      const Reference<css::container::XNameContainer>& parameters,
+      const char* name, const css::uno::Any& value) {
+    const rtl::OUString key = rtl::OUString::createFromAscii(name);
+    if (parameters->hasByName(key)) {
+      parameters->replaceByName(key, value);
+    } else {
+      parameters->insertByName(key, value);
+    }
+  }
+
+  OptionRefusal& refusal_;
+  std::map<std::string, std::string> by_name_;
+  std::set<std::string> matched_;
+};
 
 // File-name fields print the path the worker loaded, a fresh temp directory
 // per request, on the rendered pages and in every export; two parses of the
@@ -6849,20 +7243,49 @@ std::int64_t annotation_space(const Reference<css::text::XTextDocument>& text_do
 
 void set_source_name(const std::string& name) { source_name_storage() = name; }
 
-void apply_document_options(const RenderOptions& options,
-                            std::vector<std::string>* warnings) {
+DocumentOptionsResult apply_document_options(
+    const RenderOptions& options, std::vector<std::string>* warnings) {
   Warner warner(warnings);
+  DocumentOptionsResult result;
+  std::string requested;
+  if (wants_tracked_changes(options.tracked_changes)) {
+    requested = "tracked_changes";
+  }
+  if (!options.form_values.empty()) {
+    requested += requested.empty() ? "form_values" : " and form_values";
+  }
+  // A request that asked for neither option loses only the file-name pin
+  // when the document cannot be reached, which is a warning. One that asked
+  // for either gets what it asked for or a refusal.
+  auto unreachable = [&](const std::string& why) {
+    if (requested.empty()) {
+      warner.warn("apply document options: " + why);
+      return result;
+    }
+    result.ok = false;
+    result.refusal = requested + " could not be applied: " + why;
+    return result;
+  };
   try {
     Reference<css::uno::XComponentContext> context = process_context();
-    if (!context.is()) return;
+    if (!context.is()) return unreachable("the office core has no UNO context");
     Reference<css::frame::XModel> model = find_loaded_model(context);
-    if (!model.is()) return;
+    if (fault_injected("document-options-no-model")) model.clear();
+    if (!model.is()) return unreachable("the loaded document cannot be reached");
     pin_file_name_fields(model, warner);
-    apply_tracked_changes(model, context, options.tracked_changes, warner);
-    apply_form_fills(model, options.form_values, warner);
+    OptionRefusal refusal;
+    apply_tracked_changes(model, context, options.tracked_changes, refusal);
+    if (!refusal.refused() && !options.form_values.empty()) {
+      FormFiller(options.form_values, refusal).run(model);
+    }
+    if (refusal.refused()) {
+      result.ok = false;
+      result.refusal = refusal.reason();
+    }
   } catch (const css::uno::Exception& error) {
-    warner.warn("apply document options", error);
+    return unreachable(utf8(error.Message));
   }
+  return result;
 }
 
 RedactionResult apply_redaction(const RenderOptions& options,
@@ -7104,6 +7527,7 @@ void describe_parts(std::vector<PartLayout>* parts,
     Reference<css::uno::XComponentContext> context = process_context();
     if (!context.is()) return;
     Reference<css::frame::XModel> model = find_loaded_model(context);
+    if (fault_injected("describe-parts-no-model")) model.clear();
     if (!model.is()) return;
     Reference<css::sheet::XSpreadsheetDocument> calc(model, UNO_QUERY);
     if (calc.is()) {
@@ -7117,11 +7541,21 @@ void describe_parts(std::vector<PartLayout>* parts,
         Reference<css::beans::XPropertySet> props(sheet, UNO_QUERY);
         if (props.is()) {
           try {
-            props->getPropertyValue("IsVisible") >>= layout.visible;
-          } catch (const css::uno::Exception&) {
+            if (fault_injected("describe-parts-visibility-throws")) {
+              throw css::uno::RuntimeException(
+                  "injected fault: the visibility read throws");
+            }
+            layout.visibility_known =
+                (props->getPropertyValue("IsVisible") >>= layout.visible);
+          } catch (const css::uno::Exception& error) {
+            warner.warn("visibility of sheet " + std::to_string(i), error);
           }
         }
         try {
+          if (fault_injected("describe-parts-used-range-throws")) {
+            throw css::uno::RuntimeException(
+                "injected fault: the used-range read throws");
+          }
           Reference<css::sheet::XSheetCellCursor> cursor =
               sheet->createCursor();
           Reference<css::sheet::XUsedAreaCursor> area(cursor, UNO_QUERY);
@@ -7182,6 +7616,7 @@ void describe_parts(std::vector<PartLayout>* parts,
             layout.used_y = y;
             layout.used_width = width;
             layout.used_height = height;
+            layout.used_range_known = addressable.is() && col_rows.is();
           }
         } catch (const css::uno::Exception& error) {
           warner.warn("used range for sheet " + std::to_string(i), error);
@@ -7198,15 +7633,26 @@ void describe_parts(std::vector<PartLayout>* parts,
       PartLayout layout;
       Reference<css::beans::XPropertySet> props(list->getByIndex(i), UNO_QUERY);
       if (props.is()) {
+        // A slide answers Visible; older page classes answer Hidden. A
+        // page class with neither property (a drawing page) has no hidden
+        // state, which is an answer: shown. Any other failure leaves the
+        // visibility unknown.
         try {
-          props->getPropertyValue("Visible") >>= layout.visible;
-        } catch (const css::uno::Exception&) {
+          layout.visibility_known =
+              (props->getPropertyValue("Visible") >>= layout.visible);
+        } catch (const css::beans::UnknownPropertyException&) {
           try {
             bool hidden = false;
-            props->getPropertyValue("Hidden") >>= hidden;
+            layout.visibility_known =
+                (props->getPropertyValue("Hidden") >>= hidden);
             layout.visible = !hidden;
-          } catch (const css::uno::Exception&) {
+          } catch (const css::beans::UnknownPropertyException&) {
+            layout.visibility_known = true;
+          } catch (const css::uno::Exception& error) {
+            warner.warn("visibility of page " + std::to_string(i), error);
           }
+        } catch (const css::uno::Exception& error) {
+          warner.warn("visibility of page " + std::to_string(i), error);
         }
       }
       parts->push_back(layout);
