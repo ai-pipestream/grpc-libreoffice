@@ -652,6 +652,15 @@ grpc::Status RenderServiceImpl::render(
       return {grpc::StatusCode::FAILED_PRECONDITION,
               reason.empty() ? outcome.detail : reason};
     }
+    case WorkerOutcome::Kind::kOptionRefused: {
+      // The request asked for something the worker could not do to this
+      // document (leave hidden parts out, crop to the used range) and that
+      // it will not quietly skip; nothing was streamed.
+      rejected++;
+      const std::string reason = worker_reason();
+      return {grpc::StatusCode::FAILED_PRECONDITION,
+              reason.empty() ? outcome.detail : reason};
+    }
     case WorkerOutcome::Kind::kExtractionFailed: {
       // The service's failure, not the caller's: the document loaded and
       // its pages may have streamed, but the typed content asked for could

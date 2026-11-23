@@ -7087,8 +7087,10 @@ void describe_parts(std::vector<PartLayout>* parts,
               throw css::uno::RuntimeException(
                   "injected fault: the visibility read throws");
             }
-            props->getPropertyValue("IsVisible") >>= layout.visible;
-          } catch (const css::uno::Exception&) {
+            layout.visibility_known =
+                (props->getPropertyValue("IsVisible") >>= layout.visible);
+          } catch (const css::uno::Exception& error) {
+            warner.warn("visibility of sheet " + std::to_string(i), error);
           }
         }
         try {
@@ -7156,6 +7158,7 @@ void describe_parts(std::vector<PartLayout>* parts,
             layout.used_y = y;
             layout.used_width = width;
             layout.used_height = height;
+            layout.used_range_known = addressable.is() && col_rows.is();
           }
         } catch (const css::uno::Exception& error) {
           warner.warn("used range for sheet " + std::to_string(i), error);
@@ -7172,15 +7175,26 @@ void describe_parts(std::vector<PartLayout>* parts,
       PartLayout layout;
       Reference<css::beans::XPropertySet> props(list->getByIndex(i), UNO_QUERY);
       if (props.is()) {
+        // A slide answers Visible; older page classes answer Hidden. A
+        // page class with neither property (a drawing page) has no hidden
+        // state, which is an answer: shown. Any other failure leaves the
+        // visibility unknown.
         try {
-          props->getPropertyValue("Visible") >>= layout.visible;
-        } catch (const css::uno::Exception&) {
+          layout.visibility_known =
+              (props->getPropertyValue("Visible") >>= layout.visible);
+        } catch (const css::beans::UnknownPropertyException&) {
           try {
             bool hidden = false;
-            props->getPropertyValue("Hidden") >>= hidden;
+            layout.visibility_known =
+                (props->getPropertyValue("Hidden") >>= hidden);
             layout.visible = !hidden;
-          } catch (const css::uno::Exception&) {
+          } catch (const css::beans::UnknownPropertyException&) {
+            layout.visibility_known = true;
+          } catch (const css::uno::Exception& error) {
+            warner.warn("visibility of page " + std::to_string(i), error);
           }
+        } catch (const css::uno::Exception& error) {
+          warner.warn("visibility of page " + std::to_string(i), error);
         }
       }
       parts->push_back(layout);

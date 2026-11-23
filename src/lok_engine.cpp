@@ -557,6 +557,38 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
 
   std::vector<PartLayout> layouts;
   describe_parts(&layouts, &option_warnings);
+  // An option that selects what is painted is applied or refused, never
+  // accepted and dropped. skip_hidden exists so that hidden sheets and
+  // slides, which often hold what the author did not want shown, are not
+  // rendered; if the visibility of a part cannot be read, painting it under
+  // STATE_OK would do exactly what the caller asked to prevent. The same
+  // holds for a used-range crop the sheet would not give up. Nothing has
+  // been emitted yet.
+  const bool hides_parts = type == LOK_DOCTYPE_SPREADSHEET
+      || type == LOK_DOCTYPE_PRESENTATION;
+  for (const PageRect& page : pages) {
+    const PartLayout* layout =
+        page.part >= 0 && static_cast<size_t>(page.part) < layouts.size()
+            ? &layouts[static_cast<size_t>(page.part)]
+            : nullptr;
+    const char* part_kind =
+        type == LOK_DOCTYPE_SPREADSHEET ? "sheet " : "slide ";
+    if (options.skip_hidden && hides_parts
+        && (layout == nullptr || !layout->visibility_known)) {
+      *error = "skip_hidden refused: the visibility of " + std::string(part_kind)
+          + std::to_string(page.part) + " could not be read, so hidden parts "
+          "cannot be told from shown ones";
+      delete document;
+      return kExitOptionRefused;
+    }
+    if (options.paint_used_range && type == LOK_DOCTYPE_SPREADSHEET
+        && (layout == nullptr || !layout->used_range_known)) {
+      *error = "paint_used_range refused: the used range of sheet "
+          + std::to_string(page.part) + " could not be read";
+      delete document;
+      return kExitOptionRefused;
+    }
+  }
   if ((options.skip_hidden || options.paint_used_range) && !layouts.empty()
       && type != LOK_DOCTYPE_TEXT) {
     std::vector<PageRect> filtered;

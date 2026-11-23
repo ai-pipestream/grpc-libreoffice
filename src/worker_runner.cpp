@@ -147,6 +147,10 @@ WorkerOutcome finish(pid_t pid, bool kill_first, WorkerOutcome::Kind kind_on_exi
       outcome.kind = WorkerOutcome::Kind::kExtractionFailed;
       outcome.detail = "typed content extraction failed; the events already "
                        "sent are incomplete";
+    } else if (code == kExitOptionRefused) {
+      outcome.kind = WorkerOutcome::Kind::kOptionRefused;
+      outcome.detail = "a requested option could not be applied to this "
+                       "document";
     } else if (code == kExitWorkDirNotTmpfs) {
       outcome.kind = WorkerOutcome::Kind::kWorkDirNotTmpfs;
       outcome.detail = "the worker's work dir is not on tmpfs; the server "
