@@ -1819,7 +1819,7 @@ const char kEmbeddedFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
        <table:table-rows>
         <table:table-row><table:table-cell office:value-type="string"><text:p>Q1</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="1"><text:p>1</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="4"><text:p>4</text:p></table:table-cell></table:table-row>
         <table:table-row><table:table-cell office:value-type="string"><text:p>Q2</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="2"><text:p>2</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="5"><text:p>5</text:p></table:table-cell></table:table-row>
-        <table:table-row><table:table-cell office:value-type="string"><text:p>Q3</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="3"><text:p>3</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="6"><text:p>6</text:p></table:table-cell></table:table-row>
+        <table:table-row><table:table-cell office:value-type="string"><text:p>Q3</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="3"><text:p>3</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="1234567.89"><text:p>1234567.89</text:p></table:table-cell></table:table-row>
        </table:table-rows>
       </table:table>
      </chart:chart>
@@ -1868,7 +1868,7 @@ void verify_embedded_objects() {
           chart.series(0).values_y(0) == 1.0 &&
           chart.series(0).values_y(2) == 3.0 &&
           chart.series(1).values_y_size() == 3 &&
-          chart.series(1).values_y(2) == 6.0 &&
+          chart.series(1).values_y(2) == 1234567.89 &&
           chart.series(0).label() == "Alpha" &&
           chart.series(1).label() == "Beta";
       bool categories_ok = chart.categories_size() == 3 &&
@@ -1877,6 +1877,15 @@ void verify_embedded_objects() {
       bool tabular_ok = chart.tabular().rows() == 4 &&
                         chart.tabular().columns() == 3 &&
                         chart.tabular().cells_size() > 0;
+      // The grid text of a value is its exact shortest form, never a
+      // rounded one such as 1.23457e+06.
+      std::string precise_text;
+      for (const officev1::TableCellData& cell : chart.tabular().cells()) {
+        if (cell.row() == 3 && cell.column() == 2) precise_text = cell.text();
+      }
+      require(precise_text == "1234567.89",
+              "the tabular projection keeps the value exactly, got: "
+                  + precise_text);
       // The replacement graphic of a chart is a metafile inside the office
       // core; on the wire it is a PNG or nothing, never a metafile.
       bool replacement_ok =

@@ -4128,12 +4128,72 @@ bool emit_calc_content(
   return true;
 }
 
-// Formats a double for the tabular chart projection. The typed series keep
-// the values numeric; this text is only the grid projection.
+// Formats a double for the tabular chart projection: the shortest text
+// that reads back as exactly the same double, so the grid never holds a
+// rounded copy of a value the typed series carry in full.
 std::string double_text(double value) {
-  char buffer[32];
-  std::snprintf(buffer, sizeof buffer, "%g", value);
-  return buffer;
+  char buffer[64];
+  auto result = std::to_chars(buffer, buffer + sizeof buffer, value);
+  return std::string(buffer, result.ptr);
+}
+
+
+// The tabular projection of a chart: a label row on top and one row per
+// data point. Category charts put the categories down the first column and
+// one series' y values in each further column. Scatter and bubble charts
+// have no categories: the first column numbers the points from 1, and each
+// series gets an x and a y column (and a size column for bubbles), headed
+// "<label> (x)", "<label> (y)", "<label> (size)", so no coordinate is left
+// out of the grid.
+void fill_chart_tabular(officev1::EmbeddedChart* out) {
+  struct Column {
+    std::string header;
+    const google::protobuf::RepeatedField<double>* values;
+  };
+  const bool xy = out->kind() == officev1::EMBEDDED_CHART_KIND_SCATTER ||
+                  out->kind() == officev1::EMBEDDED_CHART_KIND_BUBBLE;
+  std::vector<Column> columns;
+  int rows = xy ? 0 : out->categories_size();
+  for (const officev1::EmbeddedChartSeries& series : out->series()) {
+    if (xy) {
+      columns.push_back({series.label() + " (x)", &series.values_x()});
+      columns.push_back({series.label() + " (y)", &series.values_y()});
+      if (out->kind() == officev1::EMBEDDED_CHART_KIND_BUBBLE) {
+        columns.push_back({series.label() + " (size)", &series.sizes()});
+      }
+    } else {
+      columns.push_back({series.label(), &series.values_y()});
+    }
+  }
+  for (const Column& column : columns) {
+    rows = std::max(rows, column.values->size());
+  }
+  officev1::TableData* grid = out->mutable_tabular();
+  grid->set_rows(rows + 1);
+  grid->set_columns(static_cast<int32_t>(columns.size()) + 1);
+  for (size_t column = 0; column < columns.size(); column++) {
+    officev1::TableCellData* cell = grid->add_cells();
+    cell->set_row(0);
+    cell->set_column(static_cast<int32_t>(column) + 1);
+    cell->set_text(columns[column].header);
+  }
+  for (int row = 0; row < rows; row++) {
+    officev1::TableCellData* head = grid->add_cells();
+    head->set_row(row + 1);
+    head->set_column(0);
+    if (xy) {
+      head->set_text(std::to_string(row + 1));
+    } else if (row < out->categories_size()) {
+      head->set_text(out->categories(row));
+    }
+    for (size_t column = 0; column < columns.size(); column++) {
+      if (row >= columns[column].values->size()) continue;
+      officev1::TableCellData* cell = grid->add_cells();
+      cell->set_row(row + 1);
+      cell->set_column(static_cast<int32_t>(column) + 1);
+      cell->set_text(double_text(columns[column].values->Get(row)));
+    }
+  }
 }
 
 // Concatenates a chart title's formatted string parts.
@@ -4287,35 +4347,7 @@ void fill_chart(const Reference<css::chart2::XChartDocument>& chart_doc,
   } catch (const css::uno::Exception& error) {
     warner.warn(label + " chart walk failed", error);
   }
-  // The tabular projection: a label row on top, categories down the first
-  // column, one series per further column.
-  officev1::TableData* grid = out->mutable_tabular();
-  int rows = out->categories_size();
-  for (const officev1::EmbeddedChartSeries& series : out->series()) {
-    rows = std::max(rows, series.values_y_size());
-  }
-  grid->set_rows(rows + 1);
-  grid->set_columns(out->series_size() + 1);
-  for (int column = 0; column < out->series_size(); column++) {
-    officev1::TableCellData* cell = grid->add_cells();
-    cell->set_row(0);
-    cell->set_column(column + 1);
-    cell->set_text(out->series(column).label());
-  }
-  for (int row = 0; row < rows; row++) {
-    officev1::TableCellData* head = grid->add_cells();
-    head->set_row(row + 1);
-    head->set_column(0);
-    if (row < out->categories_size()) head->set_text(out->categories(row));
-    for (int column = 0; column < out->series_size(); column++) {
-      const officev1::EmbeddedChartSeries& series = out->series(column);
-      if (row >= series.values_y_size()) continue;
-      officev1::TableCellData* cell = grid->add_cells();
-      cell->set_row(row + 1);
-      cell->set_column(column + 1);
-      cell->set_text(double_text(series.values_y(row)));
-    }
-  }
+  fill_chart_tabular(out);
 }
 
 // Projects an embedded spreadsheet's first non-empty sheet used range into

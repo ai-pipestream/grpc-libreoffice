@@ -192,8 +192,14 @@ Extraction side:
 
 Fold side:
 
-- **Chart series beyond the first** for bar, column, and pie charts. The
-  tabular projection keeps them all; the typed annotation keeps one.
+- **Chart series names on the typed annotations.** Bar, column, pie and
+  scatter charts get one typed annotation per series, in series order,
+  because the dialect's bar, pie and scatter data hold one series each;
+  the series name has no slot there and heads the matching column of the
+  tabular projection instead (scatter and bubble columns read
+  "<name> (x)", "<name> (y)", "<name> (size)"). Bubble sizes ride
+  `ChartPoint.size`, and every tabular value cell carries its exact
+  number in `CellValue.number` beside its text.
 - **A spreadsheet chart still mints two pictures**, one carrying the source
   ranges in `ChartMeta` and one carrying the typed chart data, and nothing
   links them.
