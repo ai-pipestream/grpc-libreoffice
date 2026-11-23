@@ -343,6 +343,13 @@ void verify_writer_stream() {
           "writer: status warnings surfaced");
   require_integrity(mapper, "writer");
   const docv1::Document& document = mapper.document();
+  // The worker's warnings travel with the Document itself, attributed to
+  // this collector, so a Document stored or forwarded without its response
+  // envelope still says what went wrong while it was read.
+  require(document.warnings_size() == 1 &&
+              document.warnings(0).message() == "one warning" &&
+              document.warnings(0).source().collector() == "libreoffice",
+          "writer: status warnings are on Document.warnings");
 
   require(document.name() == "Mapped Title", "writer: name from metadata title");
   require(document.origin().mimetype()
@@ -1859,6 +1866,9 @@ void verify_per_page_style() {
                 && mapper.warnings()[0].contains("Envelope")
                 && mapper.warnings()[0].contains("does not declare"),
             "page styles: an undeclared name is reported once");
+    require(document.warnings_size() == 1
+                && document.warnings(0).message().contains("Envelope"),
+            "page styles: the mapper's own warning is on Document.warnings");
   }
   {
     // Without the catalogue there is nothing to resolve against, so the
