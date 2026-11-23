@@ -378,9 +378,11 @@ int main(int argc, char** argv) {
   if (code != grlibre::kExitOk) {
     std::println(stderr, "grlibre-worker: {}", error);
   }
-  if (code == grlibre::kExitRedactionRefused) {
-    // The parent reads the reason back into the call's status; a refusal
-    // names regions and offsets, never document text.
+  if (code == grlibre::kExitRedactionRefused ||
+      code == grlibre::kExitExtractionFailed) {
+    // The parent reads the reason back into the call's status. A refusal
+    // names regions and offsets, never document text; a failed extraction
+    // names the office core's own error, with redacted text masked.
     std::ofstream refusal(options.work_dir + "/" + grlibre::kRefusalFile,
                           std::ios::binary);
     refusal << error;

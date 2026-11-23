@@ -30,6 +30,16 @@ struct PartSelection {
   bool explicit_wants(int part) const {
     return part > 0 && part < 32 && (mask & (1u << part)) != 0;
   }
+
+  // Whether any typed-content part is selected: anything beyond page
+  // images (DOCUMENT_PART_PAGES, 1) and the two line-rectangle modifiers
+  // (DOCUMENT_PART_LINE_RECTS, 15, and DOCUMENT_PART_CELL_LINE_RECTS, 16),
+  // which only add geometry to events selected by their own part.
+  bool wants_typed_content() const {
+    constexpr std::uint32_t kNoContent =
+        1u | (1u << 1) | (1u << 15) | (1u << 16);
+    return all || (mask & ~kNoContent) != 0;
+  }
 };
 
 // Everything one worker process needs to render one document.
@@ -119,8 +129,15 @@ inline constexpr int kExitRedactionRefused = 9;
 // The document is password-protected and no candidate password opened it
 // (none was supplied, or every one was wrong).
 inline constexpr int kExitPasswordRequired = 10;
-// Where a refusing worker leaves its human-readable reason, relative to
-// the work dir, for the parent to put in the call's status.
+// Typed content the caller selected could not be extracted: the office
+// core's UNO context or the loaded model could not be reached, or the walk
+// aborted part way. Page images and some typed events may already have
+// streamed; no terminal RenderStatus follows them, and the worker leaves
+// the reason in kRefusalFile under its work dir.
+inline constexpr int kExitExtractionFailed = 11;
+// Where a worker that refuses a request or fails an extraction leaves its
+// human-readable reason, relative to the work dir, for the parent to put in
+// the call's status.
 inline constexpr char kRefusalFile[] = "refusal.txt";
 
 // Loads the document through LibreOfficeKit and writes framed response

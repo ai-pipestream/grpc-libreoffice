@@ -108,8 +108,13 @@ at STANDARD plus COMMENTS):
   laid-out line in reading order, and body paragraph lines also carry the
   item-local code-point boundaries of each line's characters.
   Every event is emitted the moment it exists, so a caller can process page
-  images while typed content is still streaming. Extraction problems degrade
-  to `RenderStatus.warnings`, never a failed render.
+  images while typed content is still streaming. A problem with one item
+  (a property that will not read, an image that will not encode) lands in
+  `RenderStatus.warnings` and the walk goes on. Typed content that cannot be
+  extracted at all, because the office core's UNO context or the loaded
+  document cannot be reached or because the walk aborts part way, fails the
+  call with `INTERNAL` and the reason: the events already sent are then
+  incomplete, and no `RenderStatus` follows them.
 
   A request can select which parts are emitted through `StreamOptions`
   (`DocumentPart` values, page images included). An empty selection means
@@ -175,7 +180,8 @@ upload buffer is full), `UNIMPLEMENTED` (PDF input, see below),
 `allow_package_repair` opt-in, or a redaction that cannot be applied to the
 whole document), `DEADLINE_EXCEEDED` (per-document timeout or the caller's
 deadline, worker killed), `CANCELLED` (the caller cancelled; a running
-worker is killed), `INTERNAL` (worker crash). Health checking and
+worker is killed), `INTERNAL` (worker crash, or requested typed content
+that could not be extracted). Health checking and
 reflection are registered.
 
 A document whose zip package is broken but repairable is a special case:

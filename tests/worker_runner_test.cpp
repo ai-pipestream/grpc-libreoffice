@@ -71,7 +71,11 @@ void verify_exit_code_mapping() {
        grlibre::WorkerOutcome::Kind::kWorkDirNotTmpfs},
       {grlibre::kExitRedactionRefused,
        grlibre::WorkerOutcome::Kind::kRedactionRefused},
-      {11, grlibre::WorkerOutcome::Kind::kCrash},
+      {grlibre::kExitPasswordRequired,
+       grlibre::WorkerOutcome::Kind::kPasswordRequired},
+      {grlibre::kExitExtractionFailed,
+       grlibre::WorkerOutcome::Kind::kExtractionFailed},
+      {12, grlibre::WorkerOutcome::Kind::kCrash},
   };
   for (const auto& [code, kind] : cases) {
     auto outcome = run_stub("cat >/dev/null; exit " + std::to_string(code),
@@ -80,8 +84,8 @@ void verify_exit_code_mapping() {
             "exit " + std::to_string(code) + " maps to its outcome kind, got "
                 + outcome.detail);
   }
-  auto unknown = run_stub("cat >/dev/null; exit 11", "ignored", nullptr);
-  require(unknown.detail.contains("worker exited with code 11"),
+  auto unknown = run_stub("cat >/dev/null; exit 12", "ignored", nullptr);
+  require(unknown.detail.contains("worker exited with code 12"),
           "an unknown exit code lands in the crash detail");
 }
 

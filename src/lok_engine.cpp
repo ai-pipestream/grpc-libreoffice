@@ -689,16 +689,20 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
       }
     }
     // Pages have streamed; typed content follows from the same loaded
-    // document, each event emitted the moment it is extracted. Extraction
-    // problems degrade to status warnings, never a failed render. Under a
+    // document, each event emitted the moment it is extracted. A problem
+    // with one item degrades to a status warning; a walk that cannot start
+    // or aborts fails the render, because the events sent are then not the
+    // document and a terminal STATE_OK would say they are. Under a
     // redaction every event is checked once more on its way out, and one
     // that still carries redacted text ends the render refused instead.
     // apply_redaction already ran the same check over every part this can
     // emit, before anything was painted, so this guard is a backstop; if
     // it ever trips, the page images above have already gone out.
     bool redaction_breached = false;
+    TypedContentResult typed = TypedContentResult::kComplete;
+    std::string extraction_failure;
     if (ok) {
-      ok = emit_typed_content(
+      typed = emit_typed_content(
           options.parts, probe_ptr,
           [&](const google::protobuf::MessageLite& event) {
             std::string where;
@@ -711,12 +715,20 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
             output_bytes += static_cast<long>(event.ByteSizeLong());
             return emit(out_fd, event);
           },
-          &typed_warnings);
+          &typed_warnings, &extraction_failure);
+      ok = typed != TypedContentResult::kEmitFailed;
     }
     if (probe_ptr != nullptr) document->registerCallback(nullptr, nullptr);
     if (redaction_breached) {
       delete document;
       return kExitRedactionRefused;
+    }
+    if (typed == TypedContentResult::kFailed) {
+      *error = "typed content extraction failed: "
+          + mask_redacted(extraction_failure, redaction.redacted)
+          + "; the events already sent are incomplete";
+      delete document;
+      return kExitExtractionFailed;
     }
     if (ok) {
       officev1::StreamPagesResponse final_event;

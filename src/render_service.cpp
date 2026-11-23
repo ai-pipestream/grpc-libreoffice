@@ -614,6 +614,16 @@ grpc::Status RenderServiceImpl::render(
     failed++;
     return {grpc::StatusCode::INTERNAL, "the worker sent a malformed event"};
   }
+  // The reason a refusing or failing worker left in its work dir; empty
+  // when it left none.
+  auto worker_reason = [&] {
+    std::ifstream refusal(work_dir.path() + "/" + kRefusalFile,
+                          std::ios::binary);
+    std::string reason(4096, '\0');
+    refusal.read(reason.data(), static_cast<std::streamsize>(reason.size()));
+    reason.resize(static_cast<size_t>(std::max<std::streamsize>(0, refusal.gcount())));
+    return reason;
+  };
   switch (outcome.kind) {
     case WorkerOutcome::Kind::kOk:
       rendered++;
@@ -638,12 +648,17 @@ grpc::Status RenderServiceImpl::render(
       // The worker leaves the precise reason (which span, which region) in
       // its work dir; the generic detail stands in if it could not.
       rejected++;
-      std::ifstream refusal(work_dir.path() + "/" + kRefusalFile,
-                            std::ios::binary);
-      std::string reason(4096, '\0');
-      refusal.read(reason.data(), static_cast<std::streamsize>(reason.size()));
-      reason.resize(static_cast<size_t>(std::max<std::streamsize>(0, refusal.gcount())));
+      const std::string reason = worker_reason();
       return {grpc::StatusCode::FAILED_PRECONDITION,
+              reason.empty() ? outcome.detail : reason};
+    }
+    case WorkerOutcome::Kind::kExtractionFailed: {
+      // The service's failure, not the caller's: the document loaded and
+      // its pages may have streamed, but the typed content asked for could
+      // not be read. The stream ends here without a RenderStatus.
+      failed++;
+      const std::string reason = worker_reason();
+      return {grpc::StatusCode::INTERNAL,
               reason.empty() ? outcome.detail : reason};
     }
     case WorkerOutcome::Kind::kTimeout:

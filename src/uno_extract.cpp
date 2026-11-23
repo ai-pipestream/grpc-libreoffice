@@ -265,6 +265,21 @@ class Warner {
     if (warned_.insert(message).second) warn(message);
   }
 
+  // Reports that the walk as a whole could not start or was cut short, so
+  // what it emitted is not the document. Counted like any other problem;
+  // the first reason is kept for the caller, who fails the render on it.
+  void fail(const std::string& message) {
+    if (failure_.empty()) failure_ = message;
+    warn(message);
+  }
+
+  void fail(const std::string& context, const css::uno::Exception& error) {
+    fail(context + ": " + utf8(error.Message));
+  }
+
+  // Why the walk failed; empty while it has not.
+  const std::string& failure() const { return failure_; }
+
  private:
   void report(const std::string& message) {
     std::println(stderr, "grlibre-worker: typed content: {}", message);
@@ -273,6 +288,7 @@ class Warner {
 
   std::vector<std::string>* sink_;
   std::set<std::string> warned_;
+  std::string failure_;
   size_t count_ = 0;
 };
 
@@ -4892,20 +4908,25 @@ bool emit_text_content(const Reference<css::text::XTextDocument>& text_doc,
 }
 
 // emit_typed_content over a caller's Warner, so the redaction check can
-// count what the walk failed to read.
+// count what the walk failed to read. Returns false only when emit_fn
+// fails; a walk that could not start or aborted returns true with
+// warner.failure() set.
 bool emit_typed_content_with(const PartSelection& parts, SelectionProbe* probe,
                              const EmitFn& emit_fn, Warner& warner) {
+  // Nothing typed was asked for, so there is nothing to walk and nothing
+  // that a missing UNO context could lose.
+  if (!parts.wants_typed_content()) return true;
   try {
     Reference<css::uno::XComponentContext> context = process_context();
     if (fault_injected("typed-content-no-uno-context")) context.clear();
     if (!context.is()) {
-      warner.warn("no in-process UNO context, typed content unavailable");
+      warner.fail("no in-process UNO context, typed content unavailable");
       return true;
     }
     Reference<css::frame::XModel> model = find_loaded_model(context);
     if (fault_injected("typed-content-no-model")) model.clear();
     if (!model.is()) {
-      warner.warn("loaded document not found on the desktop, typed content unavailable");
+      warner.fail("loaded document not found on the desktop, typed content unavailable");
       return true;
     }
     const WorkFolderScope work_folder_scope(model);
@@ -4985,18 +5006,27 @@ bool emit_typed_content_with(const PartSelection& parts, SelectionProbe* probe,
     }
     return true;
   } catch (const css::uno::Exception& error) {
-    warner.warn("extraction aborted", error);
+    warner.fail("extraction aborted", error);
     return true;
   }
 }
 
 }  // namespace
 
-bool emit_typed_content(const PartSelection& parts, SelectionProbe* probe,
-                        const EmitFn& emit_fn,
-                        std::vector<std::string>* warnings) {
+TypedContentResult emit_typed_content(const PartSelection& parts,
+                                      SelectionProbe* probe,
+                                      const EmitFn& emit_fn,
+                                      std::vector<std::string>* warnings,
+                                      std::string* failure) {
   Warner warner(warnings);
-  return emit_typed_content_with(parts, probe, emit_fn, warner);
+  if (!emit_typed_content_with(parts, probe, emit_fn, warner)) {
+    return TypedContentResult::kEmitFailed;
+  }
+  if (!warner.failure().empty()) {
+    *failure = warner.failure();
+    return TypedContentResult::kFailed;
+  }
+  return TypedContentResult::kComplete;
 }
 
 bool export_pdf_stream(const std::string& filter_name, size_t chunk_limit,
