@@ -1445,9 +1445,11 @@ void verify_typed_cells() {
     sheet->set_visible(true);
     sheet->set_tab_color_rgb(-1);
     sheet->set_used_end_row(0);
-    sheet->set_used_end_column(3);
+    sheet->set_used_end_column(5);
     sheet->add_column_widths_twips(1280);
     sheet->add_column_widths_twips(2560);
+    sheet->add_column_widths_twips(1280);
+    sheet->add_column_widths_twips(1280);
     sheet->add_column_widths_twips(1280);
     sheet->add_column_widths_twips(1280);
     mapper.consume(event);
@@ -1486,6 +1488,27 @@ void verify_typed_cells() {
     money->set_number(12.5);
     money->set_display("$12.50");
     money->set_number_format_string("$#,##0.00");
+    // Formula cells whose cached result is a date and a flag: the wire
+    // carries the formula and the typed result side by side.
+    officev1::SheetCell* due = row->add_cells();
+    due->set_column(4);
+    due->set_type(officev1::SHEET_CELL_TYPE_FORMULA);
+    due->set_formula("=B1+30");
+    due->set_number(45030);
+    due->set_display("2023-04-14");
+    due->set_is_datetime(true);
+    due->mutable_datetime()->set_year(2023);
+    due->mutable_datetime()->set_month(4);
+    due->mutable_datetime()->set_day(14);
+    due->set_number_format_string("YYYY-MM-DD");
+    officev1::SheetCell* overdue = row->add_cells();
+    overdue->set_column(5);
+    overdue->set_type(officev1::SHEET_CELL_TYPE_FORMULA);
+    overdue->set_formula("=E1<TODAY()");
+    overdue->set_number(1);
+    overdue->set_display("TRUE");
+    overdue->set_is_boolean(true);
+    overdue->set_number_format_string("BOOLEAN");
     mapper.consume(event);
   }
   mapper.consume(status_event(""));
@@ -1494,12 +1517,12 @@ void verify_typed_cells() {
   const docv1::Document& document = mapper.document();
   require(document.tables_size() == 1, "cells: one table for the sheet");
   const docv1::TableData& data = document.tables(0).data();
-  require(data.columns_size() == 4
+  require(data.columns_size() == 6
               && data.columns(0).name() == "A"
               && data.columns(1).name() == "B"
               && data.columns(1).width() == 2560.0,
           "cells: column widths become a column schema");
-  require(data.table_cells_size() == 4, "cells: every cell mapped");
+  require(data.table_cells_size() == 6, "cells: every cell mapped");
   require(data.table_cells(0).value().boolean()
               && data.table_cells(0).value().number_format() == "BOOLEAN",
           "cells: a logical format makes a boolean value");
@@ -1510,6 +1533,18 @@ void verify_typed_cells() {
           "cells: a date format resolves to a civil date, text stays display");
   require(data.table_cells(2).value().error() == "#DIV/0!",
           "cells: a failed formula reports its error literal");
+  require(data.table_cells(2).value().formula_source() == "=1/0",
+          "cells: a failed formula keeps its source beside the error");
+  require(data.table_cells(4).value().has_datetime()
+              && data.table_cells(4).value().datetime().year() == 2023
+              && data.table_cells(4).value().datetime().month() == 4
+              && data.table_cells(4).value().datetime().day() == 14
+              && data.table_cells(4).value().formula_source() == "=B1+30",
+          "cells: a formula that yields a date keeps the date and its source");
+  require(data.table_cells(5).value().has_boolean()
+              && data.table_cells(5).value().boolean()
+              && data.table_cells(5).value().formula_source() == "=E1<TODAY()",
+          "cells: a formula that yields a flag keeps the flag and its source");
   require(data.table_cells(3).value().number() == 12.5
               && data.table_cells(3).value().number_format() == "$#,##0.00",
           "cells: a formatted number keeps both value and format");
