@@ -3810,6 +3810,45 @@ void verify_skip_hidden_keeps_sheet_ordinals() {
   require(run.pages[1].index() == 2,
           "the last sheet's image carries its own ordinal 2, not the hidden "
           "sheet's, got " + std::to_string(run.pages[1].index()));
+  require(run.info.page_rects_size() == 2 &&
+              run.info.page_rects(0).has_page_index() &&
+              run.info.page_rects(0).page_index() == 0 &&
+              run.info.page_rects(1).has_page_index() &&
+              run.info.page_rects(1).page_index() == 2,
+          "each page rectangle names the page it lays out");
+
+  // Folded into a Document, the last sheet's table sits on the page that
+  // holds its own image and its own size; the hidden sheet has no image.
+  grlibre::DoclingMapper mapper;
+  for (const std::string& payload : payloads) {
+    officev1::StreamPagesResponse event;
+    require(event.ParseFromString(payload), "pages event parses");
+    mapper.consume(event);
+  }
+  const auto& document = mapper.document();
+  require(document.pages().contains(1) && document.pages().contains(3),
+          "the two painted sheets are pages 1 and 3");
+  require(!document.pages().contains(2) ||
+              document.pages().at(2).image().uri().empty(),
+          "the hidden sheet's page holds no image");
+  const auto& last_page = document.pages().at(3);
+  require(!last_page.image().uri().empty(), "page 3 holds an image");
+  require(last_page.size().width() ==
+              static_cast<double>(run.info.page_rects(1).width_twips()) &&
+              last_page.size().height() ==
+                  static_cast<double>(run.info.page_rects(1).height_twips()),
+          "page 3 has the last sheet's size");
+  bool last_table_on_page_3 = false;
+  for (const auto& table : document.tables()) {
+    for (const auto& cell : table.data().table_cells()) {
+      if (cell.text() == "last data") {
+        last_table_on_page_3 =
+            table.prov_size() > 0 && table.prov(0).page_no() == 3;
+      }
+    }
+  }
+  require(last_table_on_page_3,
+          "the last sheet's table is on the page that shows it");
 }
 
 // Notes pages ride behind their slides as extra page images.
@@ -3833,6 +3872,14 @@ void verify_notes_pages() {
   require(run.pages.size() == 2, "both pages painted");
   require(run.pages[0].png() != run.pages[1].png(),
           "notes page differs from its slide");
+  // A notes page follows every slide: the slide count plus its slide's
+  // ordinal, and its rectangle says the same.
+  require(run.pages[0].index() == 0 && run.pages[1].index() == 1,
+          "the slide is page 0 and its notes page is page 1");
+  require(run.info.page_rects_size() == 2 &&
+              run.info.page_rects(0).page_index() == 0 &&
+              run.info.page_rects(1).page_index() == 1,
+          "the notes page's rectangle names it");
 }
 
 // Tracked-change display resolves before extraction: FINAL keeps the

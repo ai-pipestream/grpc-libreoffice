@@ -297,7 +297,8 @@ class DoclingMapper {
   // The document's own language tag, so a run only carries one when it
   // differs.
   std::string document_language_;
-  std::vector<ai::pipestream::office::v1::PageRect> page_rects_;
+  // Page rectangles by the PageImage.index each one lays out.
+  std::map<int, ai::pipestream::office::v1::PageRect> page_rects_;
   // The 1-based page numbers whose style name came off the wire, so the
   // catalogue check at the end of the stream visits only those.
   std::vector<int> styled_pages_;

@@ -1627,6 +1627,76 @@ void verify_page_units_and_format() {
           "pages: the page image reports the encoding it carries");
 }
 
+// A page rectangle names the page it lays out. With the middle sheet left
+// out of the pages, the last sheet's rectangle and image both say page
+// index 2, and the Document puts that sheet's size, image, and table on
+// page 3. A stream from a server that predates PageRect.page_index is
+// read by position.
+void verify_page_rects_name_their_page() {
+  grlibre::DoclingMapper mapper;
+  {
+    officev1::StreamPagesResponse event;
+    officev1::DocumentInfo* info = event.mutable_document_info();
+    info->set_document_id("book");
+    info->set_source_format("fods");
+    info->set_document_type("spreadsheet");
+    info->set_page_count(2);
+    officev1::PageRect* first = info->add_page_rects();
+    first->set_width_twips(4000);
+    first->set_height_twips(3000);
+    first->set_page_index(0);
+    officev1::PageRect* last = info->add_page_rects();
+    last->set_width_twips(9000);
+    last->set_height_twips(7000);
+    last->set_page_index(2);
+    mapper.consume(event);
+  }
+  for (int index : {0, 2}) {
+    officev1::StreamPagesResponse event;
+    officev1::PageImage* image = event.mutable_page_image();
+    image->set_index(index);
+    image->set_width_px(100);
+    image->set_height_px(80);
+    image->set_dpi(96);
+    image->set_png("png" + std::to_string(index));
+    image->set_format(officev1::PAGE_IMAGE_FORMAT_PNG);
+    mapper.consume(event);
+  }
+  for (int index : {0, 1, 2}) {
+    officev1::StreamPagesResponse event;
+    officev1::Sheet* sheet = event.mutable_sheet();
+    sheet->set_index(index);
+    sheet->set_name("S" + std::to_string(index));
+    sheet->set_visible(index != 1);
+    sheet->set_tab_color_rgb(-1);
+    mapper.consume(event);
+  }
+  mapper.consume(status_event(""));
+  const docv1::Document& document = mapper.document();
+  require(document.pages().contains(1) && document.pages().contains(3),
+          "page index: the painted sheets are pages 1 and 3");
+  require(document.pages().at(3).size().width() == 9000.0
+              && document.pages().at(3).size().height() == 7000.0,
+          "page index: page 3 has the last sheet's size");
+  require(!document.pages().at(3).image().uri().empty(),
+          "page index: page 3 has the last sheet's image");
+  require(!document.pages().contains(2)
+              || (document.pages().at(2).image().uri().empty()
+                  && document.pages().at(2).size().width() == 0.0),
+          "page index: the unpainted sheet borrowed no size and no image");
+  require(document.tables_size() == 3
+              && document.tables(2).prov(0).page_no() == 3,
+          "page index: the last sheet's table is on page 3");
+
+  grlibre::DoclingMapper legacy;
+  legacy.consume(info_event("text", 2, 15840));
+  legacy.consume(status_event(""));
+  require(legacy.document().pages().contains(1)
+              && legacy.document().pages().contains(2)
+              && legacy.document().pages().at(2).size().height() == 15840.0,
+          "page index: rectangles without an index are read by position");
+}
+
 // The page style each page carries lands on that page and resolves into
 // the style catalogue, which streams in after the page images do.
 void verify_per_page_style() {
@@ -1945,6 +2015,7 @@ int main() {
   verify_typed_cells();
   verify_slide_content();
   verify_page_units_and_format();
+  verify_page_rects_name_their_page();
   verify_per_page_style();
   verify_document_meta();
   verify_typed_declarations();

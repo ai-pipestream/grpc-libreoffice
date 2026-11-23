@@ -1339,7 +1339,10 @@ function drawOverlay() {
     return;
   }
   const page = state.pages[pos];
-  const pageRect = state.pageRects[page.index];
+  // A rectangle names the page it lays out (PageRect.pageIndex); entries
+  // from a server that predates the field are in page order.
+  const pageRect = state.pageRects.find(
+    (rect, position) => (rect.pageIndex ?? position) === page.index);
   const boxes = state.lineBoxes.get(page.index) || [];
   if (!pageRect || !boxes.length) {
     svg.classList.add("hidden");
