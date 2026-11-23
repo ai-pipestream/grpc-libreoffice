@@ -1951,6 +1951,11 @@ void fill_runs(const Reference<css::container::XEnumerationAccess>& paragraph,
         }
         continue;
       }
+      if (fault_injected("text-portion-throws") &&
+          range->getString() == "bold") {
+        throw css::uno::RuntimeException(
+            oustring("test fault: the portion stopped answering"));
+      }
       officev1::TextRun* run = runs->Add();
       run->set_text(utf8(range->getString()));
       int64_t length = codepoints(run->text());
@@ -2220,6 +2225,10 @@ bool emit_table(const Reference<css::text::XTextTable>& table, int32_t index,
         parts.wants(officev1::DOCUMENT_PART_LINE_RECTS) &&
         names.getLength() <= 64;
     for (const rtl::OUString& name : names) {
+      if (fault_injected("table-cell-walk-throws") && out->cells_size() == 1) {
+        throw css::uno::RuntimeException(
+            oustring("test fault: the cell walk stopped answering"));
+      }
       Reference<css::text::XText> cell(table->getCellByName(name), UNO_QUERY);
       if (!cell.is()) {
         warner.warn(label + " cell " + utf8(name) + " is not a text cell");
@@ -2435,6 +2444,10 @@ void encode_graphic(const Reference<css::graphic::XGraphic>& graphic,
   args[1].Name = "MimeType";
   args[1].Value <<= mime;
   try {
+    if (fault_injected("image-encode-fails")) {
+      throw css::uno::RuntimeException(
+          oustring("test fault: the source format writer failed"));
+    }
     provider->storeGraphic(graphic, store_args);
     *mime_type = utf8(mime);
     *data = sink->bytes();
@@ -2449,6 +2462,10 @@ void encode_graphic(const Reference<css::graphic::XGraphic>& graphic,
     args[0].Value <<= Reference<css::io::XStream>(png_sink.get());
     args[1].Value <<= rtl::OUString("image/png");
     try {
+      if (fault_injected("image-encode-fails")) {
+        throw css::uno::RuntimeException(
+            oustring("test fault: the png writer failed"));
+      }
       provider->storeGraphic(graphic, store_args);
       *mime_type = "image/png";
       *data = png_sink->bytes();
@@ -2934,6 +2951,10 @@ bool emit_text_frames(const Reference<css::text::XTextDocument>& text_doc,
         chain = rtl::OUString();
         props->getPropertyValue("ChainPrevName") >>= chain;
         out->set_chain_prev(utf8(chain));
+      }
+      if (fault_injected("text-frame-throws")) {
+        throw css::uno::RuntimeException(
+            oustring("test fault: the frame text stopped answering"));
       }
       flatten_text_runs(frame->getText(), label, out->mutable_runs(), marks,
                         warner);
@@ -3871,6 +3892,11 @@ bool emit_calc_content(
             if (type == css::table::CellContentType_EMPTY) continue;
             officev1::SheetCell* out_cell = row->add_cells();
             out_cell->set_column(c);
+            if (fault_injected("sheet-cell-throws") && r == used.StartRow &&
+                c == used.StartColumn) {
+              throw css::uno::RuntimeException(
+                  oustring("test fault: the cell stopped answering"));
+            }
             switch (type) {
               case css::table::CellContentType_VALUE:
                 out_cell->set_type(officev1::SHEET_CELL_TYPE_VALUE);

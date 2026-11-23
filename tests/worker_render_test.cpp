@@ -2865,6 +2865,175 @@ void verify_failed_extraction_fails_the_render() {
   }
 }
 
+// The ExtractionGap an event carries, or null for an event kind that has
+// none or an event read in full.
+const officev1::ExtractionGap* gap_of(const officev1::StreamPagesResponse& event) {
+  const officev1::ExtractionGap* gap = nullptr;
+  switch (event.event_case()) {
+    case officev1::StreamPagesResponse::kParagraph:
+      if (event.paragraph().has_gap()) gap = &event.paragraph().gap();
+      break;
+    case officev1::StreamPagesResponse::kTable:
+      if (event.table().has_gap()) gap = &event.table().gap();
+      break;
+    case officev1::StreamPagesResponse::kEmbeddedImage:
+      if (event.embedded_image().has_gap()) gap = &event.embedded_image().gap();
+      break;
+    case officev1::StreamPagesResponse::kTextFrame:
+      if (event.text_frame().has_gap()) gap = &event.text_frame().gap();
+      break;
+    case officev1::StreamPagesResponse::kFootnote:
+      if (event.footnote().has_gap()) gap = &event.footnote().gap();
+      break;
+    case officev1::StreamPagesResponse::kDocumentIndex:
+      if (event.document_index().has_gap()) gap = &event.document_index().gap();
+      break;
+    case officev1::StreamPagesResponse::kEmbeddedObject:
+      if (event.embedded_object().has_gap()) gap = &event.embedded_object().gap();
+      break;
+    case officev1::StreamPagesResponse::kSheetRow:
+      for (const officev1::SheetCell& cell : event.sheet_row().cells()) {
+        if (cell.has_gap()) gap = &cell.gap();
+      }
+      break;
+    default:
+      break;
+  }
+  return gap;
+}
+
+// The joined problems of a gap, for assertion messages and matching.
+std::string gap_text(const officev1::ExtractionGap* gap) {
+  std::string text;
+  if (gap == nullptr) return text;
+  for (const std::string& problem : gap->problems()) text += problem + "\n";
+  return text;
+}
+
+// An item the office core fails part way through reading is still sent
+// with what was read, and says so on the event itself: a table whose cell
+// walk stops after one cell, an image that cannot be encoded, a text frame
+// whose text stops answering, a paragraph that loses a text portion, and a
+// spreadsheet cell that stops answering after it was added each carry an
+// ExtractionGap naming the failure, and RenderStatus.incomplete_items
+// counts them. The render itself still completes. The same document read
+// without faults carries no gap anywhere.
+void verify_cut_short_items_carry_a_gap() {
+  auto pages_of = [](const char* fault, const char* extension,
+                     const std::string& doc) {
+    std::vector<std::string> payloads;
+    grlibre::WorkerOutcome outcome;
+    if (fault != nullptr) {
+      FaultScope scope(fault);
+      outcome = run("pages", extension, doc, &payloads);
+    } else {
+      outcome = run("pages", extension, doc, &payloads);
+    }
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            std::string(fault == nullptr ? "no fault" : fault)
+                + ": an item cut short does not fail the render: "
+                + outcome.detail);
+    std::vector<officev1::StreamPagesResponse> events;
+    for (const std::string& payload : payloads) {
+      officev1::StreamPagesResponse event;
+      require(event.ParseFromString(payload), "pages event parses");
+      events.push_back(std::move(event));
+    }
+    return events;
+  };
+  auto status_of = [](const std::vector<officev1::StreamPagesResponse>& events) {
+    require(!events.empty() && events.back().has_status(),
+            "the render ends with a status");
+    return events.back().status();
+  };
+
+  for (const auto& [extension, doc] :
+       {std::pair<const char*, std::string>{"fodt", kTypedFodt},
+        std::pair<const char*, std::string>{"fods", kTypedFods}}) {
+    auto events = pages_of(nullptr, extension, doc);
+    for (const auto& event : events) {
+      require(gap_of(event) == nullptr,
+              std::string(extension) + ": an item read in full carries no "
+                  "gap, got: " + gap_text(gap_of(event)));
+    }
+    require(status_of(events).incomplete_items() == 0,
+            std::string(extension) + ": nothing is counted incomplete");
+  }
+
+  struct Case {
+    const char* fault;
+    const char* extension;
+    const char* doc;
+    officev1::StreamPagesResponse::EventCase kind;
+    const char* problem;
+    // Another item kind the same fault reaches, when there is one.
+    officev1::StreamPagesResponse::EventCase also =
+        officev1::StreamPagesResponse::EVENT_NOT_SET;
+  };
+  const Case cases[] = {
+      {"table-cell-walk-throws", "fodt", kTypedFodt,
+       officev1::StreamPagesResponse::kTable, "table 0 extraction failed"},
+      {"image-encode-fails", "fodt", kTypedFodt,
+       officev1::StreamPagesResponse::kEmbeddedImage,
+       "could not be encoded at all"},
+      {"text-frame-throws", "fodt", kTypedFodt,
+       officev1::StreamPagesResponse::kTextFrame,
+       "the frame text stopped answering"},
+      {"text-portion-throws", "fodt", kTypedFodt,
+       officev1::StreamPagesResponse::kParagraph, "lost its run",
+       // The frame's text holds a bold run too.
+       officev1::StreamPagesResponse::kTextFrame},
+      {"sheet-cell-throws", "fods", kTypedFods,
+       officev1::StreamPagesResponse::kSheetRow, "extraction failed"},
+  };
+  for (const Case& c : cases) {
+    const std::string name = c.fault;
+    auto events = pages_of(c.fault, c.extension, c.doc);
+    int marked = 0;
+    const officev1::StreamPagesResponse* marked_event = nullptr;
+    for (const auto& event : events) {
+      const officev1::ExtractionGap* gap = gap_of(event);
+      if (gap == nullptr) continue;
+      marked++;
+      require(event.event_case() == c.kind || event.event_case() == c.also,
+              name + ": the gap is on the item that failed, got event case "
+                  + std::to_string(event.event_case()));
+      require(gap_text(gap).contains(c.problem),
+              name + ": the gap names the failure, got: " + gap_text(gap));
+      if (event.event_case() == c.kind) marked_event = &event;
+    }
+    require(marked_event != nullptr,
+            name + ": the item cut short carries a gap");
+    const officev1::RenderStatus status = status_of(events);
+    require(status.state() == officev1::RenderStatus::STATE_OK,
+            name + ": the render completes");
+    require(status.incomplete_items() == marked,
+            name + ": incomplete_items counts the marked items, got "
+                + std::to_string(status.incomplete_items()) + " for "
+                + std::to_string(marked));
+    bool warned = false;
+    for (const std::string& warning : status.warnings()) {
+      if (warning.contains(c.problem)) warned = true;
+    }
+    require(warned, name + ": the failure is also in the status warnings");
+
+    if (c.kind == officev1::StreamPagesResponse::kTable) {
+      require(marked_event->table().cells_size() == 1,
+              name + ": the table holds the one cell read before the failure");
+    } else if (c.kind == officev1::StreamPagesResponse::kEmbeddedImage) {
+      require(marked_event->embedded_image().data().empty() &&
+                  marked_event->embedded_image().mime_type().empty(),
+              name + ": the image holds no bytes it could not encode");
+    } else if (c.kind == officev1::StreamPagesResponse::kParagraph) {
+      for (const officev1::TextRun& text_run :
+           marked_event->paragraph().runs()) {
+        require(text_run.text() != "bold",
+                name + ": the lost portion is not in the runs");
+      }
+    }
+  }
+}
+
 // Redaction on page images: a span in the middle of the text must change
 // the painted page. Guards the span-overlap fix; the old fallback only
 // looked at a paragraph's first character.
@@ -4735,6 +4904,7 @@ int main() {
   verify_stream_option_extras();
   verify_all_but_pages_token();
   verify_failed_extraction_fails_the_render();
+  verify_cut_short_items_carry_a_gap();
   verify_redact_spans_change_pages();
   verify_pdf_redaction_removes_text();
   verify_redaction_removes_text_everywhere();
