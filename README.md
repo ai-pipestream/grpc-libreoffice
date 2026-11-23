@@ -184,6 +184,14 @@ worker is killed), `INTERNAL` (worker crash, or requested typed content
 that could not be extracted). Health checking and
 reflection are registered.
 
+The health service answers `SERVING` only for a server that has proven it
+can render. Before it listens, the server renders one built-in line of
+text through the worker binary and the LibreOffice install it was
+configured with and checks that a page image, the typed paragraph, and the
+terminal status all come back. If the worker cannot be executed, the
+install is missing or will not initialize, or its version cannot be read,
+the server prints `Startup failed:` with the reason and exits 1.
+
 A document whose zip package is broken but repairable is a special case:
 LibreOffice can only open it through its repair path, which rebuilds the
 package from what it can salvage and stages that copy through the core's
@@ -313,7 +321,8 @@ pictures or other resources an uploaded document links to.
 | `GRLIBRE_TASK_TIMEOUT_SECONDS` | `120` | Per-document deadline |
 | `GRLIBRE_RENDER_DPI` | `144` | Default page render DPI; a request may override it via `StreamOptions.render_dpi` |
 | `GRLIBRE_MAX_PAGE_PIXELS` | `4096` | Per-side pixel bound; pages downscale to fit |
-| `GRLIBRE_LO_PATH` | `/usr/lib/libreoffice/program` | LibreOffice installation |
+| `GRLIBRE_LO_PATH` | `/usr/lib/libreoffice/program` | LibreOffice installation; startup fails if a probe render through it fails |
+| `GRLIBRE_WORKER` | `grlibre-worker` beside the server binary | Worker binary; startup fails if it cannot be executed |
 | `GRLIBRE_TMPFS_DIR` | `/dev/shm` | tmpfs for per-worker work dirs; startup fails if it is not tmpfs |
 | `GRLIBRE_METRICS_INTERVAL_SECONDS` | `60` | Metrics line interval, `0` disables |
 

@@ -1,7 +1,11 @@
 #include "render_service.h"
 
+#include <unistd.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -393,6 +397,76 @@ RenderServiceImpl::RenderServiceImpl(ServiceConfig config)
   }
   config_.max_buffered_upload_bytes =
       std::max(config_.max_buffered_upload_bytes, config_.max_document_bytes);
+}
+
+std::string RenderServiceImpl::startup_probe() {
+  if (::access(config_.worker_path.c_str(), X_OK) != 0) {
+    return "the worker binary " + config_.worker_path
+        + " cannot be executed: " + std::strerror(errno);
+  }
+  std::error_code probe_error;
+  if (!std::filesystem::is_directory(config_.install_path, probe_error)) {
+    return "the LibreOffice install " + config_.install_path
+        + " is not a directory";
+  }
+  ScopedWorkDir work_dir(config_.tmpfs_dir);
+  if (work_dir.path().empty()) {
+    return "cannot create a worker directory under " + config_.tmpfs_dir;
+  }
+  {
+    // The all-defaults StreamOptions; the worker refuses to run without it.
+    std::ofstream options(work_dir.path() + "/options.pb", std::ios::binary);
+    options.close();
+    if (options.fail()) {
+      return "cannot write worker options under " + work_dir.path();
+    }
+  }
+  static constexpr char kProbeText[] = "grpc-libreoffice startup probe";
+  // The smallest render that still crosses everything a request crosses:
+  // office core start, a document load, one painted page, and the typed
+  // walk over the in-process UNO model.
+  const std::vector<std::string> argv = {
+      config_.worker_path, "pages", "txt",
+      std::to_string(kMinRenderDpi), "256",
+      work_dir.path(), config_.install_path, "all"};
+  int pages = 0;
+  bool text_found = false;
+  bool status_ok = false;
+  bool malformed_frame = false;
+  const WorkerOutcome outcome = run_worker(
+      argv, std::string(kProbeText) + "\n", config_.task_deadline,
+      16u * 1024 * 1024, [&](std::string&& payload) {
+        officev1::StreamPagesResponse event;
+        if (!event.ParseFromString(payload)) {
+          malformed_frame = true;
+          return false;
+        }
+        if (event.has_page_image()) pages++;
+        if (event.has_paragraph()) {
+          std::string text;
+          for (const officev1::TextRun& run : event.paragraph().runs()) {
+            text += run.text();
+          }
+          text_found = text_found || text == kProbeText;
+        }
+        if (event.has_status()) {
+          status_ok = event.status().state() == officev1::RenderStatus::STATE_OK;
+        }
+        return true;
+      });
+  const std::string through = "the probe render through " + config_.worker_path
+      + " with LibreOffice at " + config_.install_path;
+  if (malformed_frame) return through + " sent a malformed event";
+  if (outcome.kind != WorkerOutcome::Kind::kOk) {
+    return through + " failed: " + outcome.detail;
+  }
+  if (pages == 0 || !text_found || !status_ok) {
+    return through + " came back incomplete (page images: "
+        + std::to_string(pages) + ", probe text extracted: "
+        + (text_found ? "yes" : "no") + ", terminal STATE_OK: "
+        + (status_ok ? "yes" : "no") + ")";
+  }
+  return {};
 }
 
 template <typename Response, typename Request, typename In>

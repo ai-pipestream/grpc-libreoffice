@@ -35,6 +35,9 @@ struct ServiceConfig {
   std::chrono::milliseconds task_deadline{120000};
   int render_dpi = 144;
   int max_side_px = 4096;
+  // What the install's own soffice reports. The server binary refuses to
+  // start when it cannot read one; a service built without one (the tests)
+  // says so rather than naming a version it never saw.
   std::string libreoffice_version = "unknown";
   // RAM-backed directory that receives the per-worker work dirs. Uploaded
   // document bytes and the office core's spills live under it and must
@@ -71,6 +74,15 @@ class RenderServiceImpl final
       grpc::ServerContext* context,
       grpc::ServerReader<ai::pipestream::office::v1::StreamPagesRequest>* reader,
       ai::pipestream::office::v1::ToDocumentResponse* response) override;
+
+  // Renders one built-in line of text through the configured worker and
+  // LibreOffice install, the way a request would, and returns what failed,
+  // or an empty string when the render came back whole: a page image, the
+  // line as a typed paragraph, and a terminal STATE_OK. main runs it before
+  // the server listens, so a deployment that cannot render (worker binary
+  // or office install missing or broken) fails at startup instead of
+  // answering health checks as SERVING. It touches no counter.
+  std::string startup_probe();
 
   // Documents fully rendered / rejected before render / failed in render.
   std::atomic<long> rendered{0};
