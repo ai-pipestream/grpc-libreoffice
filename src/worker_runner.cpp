@@ -143,6 +143,10 @@ WorkerOutcome finish(pid_t pid, bool kill_first, WorkerOutcome::Kind kind_on_exi
       outcome.kind = WorkerOutcome::Kind::kRedactionRefused;
       outcome.detail = "the requested redaction could not be applied to "
                        "every region of the document";
+    } else if (code == kExitExtractionFailed) {
+      outcome.kind = WorkerOutcome::Kind::kExtractionFailed;
+      outcome.detail = "typed content extraction failed; the events already "
+                       "sent are incomplete";
     } else if (code == kExitWorkDirNotTmpfs) {
       outcome.kind = WorkerOutcome::Kind::kWorkDirNotTmpfs;
       outcome.detail = "the worker's work dir is not on tmpfs; the server "

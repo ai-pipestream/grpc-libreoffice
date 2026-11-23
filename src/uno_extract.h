@@ -71,18 +71,31 @@ struct SelectionProbe {
 // are emitted; the extraction work behind an unselected part is skipped, not
 // just its emission.
 //
-// Error policy: pages have already streamed when this runs, so extraction
-// problems never fail the render. Instead every problem is appended to
-// warnings with enough context to locate it, and mirrored to stderr so it
-// lands in the server log. Returns false only when emit_fn itself fails,
-// which means the parent is gone.
+// Error policy: a problem with one item (a property that will not read, an
+// image that will not encode) is appended to warnings with enough context
+// to locate it, and mirrored to stderr so it lands in the server log; the
+// walk goes on. A walk that cannot start, because the office core's UNO
+// context or the loaded model cannot be reached, or that the office core
+// throws out of part way, is a failed extraction: the events emitted so far
+// are not the document, so the result is kFailed with *failure saying why,
+// and the caller must not report the render as complete. A selection with
+// no typed-content part asks for nothing here and is always kComplete.
 // probe, when non-null, enables per-line rectangle measurement for the
 // LINE_RECTS part; pass null when the part is unselected or the flush
 // primitive is unavailable.
-bool emit_typed_content(
+enum class TypedContentResult {
+  // Every selected part was walked to its end.
+  kComplete,
+  // emit_fn failed, which means the parent is gone.
+  kEmitFailed,
+  // The walk could not start or aborted; *failure says why.
+  kFailed,
+};
+
+TypedContentResult emit_typed_content(
     const PartSelection& parts, SelectionProbe* probe,
     const std::function<bool(const google::protobuf::MessageLite&)>& emit_fn,
-    std::vector<std::string>* warnings);
+    std::vector<std::string>* warnings, std::string* failure);
 
 // Exports the document currently loaded in this process's office core to
 // PDF through an in-memory output stream: no PDF ever exists as a service

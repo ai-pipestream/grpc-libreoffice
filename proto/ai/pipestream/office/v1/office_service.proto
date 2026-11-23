@@ -30,7 +30,12 @@ option java_package = "ai.pipestream.office.v1";
 //                        when allow_package_repair is set.
 //   DEADLINE_EXCEEDED  - the worker exceeded the per-document timeout and
 //                        was killed.
-//   INTERNAL           - the worker crashed or failed mid-render.
+//   INTERNAL           - the worker crashed or failed mid-render, or the
+//                        typed content the request selected could not be
+//                        extracted (the office core could not be reached,
+//                        or the extraction aborted part way). Events sent
+//                        before the status are then incomplete, and no
+//                        RenderStatus follows them.
 service OfficeRenderService {
   // StreamPages renders every page of the uploaded document as a PNG image.
   // The client streams the document as chunks, marking the last one complete.
@@ -1743,13 +1748,15 @@ message PdfChunk {
 }
 
 // RenderStatus is the final event of a successful response stream, carrying
-// outcome counters. Failures arrive as gRPC status codes instead.
+// outcome counters. Failures arrive as gRPC status codes instead, and a
+// stream that ends without a RenderStatus is not a complete document.
 message RenderStatus {
   // State is the terminal outcome of the render.
   enum State {
     // Unset; never emitted by the server.
     STATE_UNSPECIFIED = 0;
-    // The render completed and every event was emitted.
+    // The render completed and every selected part was walked to its end.
+    // Problems with single items are listed in warnings.
     STATE_OK = 1;
   }
   // The terminal outcome.

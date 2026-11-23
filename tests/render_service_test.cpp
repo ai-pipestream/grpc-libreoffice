@@ -952,6 +952,44 @@ int main() {
             "the mapped document keeps the rest of the text");
   }
 
+  // Typed content that could not be extracted through the service: the
+  // stream ends INTERNAL carrying the worker's reason, after the pages and
+  // with no RenderStatus, and ToDocument returns the same status instead
+  // of a Document cut short. The worker's test-only fault point stands in
+  // for an office core that throws out of the walk; the worker inherits it
+  // through the environment.
+  {
+    require(::setenv("GRLIBRE_TEST_FAULT", "typed-content-walk-throws", 1) == 0,
+            "set the fault point");
+    const long failed_before = service.failed.load();
+    const long rendered_before = service.rendered.load();
+    const std::string text = "First paragraph.\nSecond paragraph.\n";
+    auto cut = stream_pages(channel, text, "cut.txt", true);
+    officev1::ToDocumentResponse mapped;
+    grpc::Status mapped_status =
+        to_document(channel, text, "cut.txt", nullptr, &mapped);
+    ::unsetenv("GRLIBRE_TEST_FAULT");
+    require(cut.status.error_code() == grpc::StatusCode::INTERNAL,
+            "a failed extraction is INTERNAL, got code "
+                + std::to_string(cut.status.error_code()) + ": "
+                + cut.status.error_message());
+    require(cut.status.error_message().contains(
+                "typed content extraction failed") &&
+                cut.status.error_message().contains("the walk throws"),
+            "the status carries the worker's reason, got: "
+                + cut.status.error_message());
+    require(cut.pages >= 1 && !cut.got_status && cut.paragraphs == 0,
+            "pages streamed, then no paragraphs and no RenderStatus");
+    require(mapped_status.error_code() == grpc::StatusCode::INTERNAL,
+            "ToDocument fails the same way, got: "
+                + mapped_status.error_message());
+    require(!mapped.has_document(),
+            "ToDocument returns no Document for a failed extraction");
+    require(service.failed.load() == failed_before + 2 &&
+                service.rendered.load() == rendered_before,
+            "both calls count as failed, neither as rendered");
+  }
+
   // A repairable broken package (a stored-entry OOXML zip truncated before
   // its central directory) maps to the repair statuses: refusal naming the
   // opt-in by default; opted-in repair is attempted and never UNIMPLEMENTED.
