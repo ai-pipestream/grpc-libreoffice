@@ -609,6 +609,7 @@ void verify_calc_stream() {
     formula->set_type(officev1::SHEET_CELL_TYPE_FORMULA);
     formula->set_formula("=A3*2");
     formula->set_number(7.0);
+    formula->set_formula_result(officev1::SHEET_CELL_TYPE_VALUE);
     formula->set_display("7");
     formula->set_merged_columns(1);
     formula->set_merged_rows(1);
@@ -713,8 +714,10 @@ void verify_calc_stream() {
     }
     require(a3 != nullptr && a3->value().number() == 3.5,
             "calc: numeric value is typed on the cell");
-    require(b3 != nullptr && b3->value().formula() == "=A3*2",
-            "calc: formula is typed on the cell");
+    require(b3 != nullptr && b3->value().has_number()
+                && b3->value().number() == 7.0
+                && b3->value().formula_source() == "=A3*2",
+            "calc: a formula cell carries its computed number and its source");
     require(table.meta().custom_fields().count("A3") == 0
                 && table.meta().custom_fields().count("B3") == 0,
             "calc: no A1-keyed side map beside the grid");
@@ -1445,13 +1448,12 @@ void verify_typed_cells() {
     sheet->set_visible(true);
     sheet->set_tab_color_rgb(-1);
     sheet->set_used_end_row(0);
-    sheet->set_used_end_column(5);
+    sheet->set_used_end_column(9);
     sheet->add_column_widths_twips(1280);
     sheet->add_column_widths_twips(2560);
-    sheet->add_column_widths_twips(1280);
-    sheet->add_column_widths_twips(1280);
-    sheet->add_column_widths_twips(1280);
-    sheet->add_column_widths_twips(1280);
+    for (int column = 2; column <= 9; column++) {
+      sheet->add_column_widths_twips(1280);
+    }
     mapper.consume(event);
   }
   {
@@ -1509,6 +1511,38 @@ void verify_typed_cells() {
     overdue->set_display("TRUE");
     overdue->set_is_boolean(true);
     overdue->set_number_format_string("BOOLEAN");
+    // A numeric result the display rounds: the exact double must survive.
+    officev1::SheetCell* total = row->add_cells();
+    total->set_column(6);
+    total->set_type(officev1::SHEET_CELL_TYPE_FORMULA);
+    total->set_formula("=SUM(A1:A9)");
+    total->set_number(1234.5678);
+    total->set_formula_result(officev1::SHEET_CELL_TYPE_VALUE);
+    total->set_display("1,235");
+    total->set_number_format_string("#,##0");
+    // A formula that yields zero is a number, not an absent value.
+    officev1::SheetCell* zero = row->add_cells();
+    zero->set_column(7);
+    zero->set_type(officev1::SHEET_CELL_TYPE_FORMULA);
+    zero->set_formula("=A1-A1");
+    zero->set_number(0);
+    zero->set_formula_result(officev1::SHEET_CELL_TYPE_VALUE);
+    zero->set_display("0");
+    // A formula that yields text: no number is claimed for it.
+    officev1::SheetCell* label = row->add_cells();
+    label->set_column(8);
+    label->set_type(officev1::SHEET_CELL_TYPE_FORMULA);
+    label->set_formula("=\"x\"&\"y\"");
+    label->set_formula_result(officev1::SHEET_CELL_TYPE_TEXT);
+    label->set_display("xy");
+    // A worker that predates formula_result: no result is known, so the
+    // formula stays on the legacy arm rather than claiming a number.
+    officev1::SheetCell* legacy = row->add_cells();
+    legacy->set_column(9);
+    legacy->set_type(officev1::SHEET_CELL_TYPE_FORMULA);
+    legacy->set_formula("=A1*2");
+    legacy->set_number(2);
+    legacy->set_display("2");
     mapper.consume(event);
   }
   mapper.consume(status_event(""));
@@ -1517,12 +1551,12 @@ void verify_typed_cells() {
   const docv1::Document& document = mapper.document();
   require(document.tables_size() == 1, "cells: one table for the sheet");
   const docv1::TableData& data = document.tables(0).data();
-  require(data.columns_size() == 6
+  require(data.columns_size() == 10
               && data.columns(0).name() == "A"
               && data.columns(1).name() == "B"
               && data.columns(1).width() == 2560.0,
           "cells: column widths become a column schema");
-  require(data.table_cells_size() == 6, "cells: every cell mapped");
+  require(data.table_cells_size() == 10, "cells: every cell mapped");
   require(data.table_cells(0).value().boolean()
               && data.table_cells(0).value().number_format() == "BOOLEAN",
           "cells: a logical format makes a boolean value");
@@ -1545,6 +1579,26 @@ void verify_typed_cells() {
               && data.table_cells(5).value().boolean()
               && data.table_cells(5).value().formula_source() == "=E1<TODAY()",
           "cells: a formula that yields a flag keeps the flag and its source");
+  require(data.table_cells(6).value().has_number()
+              && data.table_cells(6).value().number() == 1234.5678
+              && data.table_cells(6).value().formula_source() == "=SUM(A1:A9)"
+              && data.table_cells(6).value().number_format() == "#,##0"
+              && data.table_cells(6).text() == "1,235",
+          "cells: a formula keeps its exact result, not just the rounded "
+          "display");
+  require(data.table_cells(7).value().has_number()
+              && data.table_cells(7).value().number() == 0.0
+              && data.table_cells(7).value().formula_source() == "=A1-A1",
+          "cells: a formula that yields zero is the number zero");
+  require(data.table_cells(8).value().kind_case()
+                  == docv1::CellValue::KIND_NOT_SET
+              && data.table_cells(8).value().formula_source() == "=\"x\"&\"y\""
+              && data.table_cells(8).text() == "xy",
+          "cells: a formula that yields text claims no number and keeps its "
+          "source");
+  require(data.table_cells(9).value().formula() == "=A1*2"
+              && !data.table_cells(9).value().has_formula_source(),
+          "cells: a formula with no stated result stays on the legacy arm");
   require(data.table_cells(3).value().number() == 12.5
               && data.table_cells(3).value().number_format() == "$#,##0.00",
           "cells: a formatted number keeps both value and format");

@@ -885,6 +885,8 @@ void verify_typed_spreadsheet() {
   bool value_ok = false;
   bool currency_ok = false;
   bool formula_ok = false;
+  bool text_formula_ok = false;
+  bool value_cells_unmarked = true;
   bool covered_cell_absent = true;
   bool date_ok = false;
   bool boolean_ok = false;
@@ -922,6 +924,15 @@ void verify_typed_spreadsheet() {
         // Text keeps the column's format code but never borrows a date or
         // a flag from it: its value is no serial.
         formatted_text_cells++;
+        // The formula-made text says its result is text.
+        if (cell.type() == officev1::SHEET_CELL_TYPE_FORMULA) {
+          text_formula_ok =
+              cell.formula_result() == officev1::SHEET_CELL_TYPE_TEXT;
+        } else {
+          value_cells_unmarked =
+              value_cells_unmarked
+              && cell.formula_result() == officev1::SHEET_CELL_TYPE_UNSPECIFIED;
+        }
         formatted_text_untyped = formatted_text_untyped && !cell.is_datetime()
                                  && !cell.is_boolean()
                                  && !cell.has_datetime()
@@ -935,6 +946,7 @@ void verify_typed_spreadsheet() {
       if (row.sheet_index() == 0 && row.row() == 2 && cell.column() == 2) {
         formula_ok = cell.type() == officev1::SHEET_CELL_TYPE_FORMULA &&
                      !cell.formula().empty() &&
+                     cell.formula_result() == officev1::SHEET_CELL_TYPE_VALUE &&
                      cell.number() > 419.57 && cell.number() < 419.59;
       }
     }
@@ -949,7 +961,11 @@ void verify_typed_spreadsheet() {
   require(boolean_ok, "a logical cell is marked boolean, not just numeric");
   require(formatted_text_cells == 3 && formatted_text_untyped,
           "text under a date or boolean format is neither a date nor a flag");
-  require(formula_ok, "formula cell keeps formula and computed number");
+  require(formula_ok,
+          "formula cell keeps formula, computed number, and says the result "
+          "is a number");
+  require(text_formula_ok, "a formula that yields text says so");
+  require(value_cells_unmarked, "cells that are not formulas state no result");
   require(comments.size() == 1 && comments[0].sheet_index() == 0 &&
               comments[0].row() == 1 && comments[0].column() == 0 &&
               comments[0].author() == "Kris" &&

@@ -1829,15 +1829,33 @@ void DoclingMapper::on_sheet_row(const officev1::SheetRow& row) {
     out->set_col_span(std::max(1, cell.merged_columns()));
     out->set_text(cell.display());
     // The cell's typed value: text stays the display string, and the value
-    // says what the sheet actually holds. An error beats a formula, because
-    // a formula that failed has no value to report.
+    // says what the sheet actually holds. A formula cell keeps both halves:
+    // its source in formula_source and its cached result in kind, typed
+    // exactly as a value cell's would be. A failed formula's result is its
+    // error literal; a formula that yields text has no kind arm to fill and
+    // keeps the text in the cell's text.
     docv1::CellValue value;
     bool typed = true;
+    const bool is_formula = cell.type() == officev1::SHEET_CELL_TYPE_FORMULA;
+    // A worker that predates SheetCell.formula_result still marks date and
+    // flag results; any other formula of its has no result this can trust.
+    const bool numeric_result =
+        cell.formula_result() == officev1::SHEET_CELL_TYPE_VALUE
+        || cell.is_boolean() || cell.is_datetime();
+    const bool text_result =
+        cell.formula_result() == officev1::SHEET_CELL_TYPE_TEXT;
+    if (is_formula && !cell.formula().empty()
+        && (cell.error_code() != 0 || numeric_result || text_result)) {
+      value.set_formula_source(cell.formula());
+    }
     if (cell.error_code() != 0) {
       value.set_error(cell.display().empty()
                           ? "Err:" + std::to_string(cell.error_code())
                           : cell.display());
-    } else if (cell.type() == officev1::SHEET_CELL_TYPE_FORMULA) {
+    } else if (is_formula && text_result) {
+      typed = value.has_formula_source();
+    } else if (is_formula && !numeric_result) {
+      // No cached result is known: the legacy formula arm.
       value.set_formula(cell.formula());
     } else if (cell.is_boolean()) {
       value.set_boolean(cell.number() != 0);
@@ -1850,7 +1868,7 @@ void DoclingMapper::on_sheet_row(const officev1::SheetRow& row) {
       when->set_hour(cell.datetime().hour());
       when->set_minute(cell.datetime().minute());
       when->set_second(cell.datetime().second());
-    } else if (cell.type() == officev1::SHEET_CELL_TYPE_VALUE) {
+    } else if (cell.type() == officev1::SHEET_CELL_TYPE_VALUE || is_formula) {
       value.set_number(cell.number());
     } else {
       typed = false;
