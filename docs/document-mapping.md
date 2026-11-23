@@ -30,6 +30,7 @@ value rides `custom_fields` any more.
 | Merged and split table cells | `TableCell.row_span` / `col_span` and the base-grid position the office cell name anchors at |
 | Slide pictures | `PictureItem` with bytes, parented to its slide group, page-local geometry |
 | Slide tables | `TableItem` folded from the table shape's cell grid, parented to its slide group |
+| Embedded workbook with several sheets | one group named after the object, holding one `GROUP_LABEL_SHEET` group per non-empty sheet (named after it) with that sheet's `TableItem`; the object's attachment points at the outer group. A single-sheet workbook stays one `TableItem` |
 | Speaker notes | `CONTENT_LAYER_NOTES` items under the slide group |
 | Image alt text | `PictureMeta.description.text` |
 | Document properties | `Document.source_meta`: title, author, created and modified instants, language, generator, keywords (also `BaseMeta.keywords`) |

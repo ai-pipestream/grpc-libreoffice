@@ -1648,6 +1648,29 @@ void DoclingMapper::on_embedded_object(const officev1::EmbeddedObject& object) {
     return;
   }
 
+  if (object.kind() == officev1::EMBEDDED_OBJECT_KIND_SPREADSHEET &&
+      object.inner_sheets_size() > 1) {
+    // A workbook with several sheets: one group for the object, then one
+    // sheet group per sheet, named after it, holding that sheet's table.
+    const std::string book_ref =
+        add_group("#/body", docv1::GROUP_LABEL_UNSPECIFIED, object.name(),
+                  docv1::CONTENT_LAYER_BODY)
+            ->self_ref();
+    register_embedded_object(object, book_ref);
+    for (const officev1::EmbeddedSheet& sheet : object.inner_sheets()) {
+      const std::string sheet_ref =
+          add_group(book_ref, docv1::GROUP_LABEL_SHEET, sheet.name(),
+                    docv1::CONTENT_LAYER_BODY)
+              ->self_ref();
+      docv1::TableItem* item =
+          add_table(docv1::CONTENT_LAYER_BODY, sheet_ref, nullptr);
+      fold_table(sheet.table(), item);
+      add_prov(item->mutable_prov(), object.page_index(), page_local, l, t, r,
+               b, 0, 0);
+    }
+    return;
+  }
+
   if (object.kind() == officev1::EMBEDDED_OBJECT_KIND_SPREADSHEET) {
     std::string table_ref;
     docv1::TableItem* item = add_table(docv1::CONTENT_LAYER_BODY, "#/body",
