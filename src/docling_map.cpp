@@ -1,6 +1,7 @@
 #include "docling_map.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -1680,20 +1681,24 @@ void DoclingMapper::on_embedded_object(const officev1::EmbeddedObject& object) {
   const officev1::EmbeddedChart& chart = object.chart();
   const auto& series = chart.series();
   switch (chart.kind()) {
+    // The bar, pie and scatter dialects hold one series each, so a chart
+    // with several gets one annotation per series, in series order; the
+    // series names head the tabular projection's columns in that order.
     case officev1::EMBEDDED_CHART_KIND_BAR:
     case officev1::EMBEDDED_CHART_KIND_COLUMN: {
-      if (series.empty()) break;
-      docv1::PictureBarChartData* bars =
-          picture->add_annotations()->mutable_bar_chart();
-      bars->set_kind("bar_chart_data");
-      bars->set_title(chart.title());
-      bars->set_x_axis_label(chart.x_axis_title());
-      bars->set_y_axis_label(chart.y_axis_title());
-      for (int i = 0; i < series[0].values_y_size(); i++) {
-        docv1::ChartBar* bar = bars->add_bars();
-        bar->set_label(i < chart.categories_size() ? chart.categories(i)
-                                                   : std::to_string(i + 1));
-        bar->set_values(series[0].values_y(i));
+      for (const officev1::EmbeddedChartSeries& one : series) {
+        docv1::PictureBarChartData* bars =
+            picture->add_annotations()->mutable_bar_chart();
+        bars->set_kind("bar_chart_data");
+        bars->set_title(chart.title());
+        bars->set_x_axis_label(chart.x_axis_title());
+        bars->set_y_axis_label(chart.y_axis_title());
+        for (int i = 0; i < one.values_y_size(); i++) {
+          docv1::ChartBar* bar = bars->add_bars();
+          bar->set_label(i < chart.categories_size() ? chart.categories(i)
+                                                     : std::to_string(i + 1));
+          bar->set_values(one.values_y(i));
+        }
       }
       break;
     }
@@ -1718,34 +1723,35 @@ void DoclingMapper::on_embedded_object(const officev1::EmbeddedObject& object) {
       break;
     }
     case officev1::EMBEDDED_CHART_KIND_PIE: {
-      if (series.empty()) break;
-      docv1::PicturePieChartData* pie =
-          picture->add_annotations()->mutable_pie_chart();
-      pie->set_kind("pie_chart_data");
-      pie->set_title(chart.title());
-      for (int i = 0; i < series[0].values_y_size(); i++) {
-        docv1::ChartSlice* slice = pie->add_slices();
-        slice->set_label(i < chart.categories_size() ? chart.categories(i)
-                                                     : std::to_string(i + 1));
-        slice->set_value(series[0].values_y(i));
+      for (const officev1::EmbeddedChartSeries& one : series) {
+        docv1::PicturePieChartData* pie =
+            picture->add_annotations()->mutable_pie_chart();
+        pie->set_kind("pie_chart_data");
+        pie->set_title(chart.title());
+        for (int i = 0; i < one.values_y_size(); i++) {
+          docv1::ChartSlice* slice = pie->add_slices();
+          slice->set_label(i < chart.categories_size() ? chart.categories(i)
+                                                       : std::to_string(i + 1));
+          slice->set_value(one.values_y(i));
+        }
       }
       break;
     }
     case officev1::EMBEDDED_CHART_KIND_SCATTER:
     case officev1::EMBEDDED_CHART_KIND_BUBBLE: {
-      docv1::PictureScatterChartData* scatter =
-          picture->add_annotations()->mutable_scatter_chart();
-      scatter->set_kind("scatter_chart_data");
-      scatter->set_title(chart.title());
-      scatter->set_x_axis_label(chart.x_axis_title());
-      scatter->set_y_axis_label(chart.y_axis_title());
       for (const officev1::EmbeddedChartSeries& one : series) {
+        docv1::PictureScatterChartData* scatter =
+            picture->add_annotations()->mutable_scatter_chart();
+        scatter->set_kind("scatter_chart_data");
+        scatter->set_title(chart.title());
+        scatter->set_x_axis_label(chart.x_axis_title());
+        scatter->set_y_axis_label(chart.y_axis_title());
         int points = std::min(one.values_x_size(), one.values_y_size());
         for (int i = 0; i < points; i++) {
-          docv1::FloatPair* pair =
-              scatter->add_points()->mutable_value();
-          pair->set_first(one.values_x(i));
-          pair->set_second(one.values_y(i));
+          docv1::ChartPoint* point = scatter->add_points();
+          point->mutable_value()->set_first(one.values_x(i));
+          point->mutable_value()->set_second(one.values_y(i));
+          if (i < one.sizes_size()) point->set_size(one.sizes(i));
         }
       }
       break;
@@ -1761,6 +1767,35 @@ void DoclingMapper::on_embedded_object(const officev1::EmbeddedObject& object) {
   tabular->set_title(chart.title());
   docv1::TableItem scratch;
   fold_table(chart.tabular(), &scratch);
+  // The label row heads the series columns and the first column names the
+  // categories (or numbers the points); every other cell is a value, whose
+  // text is the exact shortest form of a double and is typed back into the
+  // number it reads as. The cell list and the grid each hold their own copy
+  // of every cell, so both are typed.
+  auto type_cell = [](docv1::TableCell& cell) {
+    const int row = cell.start_row_offset_idx();
+    const int column = cell.start_col_offset_idx();
+    if (row == 0) {
+      cell.set_column_header(true);
+      return;
+    }
+    if (column == 0) {
+      cell.set_row_header(true);
+      return;
+    }
+    const std::string& text = cell.text();
+    const char* end = text.data() + text.size();
+    double number = 0;
+    auto parsed = std::from_chars(text.data(), end, number);
+    if (!text.empty() && parsed.ec == std::errc() && parsed.ptr == end) {
+      cell.mutable_value()->set_number(number);
+    }
+  };
+  docv1::TableData* data = scratch.mutable_data();
+  for (docv1::TableCell& cell : *data->mutable_table_cells()) type_cell(cell);
+  for (docv1::TableRow& grid_row : *data->mutable_grid()) {
+    for (docv1::TableCell& cell : *grid_row.mutable_cells()) type_cell(cell);
+  }
   *tabular->mutable_chart_data() = scratch.data();
 }
 
