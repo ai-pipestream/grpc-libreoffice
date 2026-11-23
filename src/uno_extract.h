@@ -80,6 +80,11 @@ struct SelectionProbe {
 // are not the document, so the result is kFailed with *failure saying why,
 // and the caller must not report the render as complete. A selection with
 // no typed-content part asks for nothing here and is always kComplete.
+// An item the office core fails part way through reading (a table whose
+// cell walk throws, a cell, frame, note, index or object whose properties
+// stop answering, a paragraph that loses a text portion, an image that
+// cannot be encoded) is still emitted with what was read, carrying an
+// ExtractionGap that lists the failures; *incomplete_items counts them.
 // probe, when non-null, enables per-line rectangle measurement for the
 // LINE_RECTS part; pass null when the part is unselected or the flush
 // primitive is unavailable.
@@ -95,7 +100,8 @@ enum class TypedContentResult {
 TypedContentResult emit_typed_content(
     const PartSelection& parts, SelectionProbe* probe,
     const std::function<bool(const google::protobuf::MessageLite&)>& emit_fn,
-    std::vector<std::string>* warnings, std::string* failure);
+    std::vector<std::string>* warnings, std::string* failure,
+    int* incomplete_items);
 
 // Exports the document currently loaded in this process's office core to
 // PDF through an in-memory output stream: no PDF ever exists as a service

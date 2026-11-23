@@ -110,7 +110,12 @@ at STANDARD plus COMMENTS):
   Every event is emitted the moment it exists, so a caller can process page
   images while typed content is still streaming. A problem with one item
   (a property that will not read, an image that will not encode) lands in
-  `RenderStatus.warnings` and the walk goes on. Typed content that cannot be
+  `RenderStatus.warnings` and the walk goes on. An item the office core
+  fails part way through reading (a table whose cell walk throws, a cell,
+  frame, note, index or object that stops answering, a paragraph that
+  loses a text portion, an image that cannot be encoded) is still sent
+  with what was read, carrying an `ExtractionGap` that names the failure,
+  and `RenderStatus.incomplete_items` counts those items. Typed content that cannot be
   extracted at all, because the office core's UNO context or the loaded
   document cannot be reached or because the walk aborts part way, fails the
   call with `INTERNAL` and the reason: the events already sent are then
