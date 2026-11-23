@@ -3787,6 +3787,68 @@ void verify_sheet_visibility_and_used_range() {
   }
 }
 
+// skip_hidden and paint_used_range are applied or the render is refused,
+// never accepted and quietly dropped. When the parts cannot be described at
+// all, or one sheet's visibility or used range cannot be read, the worker
+// cannot tell a hidden sheet from a shown one (or where the used cells
+// are), so it refuses before anything is emitted instead of painting the
+// hidden sheet under STATE_OK. The same faults leave a request that set
+// neither option alone.
+void verify_unreadable_parts_refuse_the_options() {
+  const std::string doc = kTwoSheetFods;
+  struct Case {
+    const char* fault;
+    bool skip_hidden;
+    bool paint_used_range;
+    const char* names;
+  };
+  const Case cases[] = {
+      {"describe-parts-no-model", true, false, "skip_hidden"},
+      {"describe-parts-visibility-throws", true, false, "skip_hidden"},
+      {"describe-parts-no-model", false, true, "paint_used_range"},
+      {"describe-parts-used-range-throws", false, true, "paint_used_range"},
+  };
+  for (const Case& c : cases) {
+    const std::string name = std::string(c.fault) + " with " + c.names;
+    FaultScope scope(c.fault);
+    officev1::StreamOptions extras;
+    extras.set_skip_hidden(c.skip_hidden);
+    extras.set_paint_used_range(c.paint_used_range);
+    std::vector<std::string> payloads;
+    std::string refusal;
+    auto outcome = run_with_extras("pages", "fods", doc, extras, &payloads,
+                                   "all", &refusal);
+    require(payloads.empty(),
+            name + ": nothing is emitted, got "
+                + std::to_string(payloads.size()) + " events");
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOptionRefused,
+            name + ": the worker refuses the option, got: " + outcome.detail);
+    require(refusal.contains(c.names),
+            name + ": the refusal names the option, got: " + refusal);
+
+    std::vector<std::string> plain;
+    auto plain_outcome = run("pages", "fods", doc, &plain);
+    PagesRun plain_run = fold_pages(plain);
+    require(plain_outcome.kind == grlibre::WorkerOutcome::Kind::kOk &&
+                plain_run.pages.size() == 2 && plain_run.got_status,
+            name + ": a request with neither option still renders both "
+                "sheets: " + plain_outcome.detail);
+  }
+  // A used range that cannot be read does not stop skip_hidden, which
+  // needs only the visibility.
+  {
+    FaultScope scope("describe-parts-used-range-throws");
+    officev1::StreamOptions extras;
+    extras.set_skip_hidden(true);
+    std::vector<std::string> payloads;
+    auto outcome = run_with_extras("pages", "fods", doc, extras, &payloads);
+    PagesRun run = fold_pages(payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk &&
+                run.pages.size() == 1,
+            "skip_hidden needs no used range: " + outcome.detail);
+  }
+}
+
 // Notes pages ride behind their slides as extra page images.
 void verify_notes_pages() {
   const std::string doc = kNotesFodp;
@@ -4608,6 +4670,7 @@ int main() {
   verify_pdf_page_range();
   verify_pdf_skip_hidden();
   verify_sheet_visibility_and_used_range();
+  verify_unreadable_parts_refuse_the_options();
   verify_notes_pages();
   verify_tracked_change_display();
   verify_per_page_style();

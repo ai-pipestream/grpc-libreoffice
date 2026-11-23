@@ -7069,6 +7069,7 @@ void describe_parts(std::vector<PartLayout>* parts,
     Reference<css::uno::XComponentContext> context = process_context();
     if (!context.is()) return;
     Reference<css::frame::XModel> model = find_loaded_model(context);
+    if (fault_injected("describe-parts-no-model")) model.clear();
     if (!model.is()) return;
     Reference<css::sheet::XSpreadsheetDocument> calc(model, UNO_QUERY);
     if (calc.is()) {
@@ -7082,11 +7083,19 @@ void describe_parts(std::vector<PartLayout>* parts,
         Reference<css::beans::XPropertySet> props(sheet, UNO_QUERY);
         if (props.is()) {
           try {
+            if (fault_injected("describe-parts-visibility-throws")) {
+              throw css::uno::RuntimeException(
+                  "injected fault: the visibility read throws");
+            }
             props->getPropertyValue("IsVisible") >>= layout.visible;
           } catch (const css::uno::Exception&) {
           }
         }
         try {
+          if (fault_injected("describe-parts-used-range-throws")) {
+            throw css::uno::RuntimeException(
+                "injected fault: the used-range read throws");
+          }
           Reference<css::sheet::XSheetCellCursor> cursor =
               sheet->createCursor();
           Reference<css::sheet::XUsedAreaCursor> area(cursor, UNO_QUERY);
