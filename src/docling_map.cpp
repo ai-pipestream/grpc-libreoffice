@@ -1077,10 +1077,10 @@ void DoclingMapper::on_metadata(const officev1::DocumentMetadata& meta) {
   docv1::DocumentMeta* source_meta = document_.mutable_source_meta();
   if (!meta.title().empty()) source_meta->set_title(meta.title());
   if (!meta.author().empty()) source_meta->add_authors(meta.author());
-  if (meta.created_epoch_ms() != 0) {
+  if (meta.has_created_epoch_ms()) {
     set_instant(meta.created_epoch_ms(), source_meta->mutable_created());
   }
-  if (meta.modified_epoch_ms() != 0) {
+  if (meta.has_modified_epoch_ms()) {
     set_instant(meta.modified_epoch_ms(), source_meta->mutable_modified());
   }
   if (!meta.language().empty()) source_meta->set_language(meta.language());
@@ -1089,7 +1089,7 @@ void DoclingMapper::on_metadata(const officev1::DocumentMetadata& meta) {
   if (!meta.modified_by().empty()) {
     source_meta->set_modified_by(meta.modified_by());
   }
-  if (meta.printed_epoch_ms() != 0) {
+  if (meta.has_printed_epoch_ms()) {
     set_instant(meta.printed_epoch_ms(), source_meta->mutable_printed());
   }
   if (!meta.printed_by().empty()) source_meta->set_printer(meta.printed_by());
@@ -2056,7 +2056,7 @@ void DoclingMapper::on_comment(const officev1::Comment& comment) {
   docv1::CommentMeta* identity = handle.base->mutable_comment_meta();
   if (!comment.author().empty()) identity->set_author(comment.author());
   if (!comment.initials().empty()) identity->set_initials(comment.initials());
-  if (comment.epoch_ms() != 0) {
+  if (comment.has_epoch_ms()) {
     set_instant(comment.epoch_ms(), identity->mutable_timestamp());
   }
   identity->set_resolved(comment.resolved());
@@ -2098,7 +2098,7 @@ void DoclingMapper::on_tracked_change(const officev1::TrackedChange& change) {
                          [](unsigned char c) { return std::tolower(c); });
   record->set_kind(kind);
   record->set_author(change.author());
-  if (change.epoch_ms() != 0) {
+  if (change.has_epoch_ms()) {
     set_instant(change.epoch_ms(), record->mutable_timestamp());
   }
   if (!change.changed_text().empty()) {

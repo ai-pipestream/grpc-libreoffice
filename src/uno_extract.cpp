@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <print>
@@ -478,18 +479,21 @@ class PdfChunkSink : public cppu::WeakImplHelper1<css::io::XOutputStream> {
   bool closed_ = false;
 };
 
-int64_t datetime_epoch_ms(const css::util::DateTime& value) {
-  if (value.Year == 0) return 0;
-  struct tm parts = {};
-  parts.tm_year = value.Year - 1900;
-  parts.tm_mon = value.Month - 1;
-  parts.tm_mday = value.Day;
-  parts.tm_hour = value.Hours;
-  parts.tm_min = value.Minutes;
-  parts.tm_sec = value.Seconds;
-  time_t seconds = timegm(&parts);
-  if (seconds < 0) return 0;
-  return static_cast<int64_t>(seconds) * 1000 +
+// Milliseconds from the Unix epoch to a UTC date-time, negative before
+// 1970; nullopt when the office core reports no date (year 0) or one that
+// is not a calendar date.
+std::optional<int64_t> datetime_epoch_ms(const css::util::DateTime& value) {
+  if (value.Year == 0) return std::nullopt;
+  const std::chrono::year_month_day day{
+      std::chrono::year{value.Year},
+      std::chrono::month{static_cast<unsigned>(value.Month)},
+      std::chrono::day{static_cast<unsigned>(value.Day)}};
+  if (!day.ok()) return std::nullopt;
+  const auto midnight = std::chrono::sys_days{day}.time_since_epoch();
+  return std::chrono::duration_cast<std::chrono::milliseconds>(midnight).count() +
+         static_cast<int64_t>(value.Hours) * 3600000 +
+         static_cast<int64_t>(value.Minutes) * 60000 +
+         static_cast<int64_t>(value.Seconds) * 1000 +
          static_cast<int64_t>(value.NanoSeconds / 1000000);
 }
 
@@ -542,13 +546,23 @@ void set_user_property_value(const rtl::OUString& name,
   } else if (value >>= flag) {
     out->set_flag(flag);
   } else if (value >>= datetime) {
-    out->set_epoch_ms(datetime_epoch_ms(datetime));
+    if (std::optional<int64_t> epoch = datetime_epoch_ms(datetime)) {
+      out->set_epoch_ms(*epoch);
+    } else {
+      warner.warn("user property " + utf8(name) +
+                  " holds an empty date and was emitted without a value");
+    }
   } else if (value >>= date) {
     css::util::DateTime midnight;
     midnight.Year = date.Year;
     midnight.Month = date.Month;
     midnight.Day = date.Day;
-    out->set_epoch_ms(datetime_epoch_ms(midnight));
+    if (std::optional<int64_t> epoch = datetime_epoch_ms(midnight)) {
+      out->set_epoch_ms(*epoch);
+    } else {
+      warner.warn("user property " + utf8(name) +
+                  " holds an empty date and was emitted without a value");
+    }
   } else {
     warner.warn("user property " + utf8(name) +
                 " has an unmapped type and was emitted without a value");
@@ -604,13 +618,19 @@ bool emit_metadata(const Reference<css::frame::XModel>& model,
   for (const rtl::OUString& keyword : props->getKeywords()) {
     metadata->add_keywords(utf8(keyword));
   }
-  metadata->set_created_epoch_ms(datetime_epoch_ms(props->getCreationDate()));
-  metadata->set_modified_epoch_ms(datetime_epoch_ms(props->getModificationDate()));
+  if (std::optional<int64_t> epoch = datetime_epoch_ms(props->getCreationDate())) {
+    metadata->set_created_epoch_ms(*epoch);
+  }
+  if (std::optional<int64_t> epoch = datetime_epoch_ms(props->getModificationDate())) {
+    metadata->set_modified_epoch_ms(*epoch);
+  }
   metadata->set_modified_by(utf8(props->getModifiedBy()));
   metadata->set_generator(utf8(props->getGenerator()));
   metadata->set_editing_cycles(props->getEditingCycles());
   metadata->set_editing_duration_seconds(props->getEditingDuration());
-  metadata->set_printed_epoch_ms(datetime_epoch_ms(props->getPrintDate()));
+  if (std::optional<int64_t> epoch = datetime_epoch_ms(props->getPrintDate())) {
+    metadata->set_printed_epoch_ms(*epoch);
+  }
   metadata->set_printed_by(utf8(props->getPrintedBy()));
   css::lang::Locale locale = props->getLanguage();
   std::string language = utf8(locale.Language);
@@ -1107,7 +1127,9 @@ class MarkerCollector {
       out->set_initials(utf8(text));
       css::util::DateTime when;
       props->getPropertyValue("DateTimeValue") >>= when;
-      out->set_epoch_ms(datetime_epoch_ms(when));
+      if (std::optional<int64_t> epoch = datetime_epoch_ms(when)) {
+        out->set_epoch_ms(*epoch);
+      }
     } catch (const css::beans::UnknownPropertyException&) {
       // Expected probe result: initials and creation time are optional.
     }
@@ -1283,7 +1305,9 @@ class MarkerCollector {
     out->set_comment(utf8(text));
     css::util::DateTime when;
     props->getPropertyValue("RedlineDateTime") >>= when;
-    out->set_epoch_ms(datetime_epoch_ms(when));
+    if (std::optional<int64_t> epoch = datetime_epoch_ms(when)) {
+      out->set_epoch_ms(*epoch);
+    }
     try {
       css::uno::Sequence<css::beans::PropertyValue> successor;
       props->getPropertyValue("RedlineSuccessorData") >>= successor;
@@ -1305,7 +1329,9 @@ class MarkerCollector {
         } else if (entry.Name == "RedlineDateTime") {
           css::util::DateTime under_when;
           entry.Value >>= under_when;
-          under->set_epoch_ms(datetime_epoch_ms(under_when));
+          if (std::optional<int64_t> epoch = datetime_epoch_ms(under_when)) {
+            under->set_epoch_ms(*epoch);
+          }
         }
       }
       // A successor block whose fields were all empty is no successor.
@@ -3389,7 +3415,9 @@ bool emit_slide_annotations(const Reference<css::drawing::XDrawPage>& slide,
       out->set_char_end(-1);
       out->set_author(utf8(annotation->getAuthor()));
       out->set_initials(utf8(annotation->getInitials()));
-      out->set_epoch_ms(datetime_epoch_ms(annotation->getDateTime()));
+      if (std::optional<int64_t> epoch = datetime_epoch_ms(annotation->getDateTime())) {
+        out->set_epoch_ms(*epoch);
+      }
       css::geometry::RealPoint2D position = annotation->getPosition();
       // Annotation positions are in millimeters (the office core's
       // RealPoint2D convention for annotations), converted to twips like
