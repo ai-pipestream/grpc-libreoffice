@@ -2552,6 +2552,73 @@ void encode_graphic(const Reference<css::graphic::XGraphic>& graphic,
   }
 }
 
+// Reads a picture shape's Graphic. A failed read is a loss on the picture,
+// not a reason to skip it: the caller still emits the picture's event.
+Reference<css::graphic::XGraphic> picture_graphic(
+    const Reference<css::beans::XPropertySet>& props, const std::string& label,
+    Warner& warner) {
+  Reference<css::graphic::XGraphic> graphic;
+  try {
+    props->getPropertyValue("Graphic") >>= graphic;
+  } catch (const css::uno::Exception& error) {
+    warner.lose_no_text(label + " graphic query failed: "
+                        + utf8(error.Message));
+  }
+  return graphic;
+}
+
+// Where a linked picture points, or empty for an embedded one. The office
+// core keeps the link on the graphic (OriginURL) and, for Writer pictures,
+// on the shape too; a link it never loaded leaves only the shape's.
+std::string picture_link(const Reference<css::beans::XPropertySet>& props,
+                         const Reference<css::graphic::XGraphic>& graphic) {
+  rtl::OUString url;
+  for (const Reference<css::beans::XPropertySet>& source :
+       {Reference<css::beans::XPropertySet>(graphic, UNO_QUERY), props}) {
+    if (!source.is()) continue;
+    for (const char* name : {"OriginURL", "GraphicURL"}) {
+      try {
+        Reference<css::beans::XPropertySetInfo> info =
+            source->getPropertySetInfo();
+        if (info.is() && !info->hasPropertyByName(oustring(name))) continue;
+        if ((source->getPropertyValue(oustring(name)) >>= url) &&
+            !url.isEmpty()) {
+          return utf8(url);
+        }
+      } catch (const css::uno::Exception&) {
+        // Expected probe result: the property is absent or not a string.
+      }
+    }
+  }
+  return std::string();
+}
+
+// Fills a picture's bytes. A picture whose graphic the office core cannot
+// give (a linked file that is not there, a web link the profile blocks, a
+// format it could not decode) hands back no graphic or one that encodes to
+// nothing; the picture is still in the document, so its event goes out with
+// no bytes and a loss that says why and names the link. `since` is the
+// loss mark taken before the graphic was read, so a failed read is not
+// reported twice.
+void encode_picture(const Reference<css::beans::XPropertySet>& props,
+                    const Reference<css::graphic::XGraphic>& graphic,
+                    const Reference<css::graphic::XGraphicProvider>& provider,
+                    const std::string& label, size_t since,
+                    std::string* mime_type, std::string* data,
+                    Warner& warner) {
+  if (graphic.is() && !fault_injected("picture-graphic-missing")) {
+    encode_graphic(graphic, provider, label, mime_type, data, warner);
+  }
+  if (!data->empty() || warner.losses() > since) return;
+  mime_type->clear();
+  const std::string link = picture_link(props, graphic);
+  warner.lose_no_text(label + " has no graphic"
+                      + (link.empty() ? std::string(": the office core gave "
+                                                    "none for it")
+                                      : ": it links to " + link
+                                            + ", which was not loaded"));
+}
+
 // Shared state of one Writer draw-page walk, threaded through the group
 // recursion so image and shape numbering stay document-global.
 struct WriterShapeWalk {
@@ -2772,14 +2839,9 @@ bool emit_writer_shapes(const Reference<css::container::XIndexAccess>& shapes,
     if (services->supportsService("com.sun.star.text.TextGraphicObject") ||
         services->supportsService("com.sun.star.drawing.GraphicObjectShape")) {
       if (!walk->want_images) continue;
-      Reference<css::graphic::XGraphic> graphic;
-      try {
-        props->getPropertyValue("Graphic") >>= graphic;
-      } catch (const css::uno::Exception& error) {
-        warner.warn(label + " graphic query failed", error);
-        continue;
-      }
-      if (!graphic.is()) continue;
+      const size_t losses = warner.losses();
+      Reference<css::graphic::XGraphic> graphic =
+          picture_graphic(props, label, warner);
 
       officev1::StreamPagesResponse event;
       officev1::EmbeddedImage* out = event.mutable_embedded_image();
@@ -2791,8 +2853,7 @@ bool emit_writer_shapes(const Reference<css::container::XIndexAccess>& shapes,
       fill_alt_text(props, out->mutable_title(), out->mutable_description());
       std::string image_label = "image " + std::to_string(walk->image_index);
 
-      const size_t losses = warner.losses();
-      encode_graphic(graphic, walk->provider, image_label,
+      encode_picture(props, graphic, walk->provider, image_label, losses,
                      out->mutable_mime_type(), out->mutable_data(), warner);
       warner.mark_gap(losses, out);
 
@@ -3166,30 +3227,24 @@ bool emit_shapes(const Reference<css::drawing::XShapes>& shapes,
     }
     if (want_images &&
         shape_type == "com.sun.star.drawing.GraphicObjectShape" && props.is()) {
-      Reference<css::graphic::XGraphic> graphic;
-      try {
-        props->getPropertyValue("Graphic") >>= graphic;
-      } catch (const css::uno::Exception& error) {
-        warner.warn(label + " graphic query failed", error);
-      }
-      if (graphic.is()) {
-        officev1::StreamPagesResponse image_event;
-        officev1::EmbeddedImage* image = image_event.mutable_embedded_image();
-        image->set_index((*image_counter)++);
-        image->set_page_index(page_index);
-        image->set_name(out->name());
-        image->set_title(out->title());
-        image->set_description(out->description());
-        image->set_width_twips(out->width_twips());
-        image->set_height_twips(out->height_twips());
-        const size_t losses = warner.losses();
-        encode_graphic(graphic, provider,
-                       "image " + std::to_string(image->index()),
-                       image->mutable_mime_type(), image->mutable_data(),
-                       warner);
-        warner.mark_gap(losses, image);
-        if (!emit_fn(image_event)) return false;
-      }
+      const size_t losses = warner.losses();
+      Reference<css::graphic::XGraphic> graphic =
+          picture_graphic(props, label, warner);
+      officev1::StreamPagesResponse image_event;
+      officev1::EmbeddedImage* image = image_event.mutable_embedded_image();
+      image->set_index((*image_counter)++);
+      image->set_page_index(page_index);
+      image->set_name(out->name());
+      image->set_title(out->title());
+      image->set_description(out->description());
+      image->set_width_twips(out->width_twips());
+      image->set_height_twips(out->height_twips());
+      encode_picture(props, graphic, provider,
+                     "image " + std::to_string(image->index()), losses,
+                     image->mutable_mime_type(), image->mutable_data(),
+                     warner);
+      warner.mark_gap(losses, image);
+      if (!emit_fn(image_event)) return false;
     }
   }
   return true;
@@ -3404,33 +3459,26 @@ bool emit_slide_shape(const Reference<css::drawing::XShape>& shape,
   // pictures arrive as empty placeholders.
   if (image_counter != nullptr && props.is() &&
       shape_type.ends_with(".GraphicObjectShape")) {
-    Reference<css::graphic::XGraphic> graphic;
-    try {
-      props->getPropertyValue("Graphic") >>= graphic;
-    } catch (const css::uno::Exception& error) {
-      warner.warn(label + " graphic query failed", error);
-    }
-    if (graphic.is()) {
-      officev1::StreamPagesResponse image_event;
-      officev1::EmbeddedImage* image = image_event.mutable_embedded_image();
-      image->set_index((*image_counter)++);
-      // Slide geometry is page-local, and the slide index is the page.
-      image->set_page_index(notes ? -1 : slide_index);
-      Reference<css::container::XNamed> named(shape, UNO_QUERY);
-      if (named.is()) image->set_name(utf8(named->getName()));
-      image->set_title(out->title());
-      image->set_description(out->description());
-      *image->mutable_anchor() = out->position();
-      image->set_width_twips(out->width_twips());
-      image->set_height_twips(out->height_twips());
-      const size_t losses = warner.losses();
-      encode_graphic(graphic, provider,
-                     "image " + std::to_string(image->index()),
-                     image->mutable_mime_type(), image->mutable_data(),
-                     warner);
-      warner.mark_gap(losses, image);
-      if (!emit_fn(image_event)) return false;
-    }
+    const size_t losses = warner.losses();
+    Reference<css::graphic::XGraphic> graphic =
+        picture_graphic(props, label, warner);
+    officev1::StreamPagesResponse image_event;
+    officev1::EmbeddedImage* image = image_event.mutable_embedded_image();
+    image->set_index((*image_counter)++);
+    // Slide geometry is page-local, and the slide index is the page.
+    image->set_page_index(notes ? -1 : slide_index);
+    Reference<css::container::XNamed> named(shape, UNO_QUERY);
+    if (named.is()) image->set_name(utf8(named->getName()));
+    image->set_title(out->title());
+    image->set_description(out->description());
+    *image->mutable_anchor() = out->position();
+    image->set_width_twips(out->width_twips());
+    image->set_height_twips(out->height_twips());
+    encode_picture(props, graphic, provider,
+                   "image " + std::to_string(image->index()), losses,
+                   image->mutable_mime_type(), image->mutable_data(), warner);
+    warner.mark_gap(losses, image);
+    if (!emit_fn(image_event)) return false;
   }
 
   Reference<css::drawing::XShapes> children;

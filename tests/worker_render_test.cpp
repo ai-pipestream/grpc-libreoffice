@@ -5149,6 +5149,110 @@ void verify_linked_resources_are_not_fetched() {
               + std::to_string(counter.connections()) + " time(s)");
 }
 
+// A picture whose graphic the office core cannot give (a linked file that
+// is not there, a web link the profile blocks) is still a picture in the
+// document. It must reach the caller as an EmbeddedImage at its place, with
+// no bytes and an ExtractionGap naming the link, never be skipped with no
+// event and no warning.
+void verify_picture_without_graphic_is_reported() {
+  const std::string link = "file:///nonexistent/grlibre-missing-picture.png";
+  const std::string fodt = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ xmlns:xlink="http://www.w3.org/1999/xlink"
+ office:version="1.2"
+ office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:body>
+  <office:text>
+   <text:p>A missing picture follows.<draw:frame draw:name="Missing" text:anchor-type="as-char" svg:width="2cm" svg:height="2cm"><draw:image xlink:href=")"
+      + link + R"(" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/></draw:frame></text:p>
+  </office:text>
+ </office:body>
+</office:document>
+)";
+  const std::string fodg = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ xmlns:xlink="http://www.w3.org/1999/xlink"
+ office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.graphics">
+ <office:body><office:drawing>
+  <draw:page draw:name="page1">
+   <draw:frame draw:name="Missing" svg:x="2cm" svg:y="2cm" svg:width="2cm" svg:height="2cm"><draw:image xlink:href=")"
+      + link + R"(" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/></draw:frame>
+  </draw:page>
+ </office:drawing></office:body>
+</office:document>
+)";
+  for (const auto& [extension, doc] :
+       {std::pair<const char*, const std::string*>{"fodt", &fodt},
+        std::pair<const char*, const std::string*>{"fodg", &fodg}}) {
+    const std::string name = extension;
+    std::vector<std::string> payloads;
+    auto outcome = run("pages", extension, *doc, &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            name + ": a missing picture does not fail the render: "
+                + outcome.detail);
+    int images = 0;
+    const officev1::EmbeddedImage* missing = nullptr;
+    officev1::RenderStatus status;
+    std::vector<officev1::StreamPagesResponse> events(payloads.size());
+    for (size_t i = 0; i < payloads.size(); i++) {
+      require(events[i].ParseFromString(payloads[i]), "pages event parses");
+      if (events[i].has_embedded_image()) {
+        images++;
+        missing = &events[i].embedded_image();
+      }
+      if (events[i].has_status()) status = events[i].status();
+    }
+    require(images == 1 && missing != nullptr,
+            name + ": the missing picture is still an image event, got "
+                + std::to_string(images));
+    require(missing->name() == "Missing" && missing->data().empty(),
+            name + ": the event is the picture, with no bytes, got name "
+                + missing->name() + " and "
+                + std::to_string(missing->data().size()) + " bytes");
+    require(missing->width_twips() > 0 && missing->height_twips() > 0,
+            name + ": the event keeps the picture's size");
+    require(missing->has_gap() &&
+                gap_text(&missing->gap()).contains("has no graphic") &&
+                gap_text(&missing->gap()).contains(link),
+            name + ": the gap says why and names the link, got: "
+                + gap_text(missing->has_gap() ? &missing->gap() : nullptr));
+    require(status.incomplete_items() == 1,
+            name + ": the picture is counted incomplete, got "
+                + std::to_string(status.incomplete_items()));
+  }
+
+  // The office core handing back no graphic at all, on a slide (the third
+  // picture walk): the slide picture still goes out, marked.
+  std::vector<std::string> payloads;
+  grlibre::WorkerOutcome outcome;
+  {
+    FaultScope scope("picture-graphic-missing");
+    outcome = run("pages", "fodp", kTypedFodp, &payloads);
+  }
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "fodp: a picture with no graphic does not fail the render: "
+              + outcome.detail);
+  int marked = 0;
+  for (const std::string& payload : payloads) {
+    officev1::StreamPagesResponse event;
+    require(event.ParseFromString(payload), "pages event parses");
+    if (!event.has_embedded_image()) continue;
+    const officev1::EmbeddedImage& image = event.embedded_image();
+    require(image.data().empty() && image.has_gap() &&
+                gap_text(&image.gap()).contains("has no graphic"),
+            "fodp: a slide picture with no graphic is marked, got "
+                + std::to_string(image.data().size()) + " bytes and: "
+                + gap_text(image.has_gap() ? &image.gap() : nullptr));
+    marked++;
+  }
+  require(marked > 0, "fodp: the slide pictures are still image events");
+}
+
 int main() {
   if (!std::filesystem::exists(lo_install_path())) {
     std::println(stderr, "SKIP: no LibreOffice at {}", lo_install_path());
@@ -5205,6 +5309,7 @@ int main() {
   verify_shape_group_depth_is_capped();
   verify_document_macros_never_run();
   verify_linked_resources_are_not_fetched();
+  verify_picture_without_graphic_is_reported();
   verify_death_before_status_is_crash();
   verify_hung_worker_is_killed_at_deadline();
   verify_eof_without_exit_is_reaped();
