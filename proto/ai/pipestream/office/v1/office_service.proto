@@ -625,11 +625,12 @@ message DocumentMetadata {
   string subject = 3;
   // Document keywords; empty when unset.
   repeated string keywords = 4;
-  // Creation time as milliseconds since the Unix epoch, UTC; 0 when unset.
-  int64 created_epoch_ms = 5;
-  // Last-modification time as milliseconds since the Unix epoch, UTC; 0 when
-  // unset.
-  int64 modified_epoch_ms = 6;
+  // Creation time as milliseconds since the Unix epoch, UTC, negative before
+  // 1970; unset when the document carries none.
+  optional int64 created_epoch_ms = 5;
+  // Last-modification time as milliseconds since the Unix epoch, UTC,
+  // negative before 1970; unset when the document carries none.
+  optional int64 modified_epoch_ms = 6;
   // Name of the author of the last save; empty when unset.
   string modified_by = 7;
   // The application that produced the document, as stored in it.
@@ -638,9 +639,9 @@ message DocumentMetadata {
   int32 editing_cycles = 9;
   // Total editing time in seconds, as tracked by the producing application.
   int64 editing_duration_seconds = 10;
-  // Last print time as milliseconds since the Unix epoch, UTC; 0 when never
-  // printed.
-  int64 printed_epoch_ms = 11;
+  // Last print time as milliseconds since the Unix epoch, UTC, negative
+  // before 1970; unset when never printed.
+  optional int64 printed_epoch_ms = 11;
   // Name of the last printer of the document; empty when never printed.
   string printed_by = 12;
   // The document's default language as a BCP 47 style tag, for example
@@ -678,7 +679,8 @@ message UserProperty {
     double number = 3;
     // A boolean value.
     bool flag = 4;
-    // A date or datetime value as milliseconds since the Unix epoch, UTC.
+    // A date or datetime value as milliseconds since the Unix epoch, UTC,
+    // negative before 1970.
     int64 epoch_ms = 5;
   }
 }
@@ -851,8 +853,9 @@ message Comment {
   string author = 3;
   // The comment author's initials; empty when unset.
   string initials = 4;
-  // Creation time as milliseconds since the Unix epoch, UTC; 0 when unset.
-  int64 epoch_ms = 5;
+  // Creation time as milliseconds since the Unix epoch, UTC, negative before
+  // 1970; unset when the comment carries none.
+  optional int64 epoch_ms = 5;
   // The comment's plain text content.
   string text = 6;
   // The comment's rich content runs when the office core exposes them,
@@ -909,8 +912,8 @@ message TrackedChangeSuccessor {
   // The superseded change's author.
   string author = 3;
   // The superseded change's time as milliseconds since the Unix epoch,
-  // UTC; 0 when unset.
-  int64 epoch_ms = 4;
+  // UTC, negative before 1970; unset when the change carries none.
+  optional int64 epoch_ms = 4;
   // The superseded change's comment; empty when unset.
   string comment = 5;
 }
@@ -929,9 +932,9 @@ message TrackedChange {
   string kind_name = 3;
   // The change author's name.
   string author = 4;
-  // The change time as milliseconds since the Unix epoch, UTC; 0 when
-  // unset.
-  int64 epoch_ms = 5;
+  // The change time as milliseconds since the Unix epoch, UTC, negative
+  // before 1970; unset when the change carries none.
+  optional int64 epoch_ms = 5;
   // The change's comment; empty when unset.
   string comment = 6;
   // This change's number in the document, 1 up in the order the

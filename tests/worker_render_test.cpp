@@ -29,6 +29,7 @@
 #include "docling_map.h"
 #include "document_passwords.h"
 #include "encrypted_docx_fixture.h"
+#include "pdf_page_range.h"
 #include "worker_runner.h"
 
 namespace {
@@ -1488,6 +1489,75 @@ void verify_document_category() {
             "the category is not repeated as a custom property");
   }
   require(metadata_events == 1, "one metadata event for the category fixture");
+}
+
+// A flat ODT whose dates fall before 1970: the creation date, a dated
+// custom property, and a comment.
+constexpr char kOldDatesFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0"
+ office:version="1.3"
+ office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:meta>
+  <meta:creation-date>1962-03-01T09:30:00</meta:creation-date>
+  <dc:date>2024-01-02T03:04:05</dc:date>
+  <meta:user-defined meta:name="Founded" meta:value-type="date">1962-03-01</meta:user-defined>
+ </office:meta>
+ <office:body>
+  <office:text>
+   <text:p>Minutes<office:annotation><dc:creator>Ada</dc:creator><dc:date>1965-07-04T12:00:00</dc:date><text:p>An old note</text:p></office:annotation> of the meeting.</text:p>
+  </office:text>
+ </office:body>
+</office:document>
+)";
+
+// A date is reported as the instant it is, however old: dates before 1970
+// are negative milliseconds, never the 0 that means "not set". A date the
+// document does not carry is left unset rather than sent as 0.
+void verify_dates_before_1970() {
+  std::vector<std::string> payloads;
+  auto outcome = run("pages", "fodt", kOldDatesFodt, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "old-dates fodt renders ok: " + outcome.detail);
+  bool metadata_seen = false;
+  bool comment_seen = false;
+  for (const std::string& payload : payloads) {
+    officev1::StreamPagesResponse event;
+    require(event.ParseFromString(payload), "old-dates event parses");
+    if (event.has_metadata()) {
+      metadata_seen = true;
+      const officev1::DocumentMetadata& meta = event.metadata();
+      require(meta.has_created_epoch_ms() &&
+                  meta.created_epoch_ms() == -247329000000LL,
+              "a 1962 creation date is its own negative instant, got "
+                  + std::to_string(meta.created_epoch_ms()));
+      require(meta.has_modified_epoch_ms() &&
+                  meta.modified_epoch_ms() == 1704164645000LL,
+              "a 2024 modification date is unchanged");
+      require(!meta.has_printed_epoch_ms(),
+              "a document never printed carries no print date, got "
+                  + std::to_string(meta.printed_epoch_ms()));
+      bool founded = false;
+      for (const officev1::UserProperty& property : meta.user_properties()) {
+        if (property.name() == "Founded") {
+          founded = property.has_epoch_ms() &&
+                    property.epoch_ms() == -247363200000LL;
+        }
+      }
+      require(founded, "a 1962 date property keeps its date");
+    }
+    if (event.has_comment() && event.comment().author() == "Ada") {
+      comment_seen = true;
+      require(event.comment().has_epoch_ms() &&
+                  event.comment().epoch_ms() == -141825600000LL,
+              "a 1965 comment keeps its time, got "
+                  + std::to_string(event.comment().epoch_ms()));
+    }
+  }
+  require(metadata_seen && comment_seen,
+          "the metadata and the comment are both emitted");
 }
 
 void verify_part_selection() {
@@ -3950,6 +4020,25 @@ void verify_pdf_page_range() {
   std::vector<std::string> pages = rasterize_pdf(fold_pdf(payloads));
   require(pages.size() == 1, "1:1 range exports exactly one page, got "
                                  + std::to_string(pages.size()));
+
+  // A range with only a first page runs through the real end of the
+  // document, however long: no page number stands in for "the end".
+  require(grlibre::pdf_page_range(5, 0) == "5-",
+          "an open-ended range has no last page, got "
+              + grlibre::pdf_page_range(5, 0));
+  require(grlibre::pdf_page_range(0, 3) == "1-3" &&
+              grlibre::pdf_page_range(2, 4) == "2-4" &&
+              grlibre::pdf_page_range(0, 0).empty(),
+          "closed ranges and the whole document are unchanged");
+  extras.set_first_page(2);
+  extras.set_last_page(0);
+  std::vector<std::string> tail_payloads;
+  auto tail = run_with_extras("pdf", "txt", doc, extras, &tail_payloads);
+  require(tail.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "open-ended pdf ok: " + tail.detail);
+  require(rasterize_pdf(fold_pdf(tail_payloads)).size() == full_pages.size() - 1,
+          "an open-ended range from page 2 exports every page after the "
+          "first");
 }
 
 // skip_hidden on the pdf path. The office core's pdf filter never exports
@@ -4807,6 +4896,21 @@ void verify_svg_fallback_raster_is_clamped() {
   require(width <= 2048 && height <= 2048,
           "the fallback raster obeys the per-side bound, got " +
               std::to_string(width) + "x" + std::to_string(height));
+
+  // A fallback raster that fails to encode is a failed render, never an
+  // SVG wrapper around an empty image sent as a good page.
+  {
+    FaultScope scope("svg-fallback-png-fails");
+    std::vector<std::string> failed;
+    auto broken = run_with_extras("pages", "fods", tall_sheet, extras, &failed,
+                                  "1");
+    require(broken.kind != grlibre::WorkerOutcome::Kind::kOk,
+            "a fallback raster that will not encode fails the render");
+    PagesRun broken_run = fold_pages(failed);
+    require(broken_run.pages.empty() && !broken_run.got_status,
+            "no page image and no status follow an encode failure, got "
+                + std::to_string(broken_run.pages.size()) + " pages");
+  }
 }
 
 // One text shape buried under `depth` nested groups, in a text document, a
@@ -5064,6 +5168,7 @@ int main() {
   verify_typed_presentation();
   verify_part_selection();
   verify_document_category();
+  verify_dates_before_1970();
   verify_embedded_objects();
   verify_line_rects();
   verify_docling_mapping();
