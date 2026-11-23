@@ -1819,7 +1819,7 @@ const char kEmbeddedFodt[] = R"(<?xml version="1.0" encoding="UTF-8"?>
        <table:table-rows>
         <table:table-row><table:table-cell office:value-type="string"><text:p>Q1</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="1"><text:p>1</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="4"><text:p>4</text:p></table:table-cell></table:table-row>
         <table:table-row><table:table-cell office:value-type="string"><text:p>Q2</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="2"><text:p>2</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="5"><text:p>5</text:p></table:table-cell></table:table-row>
-        <table:table-row><table:table-cell office:value-type="string"><text:p>Q3</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="3"><text:p>3</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="6"><text:p>6</text:p></table:table-cell></table:table-row>
+        <table:table-row><table:table-cell office:value-type="string"><text:p>Q3</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="3"><text:p>3</text:p></table:table-cell><table:table-cell office:value-type="float" office:value="1234567.89"><text:p>1234567.89</text:p></table:table-cell></table:table-row>
        </table:table-rows>
       </table:table>
      </chart:chart>
@@ -1868,7 +1868,7 @@ void verify_embedded_objects() {
           chart.series(0).values_y(0) == 1.0 &&
           chart.series(0).values_y(2) == 3.0 &&
           chart.series(1).values_y_size() == 3 &&
-          chart.series(1).values_y(2) == 6.0 &&
+          chart.series(1).values_y(2) == 1234567.89 &&
           chart.series(0).label() == "Alpha" &&
           chart.series(1).label() == "Beta";
       bool categories_ok = chart.categories_size() == 3 &&
@@ -1877,6 +1877,15 @@ void verify_embedded_objects() {
       bool tabular_ok = chart.tabular().rows() == 4 &&
                         chart.tabular().columns() == 3 &&
                         chart.tabular().cells_size() > 0;
+      // The grid text of a value is its exact shortest form, never a
+      // rounded one such as 1.23457e+06.
+      std::string precise_text;
+      for (const officev1::TableCellData& cell : chart.tabular().cells()) {
+        if (cell.row() == 3 && cell.column() == 2) precise_text = cell.text();
+      }
+      require(precise_text == "1234567.89",
+              "the tabular projection keeps the value exactly, got: "
+                  + precise_text);
       // The replacement graphic of a chart is a metafile inside the office
       // core; on the wire it is a PNG or nothing, never a metafile.
       bool replacement_ok =
@@ -3847,6 +3856,68 @@ void verify_sheet_visibility_and_used_range() {
   }
 }
 
+// skip_hidden and paint_used_range are applied or the render is refused,
+// never accepted and quietly dropped. When the parts cannot be described at
+// all, or one sheet's visibility or used range cannot be read, the worker
+// cannot tell a hidden sheet from a shown one (or where the used cells
+// are), so it refuses before anything is emitted instead of painting the
+// hidden sheet under STATE_OK. The same faults leave a request that set
+// neither option alone.
+void verify_unreadable_parts_refuse_the_options() {
+  const std::string doc = kTwoSheetFods;
+  struct Case {
+    const char* fault;
+    bool skip_hidden;
+    bool paint_used_range;
+    const char* names;
+  };
+  const Case cases[] = {
+      {"describe-parts-no-model", true, false, "skip_hidden"},
+      {"describe-parts-visibility-throws", true, false, "skip_hidden"},
+      {"describe-parts-no-model", false, true, "paint_used_range"},
+      {"describe-parts-used-range-throws", false, true, "paint_used_range"},
+  };
+  for (const Case& c : cases) {
+    const std::string name = std::string(c.fault) + " with " + c.names;
+    FaultScope scope(c.fault);
+    officev1::StreamOptions extras;
+    extras.set_skip_hidden(c.skip_hidden);
+    extras.set_paint_used_range(c.paint_used_range);
+    std::vector<std::string> payloads;
+    std::string refusal;
+    auto outcome = run_with_extras("pages", "fods", doc, extras, &payloads,
+                                   "all", &refusal);
+    require(payloads.empty(),
+            name + ": nothing is emitted, got "
+                + std::to_string(payloads.size()) + " events");
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOptionRefused,
+            name + ": the worker refuses the option, got: " + outcome.detail);
+    require(refusal.contains(c.names),
+            name + ": the refusal names the option, got: " + refusal);
+
+    std::vector<std::string> plain;
+    auto plain_outcome = run("pages", "fods", doc, &plain);
+    PagesRun plain_run = fold_pages(plain);
+    require(plain_outcome.kind == grlibre::WorkerOutcome::Kind::kOk &&
+                plain_run.pages.size() == 2 && plain_run.got_status,
+            name + ": a request with neither option still renders both "
+                "sheets: " + plain_outcome.detail);
+  }
+  // A used range that cannot be read does not stop skip_hidden, which
+  // needs only the visibility.
+  {
+    FaultScope scope("describe-parts-used-range-throws");
+    officev1::StreamOptions extras;
+    extras.set_skip_hidden(true);
+    std::vector<std::string> payloads;
+    auto outcome = run_with_extras("pages", "fods", doc, extras, &payloads);
+    PagesRun run = fold_pages(payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk &&
+                run.pages.size() == 1,
+            "skip_hidden needs no used range: " + outcome.detail);
+  }
+}
+
 // A page image names the sheet it shows, not its place among the pages
 // that were painted: with the hidden middle sheet left out, the last
 // sheet's image still carries the last sheet's ordinal, the one its Sheet
@@ -4059,21 +4130,125 @@ void verify_per_page_style() {
   }
 }
 
-// Form values naming no existing field must degrade to nothing: same
-// render, no crash, status still OK.
-void verify_unknown_form_value_is_harmless() {
-  officev1::StreamOptions extras;
-  officev1::FormFillValue* value = extras.add_form_values();
-  value->set_name("no-such-field");
-  value->set_value("ignored");
-  std::vector<std::string> payloads;
-  auto outcome = run_with_extras("pages", "txt", "No form fields here.\n",
-                                 extras, &payloads);
-  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
-          "unknown form value renders ok: " + outcome.detail);
-  PagesRun run = fold_pages(payloads);
-  require(run.got_status && run.status.state() == officev1::RenderStatus::STATE_OK,
-          "unknown form value keeps status ok");
+// The form fields of a pages-mode run, by name; a draw-page control is
+// keyed by its own name too.
+std::map<std::string, officev1::FormField> form_fields_of(
+    const std::vector<std::string>& payloads) {
+  std::map<std::string, officev1::FormField> fields;
+  for (const std::string& payload : payloads) {
+    officev1::StreamPagesResponse event;
+    require(event.ParseFromString(payload), "pages event parses");
+    if (event.has_form_field()) {
+      fields[event.form_field().name()] = event.form_field();
+    }
+  }
+  return fields;
+}
+
+// form_values and tracked_changes are applied or the render is refused,
+// never accepted and quietly dropped. Values that name real fields land in
+// the document the pages and the typed events come from. A name no field
+// carries, a value the field cannot take, a document the worker cannot
+// reach, and a tracked-change command with nothing to dispatch it each
+// refuse the request before anything is emitted, naming what failed.
+void verify_options_are_applied_or_refused() {
+  const std::string doc = kMarkedFodt;
+  {
+    std::vector<std::string> payloads;
+    auto outcome = run("pages", "fodt", doc, &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "the form document renders: " + outcome.detail);
+    auto fields = form_fields_of(payloads);
+    require(fields["txt1"].text() == "filled value" &&
+                fields["check1"].checked() && fields["CB1"].checked(),
+            "the stored form values are the starting point");
+  }
+  {
+    officev1::StreamOptions extras;
+    auto add = [&](const char* name, const char* value) {
+      officev1::FormFillValue* fill = extras.add_form_values();
+      fill->set_name(name);
+      fill->set_value(value);
+    };
+    add("txt1", "typed by the caller");
+    add("check1", "false");
+    add("CB1", "false");
+    std::vector<std::string> payloads;
+    auto outcome = run_with_extras("pages", "fodt", doc, extras, &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            "form values that name real fields render: " + outcome.detail);
+    auto fields = form_fields_of(payloads);
+    require(fields["txt1"].text() == "typed by the caller",
+            "the text fieldmark holds the written text, got: "
+                + fields["txt1"].text());
+    require(!fields["check1"].checked(),
+            "the checkbox fieldmark is unchecked");
+    require(!fields["CB1"].checked(), "the checkbox control is unchecked");
+  }
+
+  struct Refusal {
+    const char* what;
+    const char* fault;
+    const char* field;
+    const char* value;
+    officev1::TrackedChangeDisplay display;
+    const char* names;
+  };
+  const Refusal refusals[] = {
+      {"a name no field carries", nullptr, "no-such-field", "ignored",
+       officev1::TRACKED_CHANGE_DISPLAY_UNSPECIFIED, "no-such-field"},
+      {"a checkbox value that is no flag", nullptr, "check1", "maybe",
+       officev1::TRACKED_CHANGE_DISPLAY_UNSPECIFIED, "check1"},
+      {"a control value that is no flag", nullptr, "CB1", "maybe",
+       officev1::TRACKED_CHANGE_DISPLAY_UNSPECIFIED, "CB1"},
+      {"form values with no reachable document", "document-options-no-model",
+       "txt1", "x", officev1::TRACKED_CHANGE_DISPLAY_UNSPECIFIED,
+       "form_values"},
+      {"tracked changes with no reachable document",
+       "document-options-no-model", nullptr, nullptr,
+       officev1::TRACKED_CHANGE_DISPLAY_FINAL, "tracked_changes"},
+      {"tracked changes with no dispatcher", "tracked-changes-no-dispatcher",
+       nullptr, nullptr, officev1::TRACKED_CHANGE_DISPLAY_ORIGINAL,
+       "tracked_changes"},
+  };
+  for (const Refusal& refusal : refusals) {
+    const std::string what = refusal.what;
+    officev1::StreamOptions extras;
+    if (refusal.field != nullptr) {
+      officev1::FormFillValue* fill = extras.add_form_values();
+      fill->set_name(refusal.field);
+      fill->set_value(refusal.value);
+    }
+    extras.set_tracked_changes(refusal.display);
+    std::vector<std::string> payloads;
+    std::string reason;
+    grlibre::WorkerOutcome outcome;
+    if (refusal.fault != nullptr) {
+      FaultScope scope(refusal.fault);
+      outcome = run_with_extras("pages", "fodt", doc, extras, &payloads, "all",
+                                &reason);
+    } else {
+      outcome = run_with_extras("pages", "fodt", doc, extras, &payloads, "all",
+                                &reason);
+    }
+    require(payloads.empty(),
+            what + ": nothing is emitted, got "
+                + std::to_string(payloads.size()) + " events");
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOptionRefused,
+            what + ": the worker refuses the request, got: " + outcome.detail);
+    require(reason.contains(refusal.names),
+            what + ": the refusal names what failed, got: " + reason);
+  }
+  // The same document without options is untouched by those faults.
+  for (const char* fault :
+       {"document-options-no-model", "tracked-changes-no-dispatcher"}) {
+    FaultScope scope(fault);
+    std::vector<std::string> payloads;
+    auto outcome = run_with_parts("pages", "fodt", doc, "1", &payloads);
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            std::string(fault) + ": a request with no options renders: "
+                + outcome.detail);
+  }
 }
 
 // A document whose reader-visible text comes largely from fields, whose
@@ -4745,11 +4920,12 @@ int main() {
   verify_pdf_page_range();
   verify_pdf_skip_hidden();
   verify_sheet_visibility_and_used_range();
+  verify_unreadable_parts_refuse_the_options();
   verify_skip_hidden_keeps_sheet_ordinals();
   verify_notes_pages();
   verify_tracked_change_display();
   verify_per_page_style();
-  verify_unknown_form_value_is_harmless();
+  verify_options_are_applied_or_refused();
   verify_svg_fallback_raster_is_clamped();
   verify_shape_group_depth_is_capped();
   verify_document_macros_never_run();

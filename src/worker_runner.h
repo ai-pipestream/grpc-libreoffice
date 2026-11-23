@@ -18,6 +18,7 @@ struct WorkerOutcome {
     kRedactionRefused,      // the requested redaction could not be applied
     kPasswordRequired,      // password-protected; no candidate opened it
     kExtractionFailed,      // requested typed content could not be extracted
+    kOptionRefused,         // a requested option could not be applied
     kTimeout,               // deadline elapsed; worker was killed
     kAborted,               // the frame consumer declined further frames
     kCancelled,             // the caller went away; worker was killed

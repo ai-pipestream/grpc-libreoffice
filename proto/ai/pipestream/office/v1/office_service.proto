@@ -25,7 +25,10 @@ option java_package = "ai.pipestream.office.v1";
 //   RESOURCE_EXHAUSTED - the document exceeds the configured byte cap.
 //   FAILED_PRECONDITION- the document package is broken and would need
 //                        LibreOffice's repair path, which the request did
-//                        not opt into (allow_package_repair).
+//                        not opt into (allow_package_repair); or an option
+//                        of the request could not be applied to this
+//                        document (skip_hidden, paint_used_range), in
+//                        which case nothing was emitted.
 //   UNIMPLEMENTED      - reserved; this version implements the repair path
 //                        when allow_package_repair is set.
 //   DEADLINE_EXCEEDED  - the worker exceeded the per-document timeout and
@@ -199,7 +202,11 @@ message StreamOptions {
   int32 timeout_seconds = 9;
   // How tracked changes (redlines) are displayed in the loaded document
   // before paint and extraction. Unspecified leaves the document as stored.
-  // First nonzero value in the upload stream wins.
+  // First nonzero value in the upload stream wins. Applied or refused: when
+  // FINAL or ORIGINAL leaves any tracked change behind, or the document,
+  // its view, or the command dispatcher cannot be reached, the call fails
+  // with FAILED_PRECONDITION before anything is emitted. Only text
+  // documents carry tracked changes; other classes are left as they are.
   TrackedChangeDisplay tracked_changes = 10;
   // When set to SVG, each page is exported as a vector graphic instead of
   // a raster. PageImage.format is PAGE_IMAGE_FORMAT_SVG and the png field
@@ -207,18 +214,29 @@ message StreamOptions {
   PageVectorFormat vector_format = 11;
   // When true, hidden sheets and hidden slides are omitted from page
   // images and from DocumentInfo.page_count / page_rects. Typed content
-  // for hidden parts is still extracted. First true wins.
+  // for hidden parts is still extracted. First true wins. Applied or
+  // refused: when the visibility of a sheet or slide cannot be read, the
+  // call fails with FAILED_PRECONDITION before anything is emitted rather
+  // than paint a part that may be hidden.
   bool skip_hidden = 12;
   // When true, spreadsheet page images are cropped to the used cell range
   // instead of the full sheet canvas. No effect on other document classes.
-  // First true wins.
+  // First true wins. Applied or refused: when a sheet's used range cannot
+  // be read, the call fails with FAILED_PRECONDITION before anything is
+  // emitted rather than paint the full canvas.
   bool paint_used_range = 13;
   // When true, each presentation slide is followed by its notes page as an
   // extra PageImage (and an extra DocumentInfo.page_rects entry). Notes
   // pages are painted in notes-page space. First true wins.
   bool include_notes_pages = 14;
   // Form field values to write into the loaded document before paint and
-  // export. Matched by FormField.name. First non-empty list wins.
+  // export. Matched by FormField.name, draw-page controls inside group
+  // shapes included. First non-empty list wins. Applied or refused: each
+  // value is written and read back; a name no field carries, a value the
+  // field cannot take, two different values for one name, or a field that
+  // does not hold the value afterwards fails the call with
+  // FAILED_PRECONDITION naming the field, before anything is emitted. The
+  // write is never recorded as a tracked change.
   repeated FormFillValue form_values = 15;
   // Character spans in the document's annotation text space to redact:
   // overlapping line boxes are painted black on page images, and matching
@@ -257,8 +275,10 @@ enum PageVectorFormat {
 message FormFillValue {
   // The field's name as stored in the document (FormField.name).
   string name = 1;
-  // The value to write: text content, a dropdown entry (or its index as
-  // text), or "true"/"false" for a checkbox.
+  // The value to write: text content for a text field; one of the entries
+  // (or its zero-based index as decimal text) for a dropdown or list box;
+  // true/1/yes/on or false/0/no/off, any letter case, for a checkbox or
+  // option button. Anything else for a checkbox or list is refused.
   string value = 2;
 }
 
