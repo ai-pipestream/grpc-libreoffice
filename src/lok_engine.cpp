@@ -28,6 +28,7 @@
 #include "ai/pipestream/office/v1/office_service.pb.h"
 #include "document_passwords.h"
 #include "event_frame.h"
+#include "fault_injection.h"
 #include "png_encode.h"
 #include "uno_extract.h"
 
@@ -311,6 +312,7 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
                             static_cast<int>(page.height));
         std::string png =
             encode_png(pixels.data(), size.width_px, size.height_px, bgra);
+        if (fault_injected("svg-fallback-png-fails")) png.clear();
         svg = svg_from_png(png, size.width_px, size.height_px);
       }
       if (svg.empty() || !svg.contains("<svg")) {

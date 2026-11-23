@@ -4463,6 +4463,21 @@ void verify_svg_fallback_raster_is_clamped() {
   require(width <= 2048 && height <= 2048,
           "the fallback raster obeys the per-side bound, got " +
               std::to_string(width) + "x" + std::to_string(height));
+
+  // A fallback raster that fails to encode is a failed render, never an
+  // SVG wrapper around an empty image sent as a good page.
+  {
+    FaultScope scope("svg-fallback-png-fails");
+    std::vector<std::string> failed;
+    auto broken = run_with_extras("pages", "fods", tall_sheet, extras, &failed,
+                                  "1");
+    require(broken.kind != grlibre::WorkerOutcome::Kind::kOk,
+            "a fallback raster that will not encode fails the render");
+    PagesRun broken_run = fold_pages(failed);
+    require(broken_run.pages.empty() && !broken_run.got_status,
+            "no page image and no status follow an encode failure, got "
+                + std::to_string(broken_run.pages.size()) + " pages");
+  }
 }
 
 // One text shape buried under `depth` nested groups, in a text document, a
