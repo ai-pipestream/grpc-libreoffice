@@ -141,11 +141,30 @@ bool is_repairable_broken_package(const std::string& bytes);
 // one document per process, so it is set once before extraction.
 void set_source_name(const std::string& name);
 
+// Outcome of applying a request's tracked_changes and form_values.
+struct DocumentOptionsResult {
+  // False when an option the request set could not be applied; nothing may
+  // then be painted, exported, or extracted.
+  bool ok = true;
+  // Which option failed and why, for the caller's status. It names the
+  // option and the form field, never document text.
+  std::string refusal;
+};
+
 // Applies tracked-change display and form fills to the document currently
-// loaded in this process. Problems append to warnings and never fail the
-// render.
-void apply_document_options(const RenderOptions& options,
-                            std::vector<std::string>* warnings);
+// loaded in this process, before anything is laid out. Applied or refused:
+// each option the request set either takes effect, checked by reading the
+// document back, or the result is a refusal. A form value refuses when its
+// name reaches no draw-page control or fieldmark, when the value is not one
+// the field can take (a checkbox takes true or false, a list one of its
+// entries or an entry index), or when the field does not hold the value
+// after the write. tracked_changes refuses when the document, its view, or
+// the dispatcher cannot be reached, or when tracked changes remain after
+// accepting or rejecting all of them; it asks nothing of documents that are
+// not text documents. Problems with anything the request did not ask for
+// append to warnings.
+DocumentOptionsResult apply_document_options(
+    const RenderOptions& options, std::vector<std::string>* warnings);
 
 // Outcome of applying a request's redaction to the loaded document.
 struct RedactionResult {
