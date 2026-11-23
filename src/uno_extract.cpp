@@ -186,6 +186,7 @@
 
 #include "fault_injection.h"
 #include "gif_palette.h"
+#include "pdf_page_range.h"
 #include "ai/pipestream/office/v1/office_service.pb.h"
 
 namespace grlibre {
@@ -5093,9 +5094,8 @@ bool export_pdf_stream(const std::string& filter_name, size_t chunk_limit,
     filter_data.getArray()[slot].Name = "ExportBookmarks";
     filter_data.getArray()[slot++].Value <<= true;
     if (ranged) {
-      const int first = pdf.first_page > 0 ? pdf.first_page : 1;
-      const int last = pdf.last_page > 0 ? pdf.last_page : 9999;
-      std::string range = std::to_string(first) + "-" + std::to_string(last);
+      const std::string range =
+          grlibre::pdf_page_range(pdf.first_page, pdf.last_page);
       filter_data.getArray()[slot].Name = "PageRange";
       filter_data.getArray()[slot++].Value <<=
           rtl::OUString::createFromAscii(range.c_str());

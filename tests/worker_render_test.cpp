@@ -29,6 +29,7 @@
 #include "docling_map.h"
 #include "document_passwords.h"
 #include "encrypted_docx_fixture.h"
+#include "pdf_page_range.h"
 #include "worker_runner.h"
 
 namespace {
@@ -3841,6 +3842,25 @@ void verify_pdf_page_range() {
   std::vector<std::string> pages = rasterize_pdf(fold_pdf(payloads));
   require(pages.size() == 1, "1:1 range exports exactly one page, got "
                                  + std::to_string(pages.size()));
+
+  // A range with only a first page runs through the real end of the
+  // document, however long: no page number stands in for "the end".
+  require(grlibre::pdf_page_range(5, 0) == "5-",
+          "an open-ended range has no last page, got "
+              + grlibre::pdf_page_range(5, 0));
+  require(grlibre::pdf_page_range(0, 3) == "1-3" &&
+              grlibre::pdf_page_range(2, 4) == "2-4" &&
+              grlibre::pdf_page_range(0, 0).empty(),
+          "closed ranges and the whole document are unchanged");
+  extras.set_first_page(2);
+  extras.set_last_page(0);
+  std::vector<std::string> tail_payloads;
+  auto tail = run_with_extras("pdf", "txt", doc, extras, &tail_payloads);
+  require(tail.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "open-ended pdf ok: " + tail.detail);
+  require(rasterize_pdf(fold_pdf(tail_payloads)).size() == full_pages.size() - 1,
+          "an open-ended range from page 2 exports every page after the "
+          "first");
 }
 
 // skip_hidden on the pdf path. The office core's pdf filter never exports
