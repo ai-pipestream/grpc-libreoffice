@@ -245,6 +245,13 @@ class DoclingMapper {
   // divergence is visible rather than silent.
   void resolve_page_styles();
 
+  // Labels pages with their printed numbers from the paragraphs that
+  // restart page numbering: the restart page prints the paragraph's offset
+  // and each later page one more, until the next restart. Pages before the
+  // first restart print their ordinal, which PageItem.page_no already says,
+  // so they keep no label.
+  void resolve_page_labels();
+
   // The page-local union of a cell's line rectangles on their first page;
   // false when there is nothing to measure.
   bool cell_bbox(const google::protobuf::RepeatedPtrField<
@@ -302,6 +309,9 @@ class DoclingMapper {
   // The 1-based page numbers whose style name came off the wire, so the
   // catalogue check at the end of the stream visits only those.
   std::vector<int> styled_pages_;
+  // The printed number each page-numbering restart begins at, by the
+  // PageImage.index of the page its paragraph starts on.
+  std::map<int, int> page_number_restarts_;
   // The document-absolute character space, one entry per emitted body item
   // in ascending offset order.
   std::vector<BodySpan> body_spans_;
