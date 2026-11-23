@@ -142,7 +142,9 @@ at STANDARD plus COMMENTS):
   original / show markup). `skip_hidden` omits hidden sheets and slides
   from page images; `paint_used_range` crops spreadsheet pages to the
   used cell range; `include_notes_pages` appends each slide's notes page.
-  `form_values` writes named form fields before paint or export;
+  `form_values` writes named form fields before paint or export, and
+  reads each one back; `tracked_changes` and `form_values` are applied or
+  the call is refused, never quietly dropped;
   `redact_spans` removes text from the document before anything is
   painted, exported, or extracted (see Redaction below).
   `DocumentInfo` and `RenderStatus` are always sent.
@@ -178,8 +180,10 @@ the document), `RESOURCE_EXHAUSTED` (over the byte cap, or the server-wide
 upload buffer is full), `UNIMPLEMENTED` (PDF input, see below),
 `FAILED_PRECONDITION` (broken package needing repair without the
 `allow_package_repair` opt-in, a redaction that cannot be applied to the
-whole document, or `skip_hidden` / `paint_used_range` on a document whose
-sheet or slide visibility or used range cannot be read), `DEADLINE_EXCEEDED` (per-document timeout or the caller's
+whole document, `skip_hidden` / `paint_used_range` on a document whose
+sheet or slide visibility or used range cannot be read, a form value
+naming no field or one its field cannot take, or a `tracked_changes`
+mode that could not be applied), `DEADLINE_EXCEEDED` (per-document timeout or the caller's
 deadline, worker killed), `CANCELLED` (the caller cancelled; a running
 worker is killed), `INTERNAL` (worker crash, or requested typed content
 that could not be extracted). Health checking and

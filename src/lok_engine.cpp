@@ -523,7 +523,15 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
   std::vector<std::string> option_warnings;
   set_source_name(options.source_name.empty() ? "doc." + options.extension
                                               : options.source_name);
-  apply_document_options(options, &option_warnings);
+  // A requested tracked-change display or form value is applied or the
+  // whole request is refused; nothing has been emitted at this point.
+  DocumentOptionsResult applied =
+      apply_document_options(options, &option_warnings);
+  if (!applied.ok) {
+    *error = applied.refusal;
+    delete document;
+    return kExitOptionRefused;
+  }
   // Redaction rewrites the document model before anything below lays it
   // out, paints it, exports it, or extracts from it, and refuses the whole
   // request when the text cannot be removed everywhere; nothing has been
