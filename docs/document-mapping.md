@@ -24,7 +24,7 @@ value rides `custom_fields` any more.
 | Comments | items under a `GROUP_LABEL_COMMENT_SECTION` group, back-linked from the annotated item's `comments` `FineRef` with the annotated range |
 | Tracked changes | `Document.changes`, each a `ChangeRecord` targeting the item range it touches |
 | Bookmarks | `Document.anchors`, each a `NamedAnchor` targeting the item range it names |
-| Spreadsheet cell values | `TableCell.value`: number, boolean, civil date and time, formula, or error literal, with `number_format` |
+| Spreadsheet cell values | `TableCell.value`: number, boolean, civil date and time, or error literal, with `number_format`. A formula cell carries its source in `formula_source` and its computed result in the same typed arms (a text result stays in the cell text); the legacy `formula` arm is used only when the wire states no result |
 | Sheet column widths | `TableData.columns[].width` (twips), one entry per used column |
 | Sheet row position | `TableData.row_prov[].grid`: sheet name, row, first used column |
 | Merged and split table cells | `TableCell.row_span` / `col_span` and the base-grid position the office cell name anchors at |

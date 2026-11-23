@@ -768,8 +768,9 @@ void DoclingMapper::add_prov(
     int page_index, bool page_local, double l, double t, double r, double b,
     long long span_start, long long span_end) {
   if (page_index < 0) return;
-  if (!page_local && page_index < static_cast<int>(page_rects_.size())) {
-    const officev1::PageRect& page = page_rects_[page_index];
+  if (auto found = page_rects_.find(page_index);
+      !page_local && found != page_rects_.end()) {
+    const officev1::PageRect& page = found->second;
     l -= static_cast<double>(page.x_twips());
     r -= static_cast<double>(page.x_twips());
     t -= static_cast<double>(page.y_twips());
@@ -858,8 +859,8 @@ bool DoclingMapper::cell_bbox(
   if (first) return false;
   // Line rectangles are document-absolute like every LineBox; page-local
   // like add_prov.
-  if (page_index < static_cast<int>(page_rects_.size())) {
-    const officev1::PageRect& page = page_rects_[page_index];
+  if (auto found = page_rects_.find(page_index); found != page_rects_.end()) {
+    const officev1::PageRect& page = found->second;
     l -= static_cast<double>(page.x_twips());
     r -= static_cast<double>(page.x_twips());
     t -= static_cast<double>(page.y_twips());
@@ -1016,15 +1017,20 @@ void DoclingMapper::consume(const officev1::StreamPagesResponse& event) {
 
 void DoclingMapper::on_document_info(const officev1::DocumentInfo& info) {
   document_type_ = info.document_type();
-  page_rects_.assign(info.page_rects().begin(), info.page_rects().end());
+  // Keyed by the page each rectangle names. A server that predates
+  // PageRect.page_index lists its pages in order with none left out.
+  page_rects_.clear();
+  for (int position = 0; position < info.page_rects_size(); position++) {
+    const officev1::PageRect& rect = info.page_rects(position);
+    page_rects_[rect.has_page_index() ? rect.page_index() : position] = rect;
+  }
   if (document_.name().empty() && !info.document_id().empty()) {
     document_.set_name(info.document_id());
   }
   docv1::DocumentOrigin* origin = document_.mutable_origin();
   origin->set_mimetype(mime_for_extension(info.source_format()));
   if (!info.document_id().empty()) origin->set_filename(info.document_id());
-  for (int index = 0; index < info.page_rects_size(); index++) {
-    const officev1::PageRect& rect = info.page_rects(index);
+  for (const auto& [index, rect] : page_rects_) {
     docv1::PageItem* page = &(*document_.mutable_pages())[index + 1];
     page->set_page_no(index + 1);
     page->set_unit(kCoordinateUnit);
@@ -1541,8 +1547,7 @@ void DoclingMapper::on_text_frame(const officev1::TextFrame& frame) {
 }
 
 int DoclingMapper::page_for_point(double x, double y) const {
-  for (int index = 0; index < static_cast<int>(page_rects_.size()); index++) {
-    const officev1::PageRect& page = page_rects_[index];
+  for (const auto& [index, page] : page_rects_) {
     if (x >= static_cast<double>(page.x_twips())
         && x < static_cast<double>(page.x_twips() + page.width_twips())
         && y >= static_cast<double>(page.y_twips())
@@ -1829,15 +1834,33 @@ void DoclingMapper::on_sheet_row(const officev1::SheetRow& row) {
     out->set_col_span(std::max(1, cell.merged_columns()));
     out->set_text(cell.display());
     // The cell's typed value: text stays the display string, and the value
-    // says what the sheet actually holds. An error beats a formula, because
-    // a formula that failed has no value to report.
+    // says what the sheet actually holds. A formula cell keeps both halves:
+    // its source in formula_source and its cached result in kind, typed
+    // exactly as a value cell's would be. A failed formula's result is its
+    // error literal; a formula that yields text has no kind arm to fill and
+    // keeps the text in the cell's text.
     docv1::CellValue value;
     bool typed = true;
+    const bool is_formula = cell.type() == officev1::SHEET_CELL_TYPE_FORMULA;
+    // A worker that predates SheetCell.formula_result still marks date and
+    // flag results; any other formula of its has no result this can trust.
+    const bool numeric_result =
+        cell.formula_result() == officev1::SHEET_CELL_TYPE_VALUE
+        || cell.is_boolean() || cell.is_datetime();
+    const bool text_result =
+        cell.formula_result() == officev1::SHEET_CELL_TYPE_TEXT;
+    if (is_formula && !cell.formula().empty()
+        && (cell.error_code() != 0 || numeric_result || text_result)) {
+      value.set_formula_source(cell.formula());
+    }
     if (cell.error_code() != 0) {
       value.set_error(cell.display().empty()
                           ? "Err:" + std::to_string(cell.error_code())
                           : cell.display());
-    } else if (cell.type() == officev1::SHEET_CELL_TYPE_FORMULA) {
+    } else if (is_formula && text_result) {
+      typed = value.has_formula_source();
+    } else if (is_formula && !numeric_result) {
+      // No cached result is known: the legacy formula arm.
       value.set_formula(cell.formula());
     } else if (cell.is_boolean()) {
       value.set_boolean(cell.number() != 0);
@@ -1850,7 +1873,7 @@ void DoclingMapper::on_sheet_row(const officev1::SheetRow& row) {
       when->set_hour(cell.datetime().hour());
       when->set_minute(cell.datetime().minute());
       when->set_second(cell.datetime().second());
-    } else if (cell.type() == officev1::SHEET_CELL_TYPE_VALUE) {
+    } else if (cell.type() == officev1::SHEET_CELL_TYPE_VALUE || is_formula) {
       value.set_number(cell.number());
     } else {
       typed = false;

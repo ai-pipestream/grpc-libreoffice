@@ -305,6 +305,50 @@ constexpr char kTwoSheetFods[] = R"(<?xml version="1.0" encoding="UTF-8"?>
 </office:document>
 )";
 
+// Three sheets with the hidden one in the middle, so leaving it out moves
+// the sheet after it up one place in the emitted page list.
+constexpr char kHiddenMiddleSheetFods[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+ office:version="1.2"
+ office:mimetype="application/vnd.oasis.opendocument.spreadsheet">
+ <office:automatic-styles>
+  <style:style style:name="taShown" style:family="table">
+   <style:table-properties table:display="true"/>
+  </style:style>
+  <style:style style:name="taHidden" style:family="table">
+   <style:table-properties table:display="false"/>
+  </style:style>
+ </office:automatic-styles>
+ <office:body>
+  <office:spreadsheet>
+   <table:table table:name="First" table:style-name="taShown">
+    <table:table-row>
+     <table:table-cell office:value-type="string"><text:p>first data</text:p></table:table-cell>
+    </table:table-row>
+   </table:table>
+   <table:table table:name="Hidden" table:style-name="taHidden">
+    <table:table-row>
+     <table:table-cell office:value-type="string"><text:p>hidden data</text:p></table:table-cell>
+    </table:table-row>
+   </table:table>
+   <table:table table:name="Last" table:style-name="taShown">
+    <table:table-column table:number-columns-repeated="6"/>
+    <table:table-row table:number-rows-repeated="8">
+     <table:table-cell table:number-columns-repeated="6"/>
+    </table:table-row>
+    <table:table-row>
+     <table:table-cell table:number-columns-repeated="5"/>
+     <table:table-cell office:value-type="string"><text:p>last data</text:p></table:table-cell>
+    </table:table-row>
+   </table:table>
+  </office:spreadsheet>
+ </office:body>
+</office:document>
+)";
+
 constexpr char kNotesFodp[] = R"(<?xml version="1.0" encoding="UTF-8"?>
 <office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
  xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
@@ -885,6 +929,8 @@ void verify_typed_spreadsheet() {
   bool value_ok = false;
   bool currency_ok = false;
   bool formula_ok = false;
+  bool text_formula_ok = false;
+  bool value_cells_unmarked = true;
   bool covered_cell_absent = true;
   bool date_ok = false;
   bool boolean_ok = false;
@@ -922,6 +968,15 @@ void verify_typed_spreadsheet() {
         // Text keeps the column's format code but never borrows a date or
         // a flag from it: its value is no serial.
         formatted_text_cells++;
+        // The formula-made text says its result is text.
+        if (cell.type() == officev1::SHEET_CELL_TYPE_FORMULA) {
+          text_formula_ok =
+              cell.formula_result() == officev1::SHEET_CELL_TYPE_TEXT;
+        } else {
+          value_cells_unmarked =
+              value_cells_unmarked
+              && cell.formula_result() == officev1::SHEET_CELL_TYPE_UNSPECIFIED;
+        }
         formatted_text_untyped = formatted_text_untyped && !cell.is_datetime()
                                  && !cell.is_boolean()
                                  && !cell.has_datetime()
@@ -935,6 +990,7 @@ void verify_typed_spreadsheet() {
       if (row.sheet_index() == 0 && row.row() == 2 && cell.column() == 2) {
         formula_ok = cell.type() == officev1::SHEET_CELL_TYPE_FORMULA &&
                      !cell.formula().empty() &&
+                     cell.formula_result() == officev1::SHEET_CELL_TYPE_VALUE &&
                      cell.number() > 419.57 && cell.number() < 419.59;
       }
     }
@@ -949,7 +1005,11 @@ void verify_typed_spreadsheet() {
   require(boolean_ok, "a logical cell is marked boolean, not just numeric");
   require(formatted_text_cells == 3 && formatted_text_untyped,
           "text under a date or boolean format is neither a date nor a flag");
-  require(formula_ok, "formula cell keeps formula and computed number");
+  require(formula_ok,
+          "formula cell keeps formula, computed number, and says the result "
+          "is a number");
+  require(text_formula_ok, "a formula that yields text says so");
+  require(value_cells_unmarked, "cells that are not formulas state no result");
   require(comments.size() == 1 && comments[0].sheet_index() == 0 &&
               comments[0].row() == 1 && comments[0].column() == 0 &&
               comments[0].author() == "Kris" &&
@@ -3849,6 +3909,75 @@ void verify_unreadable_parts_refuse_the_options() {
   }
 }
 
+// A page image names the sheet it shows, not its place among the pages
+// that were painted: with the hidden middle sheet left out, the last
+// sheet's image still carries the last sheet's ordinal, the one its Sheet
+// event and its rows carry, so image and typed content join on it.
+void verify_skip_hidden_keeps_sheet_ordinals() {
+  officev1::StreamOptions extras;
+  extras.set_skip_hidden(true);
+  std::vector<std::string> payloads;
+  auto outcome = run_with_extras("pages", "fods", kHiddenMiddleSheetFods,
+                                 extras, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "hidden-middle fods renders ok: " + outcome.detail);
+  PagesRun run = fold_pages(payloads);
+  std::vector<int> sheet_ordinals;
+  for (const std::string& payload : payloads) {
+    officev1::StreamPagesResponse event;
+    require(event.ParseFromString(payload), "pages event parses");
+    if (event.has_sheet()) sheet_ordinals.push_back(event.sheet().index());
+  }
+  require(sheet_ordinals == std::vector<int>({0, 1, 2}),
+          "typed content still covers all three sheets");
+  require(run.info.page_count() == 2 && run.pages.size() == 2,
+          "the hidden sheet is not painted");
+  require(run.pages[0].index() == 0,
+          "the first sheet's image carries ordinal 0");
+  require(run.pages[1].index() == 2,
+          "the last sheet's image carries its own ordinal 2, not the hidden "
+          "sheet's, got " + std::to_string(run.pages[1].index()));
+  require(run.info.page_rects_size() == 2 &&
+              run.info.page_rects(0).has_page_index() &&
+              run.info.page_rects(0).page_index() == 0 &&
+              run.info.page_rects(1).has_page_index() &&
+              run.info.page_rects(1).page_index() == 2,
+          "each page rectangle names the page it lays out");
+
+  // Folded into a Document, the last sheet's table sits on the page that
+  // holds its own image and its own size; the hidden sheet has no image.
+  grlibre::DoclingMapper mapper;
+  for (const std::string& payload : payloads) {
+    officev1::StreamPagesResponse event;
+    require(event.ParseFromString(payload), "pages event parses");
+    mapper.consume(event);
+  }
+  const auto& document = mapper.document();
+  require(document.pages().contains(1) && document.pages().contains(3),
+          "the two painted sheets are pages 1 and 3");
+  require(!document.pages().contains(2) ||
+              document.pages().at(2).image().uri().empty(),
+          "the hidden sheet's page holds no image");
+  const auto& last_page = document.pages().at(3);
+  require(!last_page.image().uri().empty(), "page 3 holds an image");
+  require(last_page.size().width() ==
+              static_cast<double>(run.info.page_rects(1).width_twips()) &&
+              last_page.size().height() ==
+                  static_cast<double>(run.info.page_rects(1).height_twips()),
+          "page 3 has the last sheet's size");
+  bool last_table_on_page_3 = false;
+  for (const auto& table : document.tables()) {
+    for (const auto& cell : table.data().table_cells()) {
+      if (cell.text() == "last data") {
+        last_table_on_page_3 =
+            table.prov_size() > 0 && table.prov(0).page_no() == 3;
+      }
+    }
+  }
+  require(last_table_on_page_3,
+          "the last sheet's table is on the page that shows it");
+}
+
 // Notes pages ride behind their slides as extra page images.
 void verify_notes_pages() {
   const std::string doc = kNotesFodp;
@@ -3870,6 +3999,14 @@ void verify_notes_pages() {
   require(run.pages.size() == 2, "both pages painted");
   require(run.pages[0].png() != run.pages[1].png(),
           "notes page differs from its slide");
+  // A notes page follows every slide: the slide count plus its slide's
+  // ordinal, and its rectangle says the same.
+  require(run.pages[0].index() == 0 && run.pages[1].index() == 1,
+          "the slide is page 0 and its notes page is page 1");
+  require(run.info.page_rects_size() == 2 &&
+              run.info.page_rects(0).page_index() == 0 &&
+              run.info.page_rects(1).page_index() == 1,
+          "the notes page's rectangle names it");
 }
 
 // Tracked-change display resolves before extraction: FINAL keeps the
@@ -4671,6 +4808,7 @@ int main() {
   verify_pdf_skip_hidden();
   verify_sheet_visibility_and_used_range();
   verify_unreadable_parts_refuse_the_options();
+  verify_skip_hidden_keeps_sheet_ordinals();
   verify_notes_pages();
   verify_tracked_change_display();
   verify_per_page_style();

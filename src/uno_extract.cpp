@@ -3912,6 +3912,13 @@ bool emit_calc_content(
               sal_Int32 result = 0;
               cell_props->getPropertyValue("FormulaResultType2") >>= result;
               holds_number = result == css::sheet::FormulaResult::VALUE;
+              // Said on the wire, so a consumer can tell a formula that
+              // yields 0 from one that yields text.
+              if (holds_number) {
+                out_cell->set_formula_result(officev1::SHEET_CELL_TYPE_VALUE);
+              } else if (result == css::sheet::FormulaResult::STRING) {
+                out_cell->set_formula_result(officev1::SHEET_CELL_TYPE_TEXT);
+              }
             }
             if (holds_number
                 && (format.category & css::util::NumberFormat::LOGICAL) != 0) {

@@ -47,6 +47,9 @@ struct PageRect {
   long width = 0;
   long height = 0;
   bool notes = false;
+  // The PageImage.index this page goes out under; set once the page list
+  // is final.
+  int index = 0;
 };
 
 std::string doc_type_name(int type) {
@@ -318,7 +321,7 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
       encoded_bytes += static_cast<long>(svg.size());
       officev1::StreamPagesResponse page_event;
       officev1::PageImage* image = page_event.mutable_page_image();
-      image->set_index(static_cast<int>(index));
+      image->set_index(page.index);
       image->set_width_px(0);
       image->set_height_px(0);
       image->set_dpi(0);
@@ -336,7 +339,7 @@ bool paint_pages(lok::Document* document, const RenderOptions& options,
     const PaintSize size = paint_size(page, options);
     const int width_px = size.width_px;
     const int height_px = size.height_px;
-    RawPage raw{.index = static_cast<int>(index),
+    RawPage raw{.index = page.index,
                 .width_px = width_px,
                 .height_px = height_px,
                 .dpi = size.dpi,
@@ -539,14 +542,24 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     pages = parse_page_rectangles(rectangles);
     std::free(rectangles);
   }
+  // How many sheets, slides, or drawing pages the document has, shown or
+  // not. A notes page's index counts on from it.
+  const int part_count = std::max(1, document->getParts());
   if (pages.empty()) {
-    int parts = std::max(1, document->getParts());
-    for (int part = 0; part < parts; part++) {
+    for (int part = 0; part < part_count; part++) {
       PageRect rect;
       rect.part = part;
-      if (parts > 1 || type != LOK_DOCTYPE_TEXT) document->setPart(part);
+      if (part_count > 1 || type != LOK_DOCTYPE_TEXT) document->setPart(part);
       document->getDocumentSize(&rect.width, &rect.height);
-      if (rect.width > 0 && rect.height > 0) pages.push_back(rect);
+      if (rect.width > 0 && rect.height > 0) {
+        pages.push_back(rect);
+      } else if (type != LOK_DOCTYPE_TEXT) {
+        // Left out of the pages, and said: the parts after it keep their
+        // own indexes, so the gap shows in DocumentInfo.page_rects too.
+        option_warnings.push_back(
+            "part " + std::to_string(part) + " reports no size and is not "
+            "rendered as a page");
+      }
     }
   }
   if (pages.empty()) {
@@ -626,6 +639,22 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     delete document;
     return kExitRenderFailure;
   }
+  // Every page's index, fixed before anything is emitted. A text document's
+  // pages are its laid-out pages in order. Every other class has one page
+  // per sheet, slide, or drawing page, and the index is that part's own
+  // ordinal, the one its Sheet or Slide event carries, whichever parts
+  // skip_hidden or a missing size left out before it; a notes page follows
+  // all of them, at the part count plus its slide's ordinal. Indexing by
+  // position in the filtered list would hand a later sheet's image the
+  // ordinal of a hidden one.
+  for (size_t position = 0; position < pages.size(); position++) {
+    PageRect& page = pages[position];
+    if (type == LOK_DOCTYPE_TEXT) {
+      page.index = static_cast<int>(position);
+    } else {
+      page.index = page.notes ? part_count + page.part : page.part;
+    }
+  }
 
   // Which page style each page carries, read off the laid-out document the
   // pages above were measured in. A text document names one per page (the
@@ -661,6 +690,7 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     rect->set_y_twips(page.y);
     rect->set_width_twips(page.width);
     rect->set_height_twips(page.height);
+    rect->set_page_index(page.index);
   }
 
   // Per-line rectangles ride the selection callback, for pages mode only.

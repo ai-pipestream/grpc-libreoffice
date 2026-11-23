@@ -434,6 +434,28 @@ int main() {
   config.render_dpi = 96;
   grlibre::RenderServiceImpl service(config);
 
+  // The startup probe passes on a working configuration and names what is
+  // wrong on a broken one, without counting as a served document.
+  {
+    const std::string probed = service.startup_probe();
+    require(probed.empty(), "the startup probe passes here: " + probed);
+    grlibre::ServiceConfig no_office = config;
+    no_office.install_path = "/nonexistent/libreoffice/program";
+    grlibre::RenderServiceImpl broken(no_office);
+    require(broken.startup_probe().contains("/nonexistent/libreoffice/program"),
+            "the probe names a missing LibreOffice install");
+    // A directory that holds no office core: the worker itself must fail.
+    grlibre::ServiceConfig empty_office = config;
+    empty_office.install_path = "/tmp";
+    grlibre::RenderServiceImpl hollow(empty_office);
+    const std::string hollow_probe = hollow.startup_probe();
+    require(hollow_probe.contains("failed") && hollow_probe.contains("/tmp"),
+            "the probe fails on a directory with no office core in it, got: "
+                + hollow_probe);
+    require(service.rendered.load() == 0 && service.failed.load() == 0,
+            "probes are not counted as served documents");
+  }
+
   int port = 0;
   grpc::ServerBuilder builder;
   builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
@@ -1036,7 +1058,84 @@ int main() {
 
   server->Shutdown();
 
-  // SIGTERM must shut the real binary down cleanly: the handler only pokes
+  // A server that cannot render must not come up and answer health checks
+  // as SERVING: with the worker binary or the LibreOffice install missing,
+  // the real binary fails its startup probe, says why, and exits non-zero
+  // without ever listening.
+  {
+    const char* server_bin = std::getenv("GRLIBRE_SERVER");
+    require(server_bin != nullptr, "GRLIBRE_SERVER must point at the server binary");
+    struct Broken {
+      const char* what;
+      const char* variable;
+      const char* value;
+      const char* names;
+    };
+    const Broken cases[] = {
+        {"a missing worker binary", "GRLIBRE_WORKER",
+         "/nonexistent/grlibre-worker", "/nonexistent/grlibre-worker"},
+        {"a missing LibreOffice install", "GRLIBRE_LO_PATH",
+         "/nonexistent/libreoffice/program", "/nonexistent/libreoffice/program"},
+    };
+    for (const Broken& broken : cases) {
+      const std::string what = broken.what;
+      int probe = ::socket(AF_INET, SOCK_STREAM, 0);
+      require(probe >= 0, "probe socket");
+      sockaddr_in addr{};
+      addr.sin_family = AF_INET;
+      addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      require(::bind(probe, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == 0,
+              "probe bind");
+      socklen_t addr_len = sizeof addr;
+      require(::getsockname(probe, reinterpret_cast<sockaddr*>(&addr), &addr_len) == 0,
+              "probe getsockname");
+      const int free_port = ntohs(addr.sin_port);
+      ::close(probe);
+
+      char log_path[] = "/tmp/grlibre-startup-XXXXXX";
+      int log_fd = ::mkstemp(log_path);
+      require(log_fd >= 0, "startup log file");
+      pid_t pid = ::fork();
+      require(pid >= 0, "fork server");
+      if (pid == 0) {
+        ::setenv("GRLIBRE_PORT", std::to_string(free_port).c_str(), 1);
+        ::setenv("GRLIBRE_METRICS_INTERVAL_SECONDS", "0", 1);
+        ::setenv(broken.variable, broken.value, 1);
+        ::dup2(log_fd, STDERR_FILENO);
+        ::execl(server_bin, server_bin, nullptr);
+        ::_exit(127);
+      }
+      ::close(log_fd);
+      int status = 0;
+      bool exited = false;
+      bool listened = false;
+      for (int attempt = 0; attempt < 600 && !exited && !listened; attempt++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        exited = ::waitpid(pid, &status, WNOHANG) == pid;
+        if (exited) break;
+        int s = ::socket(AF_INET, SOCK_STREAM, 0);
+        addr.sin_port = htons(free_port);
+        listened = ::connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == 0;
+        ::close(s);
+      }
+      if (!exited) {
+        ::kill(pid, SIGKILL);
+        ::waitpid(pid, &status, 0);
+      }
+      std::ifstream log(log_path, std::ios::binary);
+      const std::string said((std::istreambuf_iterator<char>(log)),
+                             std::istreambuf_iterator<char>());
+      ::unlink(log_path);
+      require(!listened,
+              "a server with " + what + " must not listen and report SERVING");
+      require(exited && WIFEXITED(status) && WEXITSTATUS(status) == 1,
+              "a server with " + what + " exits 1 at startup");
+      require(said.contains("Startup failed") && said.contains(broken.names),
+              "the startup failure names " + what + ", got: " + said);
+    }
+  }
+
+  // SIGTERM must shut the real binary down cleanly: the handler only pokes  // SIGTERM must shut the real binary down cleanly: the handler only pokes
   // an eventfd and the actual grpc Shutdown runs on a plain thread, so the
   // exit is orderly (code 0) instead of a signal-context deadlock gamble.
   // Runs against the built server because main() owns the signal wiring.
