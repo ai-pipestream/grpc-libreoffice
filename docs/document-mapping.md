@@ -74,6 +74,8 @@ now, and the map copies are gone.
 | Character style, highlight, overline | `InlineSpan.style_name`, `.highlight_color`, `Formatting.overline` |
 | Form field identity | `FieldItem.field_name`, `.options`, `.selected_index` (presence-tracked), `.span` (a `FineRef` into the item space), `.parameters` |
 | A permanently shown spreadsheet note | `CommentMeta.shown` |
+| An image, object, frame or shape anchored in a page header or footer (`in_header_footer`) | the furniture layer under `#/furniture` |
+| A paragraph that restarts page numbering (`Paragraph.page_number_offset`) | `PageItem.page_label` on the restart page and every page after it, until the next restart |
 | A chart's data sources | `PictureItem.chart` (`ChartMeta`): source `GridSpan`s and the two header flags |
 | A name defined as a formula | `NamedRange.expression`, with `range` unset |
 | Form fields | the schema's own form subtree, below |
@@ -199,8 +201,6 @@ Fold side:
   links them.
 - **List markers and nesting depth.** `ListItem.marker`, `.enumerated`, and
   the nesting level are unset, so nested lists flatten.
-- **Printed page numbering restarts.** `Paragraph.page_number_offset` is on
-  the wire and unread, so page numbers stay physical indices.
 - **A sheet's used-range origin.** Only the end bounds become `num_rows` and
   `num_cols`, so a sheet whose data starts at M50 reports a mostly empty
   50 by 13 table.

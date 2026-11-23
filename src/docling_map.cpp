@@ -20,6 +20,17 @@ namespace officev1 = ai::pipestream::office::v1;
 
 namespace {
 
+// The layer and root an item anchored in a page header or footer belongs
+// to: it repeats on every page of that style, so it is furniture.
+docv1::ContentLayer layer_for(bool in_header_footer) {
+  return in_header_footer ? docv1::CONTENT_LAYER_FURNITURE
+                          : docv1::CONTENT_LAYER_BODY;
+}
+
+const char* root_for(bool in_header_footer) {
+  return in_header_footer ? "#/furniture" : "#/body";
+}
+
 // The schema identity docling-core v2 interop expects on the root.
 constexpr const char* kSchemaName = "docling_document_v2";
 
@@ -1160,7 +1171,34 @@ void DoclingMapper::on_status(const officev1::RenderStatus& status) {
   // cross-reference can name an anchor from a later page.
   resolve_anchors();
   resolve_page_styles();
+  resolve_page_labels();
   finished_ = true;
+}
+
+void DoclingMapper::resolve_page_labels() {
+  if (page_number_restarts_.empty()) return;
+  std::vector<int> page_numbers;
+  for (const auto& entry : document_.pages()) page_numbers.push_back(entry.first);
+  std::ranges::sort(page_numbers);
+  bool numbering = false;
+  long long printed = 0;
+  int previous_index = 0;
+  for (int page_no : page_numbers) {
+    const int index = page_no - 1;
+    auto restart = page_number_restarts_.find(index);
+    if (restart != page_number_restarts_.end()) {
+      numbering = true;
+      printed = restart->second;
+    } else if (numbering) {
+      // A page that was not emitted still advances the printed number.
+      printed += index - previous_index;
+    }
+    previous_index = index;
+    if (numbering) {
+      (*document_.mutable_pages())[page_no].set_page_label(
+          std::to_string(printed));
+    }
+  }
 }
 
 void DoclingMapper::resolve_page_styles() {
@@ -1188,6 +1226,12 @@ void DoclingMapper::resolve_page_styles() {
 }
 
 void DoclingMapper::on_paragraph(const officev1::Paragraph& paragraph) {
+  // A restart takes effect on the page its paragraph starts on; the first
+  // restart seen for a page is the one that page prints.
+  if (paragraph.page_number_offset() >= 0 && paragraph.page_index() >= 0) {
+    page_number_restarts_.emplace(paragraph.page_index(),
+                                  paragraph.page_number_offset());
+  }
   std::string text = concat_runs(paragraph.runs());
   long long length = runs_length(paragraph.runs());
   // Provenance charspans are 0-indexed within the item's own text; the
@@ -1247,7 +1291,8 @@ void DoclingMapper::on_table(const officev1::TableData& table) {
 }
 
 void DoclingMapper::on_embedded_image(const officev1::EmbeddedImage& image) {
-  std::string parent = "#/body";
+  const docv1::ContentLayer layer = layer_for(image.in_header_footer());
+  std::string parent = root_for(image.in_header_footer());
   // A slide picture belongs under its slide; its geometry is already
   // page-local, unlike a text document's document-absolute anchors.
   bool page_local = false;
@@ -1262,8 +1307,7 @@ void DoclingMapper::on_embedded_image(const officev1::EmbeddedImage& image) {
     parent = container->second;
   }
   docv1::PictureItem* picture = add_picture(
-      docv1::DOC_ITEM_LABEL_PICTURE, docv1::CONTENT_LAYER_BODY, parent,
-      nullptr);
+      docv1::DOC_ITEM_LABEL_PICTURE, layer, parent, nullptr);
   if (!image.name().empty()) picture->mutable_shape()->set_name(image.name());
   set_alt_text(image.title(), image.description(), picture);
   if (!image.data().empty()) {
@@ -1516,10 +1560,12 @@ void DoclingMapper::on_slide_shape(const officev1::SlideShape& shape) {
 }
 
 void DoclingMapper::on_text_frame(const officev1::TextFrame& frame) {
-  docv1::GroupItem* group = add_group("#/body", docv1::GROUP_LABEL_UNSPECIFIED,
-                                      frame.name(), docv1::CONTENT_LAYER_BODY);
+  const docv1::ContentLayer layer = layer_for(frame.in_header_footer());
+  docv1::GroupItem* group = add_group(root_for(frame.in_header_footer()),
+                                      docv1::GROUP_LABEL_UNSPECIFIED,
+                                      frame.name(), layer);
   TextHandle handle = add_text(TextKind::kText, docv1::DOC_ITEM_LABEL_TEXT,
-                               docv1::CONTENT_LAYER_BODY, group->self_ref());
+                               layer, group->self_ref());
   // The frame's identity, chain included, belongs on the item that carries
   // its text: reading order across a chain resolves by frame name.
   docv1::ShapeMeta* shape_meta = handle.base->mutable_shape();
@@ -1559,7 +1605,8 @@ int DoclingMapper::page_for_point(double x, double y) const {
 }
 
 void DoclingMapper::on_shape(const officev1::Shape& shape) {
-  std::string parent = "#/body";
+  const docv1::ContentLayer layer = layer_for(shape.in_header_footer());
+  std::string parent = root_for(shape.in_header_footer());
   if (auto container = writer_groups_.find(shape.group_path());
       container != writer_groups_.end()) {
     parent = container->second;
@@ -1571,7 +1618,7 @@ void DoclingMapper::on_shape(const officev1::Shape& shape) {
     docv1::GroupItem* group = add_group(parent,
                                         docv1::GROUP_LABEL_PICTURE_AREA,
                                         shape.name(),
-                                        docv1::CONTENT_LAYER_BODY);
+                                        layer);
     std::string child_path = shape.group_path().empty()
         ? std::to_string(shape.z_order())
         : shape.group_path() + "/" + std::to_string(shape.z_order());
@@ -1580,9 +1627,9 @@ void DoclingMapper::on_shape(const officev1::Shape& shape) {
   }
 
   docv1::GroupItem* group = add_group(parent, docv1::GROUP_LABEL_UNSPECIFIED,
-                                      shape.name(), docv1::CONTENT_LAYER_BODY);
+                                      shape.name(), layer);
   TextHandle handle = add_text(TextKind::kText, docv1::DOC_ITEM_LABEL_TEXT,
-                               docv1::CONTENT_LAYER_BODY, group->self_ref());
+                               layer, group->self_ref());
   docv1::ShapeMeta* shape_meta = handle.base->mutable_shape();
   set_shape_meta(shape.shape_type(), shape.name(), shape_meta);
   shape_meta->set_z_order(shape.z_order());
@@ -1620,6 +1667,8 @@ void DoclingMapper::on_shape(const officev1::Shape& shape) {
 }
 
 void DoclingMapper::on_embedded_object(const officev1::EmbeddedObject& object) {
+  const docv1::ContentLayer layer = layer_for(object.in_header_footer());
+  const char* root = root_for(object.in_header_footer());
   // Geometry: Writer text-anchored objects carry a document-absolute caret
   // anchor; draw-page objects carry a page-local position.
   bool page_local = !object.has_anchor();
@@ -1638,7 +1687,7 @@ void DoclingMapper::on_embedded_object(const officev1::EmbeddedObject& object) {
   if (object.kind() == officev1::EMBEDDED_OBJECT_KIND_FORMULA) {
     TextHandle handle = add_text(TextKind::kFormula,
                                  docv1::DOC_ITEM_LABEL_FORMULA,
-                                 docv1::CONTENT_LAYER_BODY, "#/body");
+                                 layer, root);
     handle.base->set_text(object.formula());
     handle.base->set_orig(object.formula());
     register_embedded_object(object, handle.ref);
@@ -1649,7 +1698,7 @@ void DoclingMapper::on_embedded_object(const officev1::EmbeddedObject& object) {
 
   if (object.kind() == officev1::EMBEDDED_OBJECT_KIND_SPREADSHEET) {
     std::string table_ref;
-    docv1::TableItem* item = add_table(docv1::CONTENT_LAYER_BODY, "#/body",
+    docv1::TableItem* item = add_table(layer, root,
                                        &table_ref);
     fold_table(object.inner_table(), item);
     register_embedded_object(object, table_ref);
@@ -1662,7 +1711,7 @@ void DoclingMapper::on_embedded_object(const officev1::EmbeddedObject& object) {
   std::string picture_ref;
   docv1::PictureItem* picture = add_picture(
       is_chart ? docv1::DOC_ITEM_LABEL_CHART : docv1::DOC_ITEM_LABEL_PICTURE,
-      docv1::CONTENT_LAYER_BODY, "#/body", &picture_ref);
+      layer, root, &picture_ref);
   if (!object.name().empty()) picture->mutable_shape()->set_name(object.name());
   register_embedded_object(object, picture_ref);
   if (!object.replacement_image().empty()) {
