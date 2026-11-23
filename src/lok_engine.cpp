@@ -771,6 +771,7 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
     bool redaction_breached = false;
     TypedContentResult typed = TypedContentResult::kComplete;
     std::string extraction_failure;
+    int incomplete_items = 0;
     if (ok) {
       typed = emit_typed_content(
           options.parts, probe_ptr,
@@ -785,7 +786,7 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
             output_bytes += static_cast<long>(event.ByteSizeLong());
             return emit(out_fd, event);
           },
-          &typed_warnings, &extraction_failure);
+          &typed_warnings, &extraction_failure, &incomplete_items);
       ok = typed != TypedContentResult::kEmitFailed;
     }
     if (probe_ptr != nullptr) document->registerCallback(nullptr, nullptr);
@@ -809,6 +810,7 @@ int run_render(const RenderOptions& options, int out_fd, std::string* error) {
       }
       status->set_input_bytes(options.input_bytes);
       status->set_output_bytes(output_bytes);
+      status->set_incomplete_items(incomplete_items);
       status->set_render_millis(std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - started).count());
       ok = emit(out_fd, final_event);

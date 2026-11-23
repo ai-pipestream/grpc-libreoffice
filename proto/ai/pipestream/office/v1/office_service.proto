@@ -756,6 +756,18 @@ message TextRun {
   int32 highlight_rgb = 22;
 }
 
+// ExtractionGap marks a typed event whose extraction the office core cut
+// short: a table whose cell walk threw part way, a cell, frame, note,
+// index or object whose properties stopped answering, a paragraph that
+// lost a text portion, an image that could not be encoded. The event is
+// still sent, holding what was read, so a consumer can keep it or drop it,
+// but never mistake it for the whole item.
+message ExtractionGap {
+  // What failed, one line per failure while this item was read, in order.
+  // The same lines are in RenderStatus.warnings.
+  repeated string problems = 1;
+}
+
 // Paragraph is one body paragraph of a text document, in reading order, with
 // its styled runs and its exact layout anchors. The anchors are caret
 // positions from the live layout the page images were painted from: start is
@@ -795,6 +807,11 @@ message Paragraph {
   // not be measured. start and end give text-flow anchors; line_rects give
   // the true bounding boxes.
   repeated LineBox line_rects = 12;
+  // Present when the office core failed part way through reading this
+  // paragraph: the event holds what was read before the failure and
+  // nothing after it; a text portion that could not be read is missing
+  // from runs. Absent when it was read in full.
+  ExtractionGap gap = 13;
 }
 
 // Footnote is one footnote or endnote, with its citation label, its content
@@ -814,6 +831,10 @@ message Footnote {
   TwipsPoint anchor = 5;
   // The note's content runs, in order, flattened across its paragraphs.
   repeated TextRun runs = 6;
+  // Present when the office core failed part way through reading this
+  // note: the event holds what was read before the failure and
+  // nothing after it. Absent when it was read in full.
+  ExtractionGap gap = 7;
 }
 
 // Comment is one document comment: a Writer comment anchored in the text
@@ -1093,6 +1114,10 @@ message DocumentIndex {
   TwipsPoint anchor = 5;
   // The generated index text runs, flattened across its paragraphs.
   repeated TextRun runs = 6;
+  // Present when the office core failed part way through reading this
+  // index: the event holds what was read before the failure and
+  // nothing after it. Absent when it was read in full.
+  ExtractionGap gap = 7;
 }
 
 // TableCellData is one cell of a table.
@@ -1148,6 +1173,10 @@ message TableData {
   // measurements to their cells (TableCellData.line_rects) without the size
   // cap.
   repeated LineBox line_rects = 8;
+  // Present when the office core failed part way through reading this
+  // table: the event holds what was read before the failure and
+  // nothing after it. Absent when it was read in full.
+  ExtractionGap gap = 9;
 }
 
 // EmbeddedImage is one image object embedded in the document, with its bytes
@@ -1194,6 +1223,11 @@ message EmbeddedImage {
   // to the body at the anchor's caret. The caret point and page are then
   // where the header is laid out on its first page.
   bool in_header_footer = 13;
+  // Present when the office core failed part way through reading this
+  // image: the event holds what was read before the failure and
+  // nothing after it (an image that could not be encoded at all has no
+  // data and no mime_type). Absent when it was read in full.
+  ExtractionGap gap = 14;
 }
 
 // EmbeddedObjectKind classifies an embedded object's inner content.
@@ -1327,6 +1361,10 @@ message EmbeddedObject {
   // to the body at the anchor's caret. The caret point and page are then
   // where the header is laid out on its first page.
   bool in_header_footer = 15;
+  // Present when the office core failed part way through reading this
+  // object: the event holds what was read before the failure and
+  // nothing after it. Absent when it was read in full.
+  ExtractionGap gap = 16;
 }
 
 // SheetCellType is the office core's cell content classification, mirroring
@@ -1442,6 +1480,10 @@ message SheetCell {
   // that evaluates to an error (error_code says so). Without it a formula
   // yielding 0 and a formula yielding text look the same in number.
   SheetCellType formula_result = 14;
+  // Present when the office core failed part way through reading this
+  // cell: the event holds what was read before the failure and
+  // nothing after it. Absent when it was read in full.
+  ExtractionGap gap = 15;
 }
 
 // SheetRow is one used row of a sheet, streamed the moment it is parsed.
@@ -1574,6 +1616,10 @@ message TextFrame {
   // to the body at the anchor's caret. The caret point and page are then
   // where the header is laid out on its first page.
   bool in_header_footer = 10;
+  // Present when the office core failed part way through reading this
+  // frame: the event holds what was read before the failure and
+  // nothing after it. Absent when it was read in full.
+  ExtractionGap gap = 11;
 }
 
 // Shape is one draw-page shape of a text document: a custom shape, a text
@@ -1798,7 +1844,8 @@ message RenderStatus {
     // Unset; never emitted by the server.
     STATE_UNSPECIFIED = 0;
     // The render completed and every selected part was walked to its end.
-    // Problems with single items are listed in warnings.
+    // Problems with single items are listed in warnings; an item cut short
+    // carries an ExtractionGap and is counted in incomplete_items.
     STATE_OK = 1;
   }
   // The terminal outcome.
@@ -1812,6 +1859,10 @@ message RenderStatus {
   int64 output_bytes = 4;
   // Wall-clock render time in milliseconds, measured in the worker.
   int64 render_millis = 5;
+  // Typed events sent with an ExtractionGap: items the office core failed
+  // part way through reading, sent with what was read. 0 when every item
+  // was read in full.
+  int32 incomplete_items = 6;
 }
 
 // GetServiceInfoRequest asks for the service's capabilities.
