@@ -2756,6 +2756,55 @@ void verify_all_but_pages_token() {
           "all-but-pages status ok");
 }
 
+// Trips the worker's test-only fault points (src/fault_injection.h) for
+// the worker runs inside its scope; the worker inherits the environment.
+struct FaultScope {
+  explicit FaultScope(const char* points) {
+    require(::setenv("GRLIBRE_TEST_FAULT", points, 1) == 0, "set fault points");
+  }
+  ~FaultScope() { ::unsetenv("GRLIBRE_TEST_FAULT"); }
+  FaultScope(const FaultScope&) = delete;
+  FaultScope& operator=(const FaultScope&) = delete;
+};
+
+// Typed content the caller asked for that could not be extracted is a
+// failed render, never STATE_OK over an empty or cut-short event list: an
+// office core whose UNO context or loaded model cannot be reached, and a
+// walk that throws half way, each end the worker with a failure and no
+// terminal status frame. A request for page images alone asked for no
+// typed content, so the same faults lose nothing and the render stands.
+void verify_failed_extraction_fails_the_render() {
+  const std::string doc = "First paragraph.\nSecond paragraph.\n";
+  for (const char* fault : {"typed-content-no-uno-context",
+                            "typed-content-no-model",
+                            "typed-content-walk-throws"}) {
+    const std::string name = fault;
+    FaultScope scope(fault);
+    std::vector<std::string> payloads;
+    auto outcome = run_with_parts("pages", "txt", doc, "all", &payloads);
+    PagesRun run = fold_pages(payloads);
+    require(!run.got_status,
+            name + ": no terminal status follows a failed extraction, got "
+                "state " + std::to_string(run.status.state()));
+    require(outcome.kind == grlibre::WorkerOutcome::Kind::kExtractionFailed,
+            name + ": the worker reports the failed extraction, got: "
+                + outcome.detail);
+    require(run.paragraphs.empty(),
+            name + ": the fault really cut the paragraphs off");
+
+    std::vector<std::string> pages_only;
+    auto pages_outcome = run_with_parts("pages", "txt", doc, "1", &pages_only);
+    PagesRun pages_run = fold_pages(pages_only);
+    require(pages_outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+            name + ": a pages-only render asked for no typed content and "
+                "stands: " + pages_outcome.detail);
+    require(pages_run.got_status &&
+                pages_run.status.state() == officev1::RenderStatus::STATE_OK &&
+                !pages_run.pages.empty(),
+            name + ": the pages-only render ends STATE_OK with its pages");
+  }
+}
+
 // Redaction on page images: a span in the middle of the text must change
 // the painted page. Guards the span-overlap fix; the old fallback only
 // looked at a paragraph's first character.
@@ -4548,6 +4597,7 @@ int main() {
   verify_html_renders_and_exits_promptly();
   verify_stream_option_extras();
   verify_all_but_pages_token();
+  verify_failed_extraction_fails_the_render();
   verify_redact_spans_change_pages();
   verify_pdf_redaction_removes_text();
   verify_redaction_removes_text_everywhere();

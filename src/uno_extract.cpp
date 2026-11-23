@@ -183,6 +183,7 @@
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/message.h>
 
+#include "fault_injection.h"
 #include "gif_palette.h"
 #include "ai/pipestream/office/v1/office_service.pb.h"
 
@@ -4896,11 +4897,13 @@ bool emit_typed_content_with(const PartSelection& parts, SelectionProbe* probe,
                              const EmitFn& emit_fn, Warner& warner) {
   try {
     Reference<css::uno::XComponentContext> context = process_context();
+    if (fault_injected("typed-content-no-uno-context")) context.clear();
     if (!context.is()) {
       warner.warn("no in-process UNO context, typed content unavailable");
       return true;
     }
     Reference<css::frame::XModel> model = find_loaded_model(context);
+    if (fault_injected("typed-content-no-model")) model.clear();
     if (!model.is()) {
       warner.warn("loaded document not found on the desktop, typed content unavailable");
       return true;
@@ -4908,6 +4911,9 @@ bool emit_typed_content_with(const PartSelection& parts, SelectionProbe* probe,
     const WorkFolderScope work_folder_scope(model);
     if (parts.wants(officev1::DOCUMENT_PART_METADATA)) {
       if (!emit_metadata(model, emit_fn, warner)) return false;
+    }
+    if (fault_injected("typed-content-walk-throws")) {
+      throw css::uno::RuntimeException("injected fault: the walk throws");
     }
     if (parts.wants(officev1::DOCUMENT_PART_EMBEDDED_OBJECTS)) {
       if (!emit_embedded_objects(model, context,
