@@ -5,6 +5,7 @@
 
 #include <cstdlib>
 #include <print>
+#include <map>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -438,10 +439,13 @@ void verify_writer_stream() {
     require(split->start_row_offset_idx() == 1
                 && split->start_col_offset_idx() == 1,
             "writer: split cell anchors where its name says");
-    require(table.meta().custom_fields().count("cell:B2.1") == 0,
-            "writer: an anchored split cell needs no custom field");
-    require(table.meta().custom_fields().count("cell:?") == 1,
-            "writer: a cell name anchoring nowhere still keeps its text");
+    require(table.meta().custom_fields().empty(),
+            "writer: no table cell rides a value map");
+    require(table.data().unplaced_cells_size() == 1
+                && table.data().unplaced_cells(0).source_name() == "?"
+                && table.data().unplaced_cells(0).text() == "stray text",
+            "writer: a cell name anchoring nowhere keeps its text as an "
+            "unplaced cell");
   }
   require(table.data().table_cells(0).row_span() == 2
               && table.data().table_cells(0).end_row_offset_idx() == 2,
@@ -1144,8 +1148,12 @@ void verify_marks_stream() {
           "marks: the value item hangs from its field item");
   const docv1::FieldItem& checkbox_field = document.field_items(0);
   require(checkbox_field.field_name() == "check1"
-              && checkbox_field.parameters().at("Checkbox_Checked") == "true",
-          "marks: a field names itself and keeps its stored parameters");
+              && checkbox_field.parameters().empty()
+              && checkbox_field.typed_parameters_size() == 1
+              && checkbox_field.typed_parameters(0).name() == "Checkbox_Checked"
+              && checkbox_field.typed_parameters(0).has_bool_value()
+              && checkbox_field.typed_parameters(0).bool_value(),
+          "marks: a field names itself and keeps its stored parameters typed");
   require(checkbox_field.meta().custom_fields().empty(),
           "marks: nothing about a form field rides a value map");
   const docv1::FieldItem& dropdown_field = document.field_items(1);
@@ -2457,6 +2465,134 @@ void verify_embedded_workbook_sheets() {
   require(attached, "the workbook's attachment points at its group");
 }
 
+// Typed wire values keep their types in the Document. A table cell whose
+// name anchors nowhere is an unplaced TableCell under its own name, a
+// placed cell keeps its name too, a header paragraph names its page style,
+// a slide group carries its layout number and master page, and a form
+// field's parameters keep their stored types (a tiny double does not round
+// to zero, a list stays one list). Nothing rides custom_fields or the
+// text-only parameters map.
+void verify_typed_values_have_typed_homes() {
+  grlibre::DoclingMapper mapper;
+  mapper.consume(info_event("text", 1, 15840));
+  {
+    officev1::StreamPagesResponse event;
+    officev1::TableData* table = event.mutable_table();
+    table->set_rows(1);
+    table->set_columns(1);
+    table->set_page_index(0);
+    officev1::TableCellData* cell = table->add_cells();
+    cell->set_row(0);
+    cell->set_column(0);
+    cell->set_name("A1");
+    cell->set_text("placed");
+    officev1::TableCellData* stray = table->add_cells();
+    stray->set_row(-1);
+    stray->set_column(-1);
+    stray->set_name("?");
+    stray->set_text("stray");
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::HeaderFooter* header = event.mutable_header_footer();
+    header->set_page_style("Landscape");
+    officev1::TextRun* run = header->add_paragraphs()->add_runs();
+    run->set_text("Letterhead");
+    run->set_char_offset(-1);
+    run->set_char_length(10);
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::Slide* slide = event.mutable_slide();
+    slide->set_index(0);
+    slide->set_name("Slide 1");
+    slide->set_layout(0);
+    slide->set_master_page_name("Master A");
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::FormField* field = event.mutable_form_field();
+    field->set_index(0);
+    field->set_kind(officev1::FORM_FIELD_KIND_TEXT);
+    field->set_name("typed");
+    field->set_selected_index(-1);
+    auto add = [&](const std::string& name) {
+      officev1::FormFieldParameter* parameter = field->add_parameters();
+      parameter->set_name(name);
+      return parameter;
+    };
+    add("flag")->set_bool_value(true);
+    add("count")->set_int_value(-7);
+    add("tiny")->set_double_value(1e-7);
+    add("huge")->set_double_value(1e21);
+    add("label")->set_string_value("text");
+    officev1::FormFieldParameter* list = add("entries");
+    list->add_string_list("alpha");
+    list->add_string_list("beta");
+    mapper.consume(event);
+  }
+  mapper.consume(status_event(""));
+  const docv1::Document& document = mapper.document();
+
+  require(document.tables_size() == 1, "typed: one table");
+  const docv1::TableItem& table = document.tables(0);
+  require(table.meta().custom_fields().empty(),
+          "typed: no table cell rides a value map");
+  require(table.data().table_cells_size() == 1
+              && table.data().table_cells(0).source_name() == "A1",
+          "typed: a placed cell keeps its own name");
+  require(table.data().unplaced_cells_size() == 1
+              && table.data().unplaced_cells(0).source_name() == "?"
+              && table.data().unplaced_cells(0).text() == "stray",
+          "typed: a cell anchoring nowhere is an unplaced cell");
+
+  const docv1::TextItemBase* header =
+      find_text(document, docv1::DOC_ITEM_LABEL_PAGE_HEADER);
+  require(header != nullptr && header->meta().custom_fields().empty()
+              && header->has_page_style_name()
+              && header->page_style_name() == "Landscape",
+          "typed: a header paragraph names its page style");
+
+  const docv1::GroupItem* slide = nullptr;
+  for (const docv1::GroupItem& group : document.groups()) {
+    if (group.label() == docv1::GROUP_LABEL_SLIDE) slide = &group;
+  }
+  require(slide != nullptr && slide->meta().custom_fields().empty()
+              && slide->has_slide() && slide->slide().has_layout_id()
+              && slide->slide().layout_id() == 0
+              && slide->slide().master_page_name() == "Master A",
+          "typed: a slide carries its layout number and master page");
+
+  require(document.field_items_size() == 1, "typed: one field item");
+  const docv1::FieldItem& field = document.field_items(0);
+  require(field.parameters().empty(),
+          "typed: the text-only parameters map stays empty");
+  std::map<std::string, const docv1::FieldParameter*> by_name;
+  for (const docv1::FieldParameter& parameter : field.typed_parameters()) {
+    by_name[parameter.name()] = &parameter;
+  }
+  require(by_name.size() == 6, "typed: every parameter is kept, got "
+                                   + std::to_string(by_name.size()));
+  require(by_name["flag"]->has_bool_value() && by_name["flag"]->bool_value(),
+          "typed: a bool stays a bool");
+  require(by_name["count"]->has_int_value()
+              && by_name["count"]->int_value() == -7,
+          "typed: an integer stays an integer");
+  require(by_name["tiny"]->has_double_value()
+              && by_name["tiny"]->double_value() == 1e-7
+              && by_name["huge"]->double_value() == 1e21,
+          "typed: a double keeps its exact value");
+  require(by_name["label"]->string_value() == "text",
+          "typed: a string stays a string");
+  require(by_name["entries"]->has_string_list()
+              && by_name["entries"]->string_list().values_size() == 2
+              && by_name["entries"]->string_list().values(1) == "beta",
+          "typed: a list stays one list");
+}
+
 int main() {
   verify_writer_stream();
   verify_calc_stream();
@@ -2479,6 +2615,7 @@ int main() {
   verify_header_footer_items_and_page_labels();
   verify_chart_series_kept();
   verify_embedded_workbook_sheets();
+  verify_typed_values_have_typed_homes();
   std::println("docling_map_test passed");
   return 0;
 }
