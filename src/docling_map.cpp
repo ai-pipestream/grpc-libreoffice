@@ -49,42 +49,6 @@ int32_t clamp32(long long value) {
   return static_cast<int32_t>(value);
 }
 
-std::string base64(const std::string& data) {
-  static const char alphabet[] =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  std::string out;
-  out.reserve((data.size() + 2) / 3 * 4);
-  size_t i = 0;
-  while (i + 2 < data.size()) {
-    uint32_t chunk = (static_cast<unsigned char>(data[i]) << 16)
-        | (static_cast<unsigned char>(data[i + 1]) << 8)
-        | static_cast<unsigned char>(data[i + 2]);
-    out.push_back(alphabet[(chunk >> 18) & 63]);
-    out.push_back(alphabet[(chunk >> 12) & 63]);
-    out.push_back(alphabet[(chunk >> 6) & 63]);
-    out.push_back(alphabet[chunk & 63]);
-    i += 3;
-  }
-  if (i + 1 == data.size()) {
-    uint32_t chunk = static_cast<unsigned char>(data[i]) << 16;
-    out.push_back(alphabet[(chunk >> 18) & 63]);
-    out.push_back(alphabet[(chunk >> 12) & 63]);
-    out.append("==");
-  } else if (i + 2 == data.size()) {
-    uint32_t chunk = (static_cast<unsigned char>(data[i]) << 16)
-        | (static_cast<unsigned char>(data[i + 1]) << 8);
-    out.push_back(alphabet[(chunk >> 18) & 63]);
-    out.push_back(alphabet[(chunk >> 12) & 63]);
-    out.push_back(alphabet[(chunk >> 6) & 63]);
-    out.push_back('=');
-  }
-  return out;
-}
-
-std::string data_uri(const std::string& mime, const std::string& bytes) {
-  return "data:" + mime + ";base64," + base64(bytes);
-}
-
 // The media type of a rendered page image. The request selects the encoding
 // and the response names it; a producer that predates format selection sends
 // PNG and no name.
@@ -1094,7 +1058,7 @@ void DoclingMapper::on_page_image(const officev1::PageImage& image) {
   ref->set_dpi(image.dpi());
   ref->mutable_size()->set_width(image.width_px());
   ref->mutable_size()->set_height(image.height_px());
-  ref->set_uri(data_uri(mime, image.png()));
+  ref->set_data(image.png());
 }
 
 void DoclingMapper::on_metadata(const officev1::DocumentMetadata& meta) {
@@ -1343,7 +1307,7 @@ void DoclingMapper::on_embedded_image(const officev1::EmbeddedImage& image) {
     ref->set_mimetype(image.mime_type());
     ref->mutable_size()->set_width(static_cast<double>(image.width_twips()));
     ref->mutable_size()->set_height(static_cast<double>(image.height_twips()));
-    ref->set_uri(data_uri(image.mime_type(), image.data()));
+    ref->set_data(image.data());
   }
   if (image.has_anchor()) {
     add_prov(picture->mutable_prov(), image.page_index(), page_local,
@@ -1793,8 +1757,7 @@ void DoclingMapper::on_embedded_object(const officev1::EmbeddedObject& object) {
     ref->set_mimetype(object.replacement_mime_type());
     ref->mutable_size()->set_width(static_cast<double>(object.width_twips()));
     ref->mutable_size()->set_height(static_cast<double>(object.height_twips()));
-    ref->set_uri(data_uri(object.replacement_mime_type(),
-                          object.replacement_image()));
+    ref->set_data(object.replacement_image());
   }
   add_prov(picture->mutable_prov(), object.page_index(), page_local, l, t, r, b,
            0, 0);

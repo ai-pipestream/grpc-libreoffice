@@ -411,7 +411,8 @@ test("POST /api/document with default parts embeds no page images", async () => 
   const body = await resp.json();
   assert.ok(body.document.texts?.length > 0, "typed content still mapped");
   for (const page of Object.values(body.document.pages ?? {})) {
-    assert.ok(!page.image?.uri, "no page image data URIs by default");
+    assert.ok(!page.image?.uri && !page.image?.data,
+      "no page image bytes by default");
   }
 });
 

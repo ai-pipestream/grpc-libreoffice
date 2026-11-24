@@ -890,7 +890,8 @@ int main() {
     require(mapped.status().state() == officev1::RenderStatus::STATE_OK,
             "ToDocument status is OK");
     for (const auto& entry : mapped.document().pages()) {
-      require(entry.second.image().uri().empty(),
+      require(entry.second.image().data().empty()
+                  && entry.second.image().uri().empty(),
               "default ToDocument embeds no page images");
     }
 
@@ -903,7 +904,9 @@ int main() {
             "ToDocument with pages ok: " + status.error_message());
     bool embedded = false;
     for (const auto& entry : mapped_pages.document().pages()) {
-      if (entry.second.image().uri().starts_with("data:image/png")) {
+      if (entry.second.image().mimetype() == "image/png"
+          && entry.second.image().data().starts_with("\x89PNG")
+          && entry.second.image().uri().empty()) {
         embedded = true;
       }
     }

@@ -2261,9 +2261,10 @@ void verify_docling_mapping() {
               && document.tables(0).data().num_cols() == 2,
           "mapped table keeps its grid dimensions");
   require(document.pictures_size() >= 1
-              && document.pictures(0).image().uri()
-                     .starts_with("data:image/"),
-          "mapped picture carries a data URI");
+              && document.pictures(0).image().mimetype().starts_with("image/")
+              && !document.pictures(0).image().data().empty()
+              && document.pictures(0).image().uri().empty(),
+          "mapped picture carries its bytes in ImageRef.data");
   std::string wpg_ref;
   for (const docv1::GroupItem& group : document.groups()) {
     if (group.name() == "WPG1") wpg_ref = group.self_ref();
@@ -4420,10 +4421,10 @@ void verify_skip_hidden_keeps_sheet_ordinals() {
   require(document.pages().contains(1) && document.pages().contains(3),
           "the two painted sheets are pages 1 and 3");
   require(!document.pages().contains(2) ||
-              document.pages().at(2).image().uri().empty(),
+              document.pages().at(2).image().data().empty(),
           "the hidden sheet's page holds no image");
   const auto& last_page = document.pages().at(3);
-  require(!last_page.image().uri().empty(), "page 3 holds an image");
+  require(!last_page.image().data().empty(), "page 3 holds an image");
   require(last_page.size().width() ==
               static_cast<double>(run.info.page_rects(1).width_twips()) &&
               last_page.size().height() ==

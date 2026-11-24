@@ -474,8 +474,9 @@ void verify_writer_stream() {
           "writer: images and chart become pictures");
   const docv1::PictureItem& image = document.pictures(0);
   require(image.label() == docv1::DOC_ITEM_LABEL_PICTURE
-              && image.image().uri().starts_with("data:image/png;base64,"),
-          "writer: embedded image data URI");
+              && image.image().mimetype() == "image/png"
+              && !image.image().data().empty() && image.image().uri().empty(),
+          "writer: embedded image bytes ride ImageRef.data, not a URI");
   require(image.prov_size() == 1
               && image.prov(0).bbox().l() == 2000.0 - 284.0,
           "writer: image anchor page-local");
@@ -1896,8 +1897,10 @@ void verify_slide_content() {
               && document.pictures(0).parent().ref() == slide->self_ref(),
           "slides: a slide picture lands under its slide");
   const docv1::PictureItem& picture = document.pictures(0);
-  require(picture.image().uri().starts_with("data:image/jpeg;base64,"),
-          "slides: slide pictures carry their bytes");
+  require(picture.image().mimetype() == "image/jpeg"
+              && !picture.image().data().empty()
+              && picture.image().uri().empty(),
+          "slides: slide pictures carry their bytes in ImageRef.data");
   require(picture.meta().description().text()
               == "A bar chart of quarterly revenue",
           "slides: alt text becomes the picture description");
@@ -1926,7 +1929,7 @@ void verify_page_units_and_format() {
   const docv1::PageItem& page = document.pages().at(1);
   require(page.unit() == "twip", "pages: the coordinate unit is declared");
   require(page.image().mimetype() == "image/webp"
-              && page.image().uri().starts_with("data:image/webp;base64,"),
+              && !page.image().data().empty() && page.image().uri().empty(),
           "pages: the page image reports the encoding it carries");
 }
 
@@ -1981,10 +1984,10 @@ void verify_page_rects_name_their_page() {
   require(document.pages().at(3).size().width() == 9000.0
               && document.pages().at(3).size().height() == 7000.0,
           "page index: page 3 has the last sheet's size");
-  require(!document.pages().at(3).image().uri().empty(),
+  require(!document.pages().at(3).image().data().empty(),
           "page index: page 3 has the last sheet's image");
   require(!document.pages().contains(2)
-              || (document.pages().at(2).image().uri().empty()
+              || (document.pages().at(2).image().data().empty()
                   && document.pages().at(2).size().width() == 0.0),
           "page index: the unpainted sheet borrowed no size and no image");
   require(document.tables_size() == 3
