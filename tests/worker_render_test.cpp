@@ -976,7 +976,12 @@ void verify_sheet_chart_is_one_picture() {
   bool has_bars = false;
   bool has_tabular = false;
   for (const auto& annotation : chart.annotations()) {
-    if (annotation.has_bar_chart()) has_bars = true;
+    if (annotation.has_bar_chart()) {
+      has_bars = true;
+      require(annotation.bar_chart().series_name() == "Sales",
+              "the bar annotation names its series, got '"
+                  + annotation.bar_chart().series_name() + "'");
+    }
     if (annotation.has_tabular_chart()) has_tabular = true;
   }
   require(has_bars && has_tabular,
@@ -999,6 +1004,76 @@ void verify_sheet_chart_is_one_picture() {
     if (child.ref() == chart.self_ref()) links++;
   }
   require(links == 1, "the chart picture is linked exactly once");
+}
+
+// A flat ODS whose only data sits at M50:N51.
+const char kOffsetFods[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.spreadsheet">
+ <office:body><office:spreadsheet>
+  <table:table table:name="Offset">
+   <table:table-row table:number-rows-repeated="49"><table:table-cell table:number-columns-repeated="14"/></table:table-row>
+   <table:table-row>
+    <table:table-cell table:number-columns-repeated="12"/>
+    <table:table-cell office:value-type="string"><text:p>first</text:p></table:table-cell>
+    <table:table-cell/>
+   </table:table-row>
+   <table:table-row>
+    <table:table-cell table:number-columns-repeated="13"/>
+    <table:table-cell office:value-type="float" office:value="7"><text:p>7</text:p></table:table-cell>
+   </table:table-row>
+  </table:table>
+ </office:spreadsheet></office:body>
+</office:document>
+)";
+
+// The sheet's table holds its used range only, and its origin says the
+// range starts at M50, so the grid is not 51 rows of mostly nothing.
+void verify_sheet_table_starts_at_used_range() {
+  namespace docv1 = ai::pipestream::document::v1;
+  std::vector<std::string> payloads;
+  auto outcome = run("pages", "fods", kOffsetFods, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "offset fods renders ok: " + outcome.detail);
+  grlibre::DoclingMapper mapper;
+  for (const std::string& payload : payloads) {
+    officev1::StreamPagesResponse event;
+    require(event.ParseFromString(payload), "offset event parses");
+    if (event.has_sheet()) {
+      require(event.sheet().used_start_row() == 49
+                  && event.sheet().used_start_column() == 12,
+              "the worker reports the used range starting at M50, got row "
+                  + std::to_string(event.sheet().used_start_row())
+                  + " col "
+                  + std::to_string(event.sheet().used_start_column()));
+    }
+    mapper.consume(event);
+  }
+  const auto& document = mapper.document();
+  require(document.tables_size() == 1, "one table for the sheet");
+  const docv1::TableData& data = document.tables(0).data();
+  require(data.num_rows() == 2 && data.num_cols() == 2,
+          "the table covers M50:N51 only, got "
+              + std::to_string(data.num_rows()) + " by "
+              + std::to_string(data.num_cols()));
+  require(data.has_origin() && data.origin().row() == 49
+              && data.origin().col() == 12,
+          "the table's origin is M50");
+  bool first_ok = false;
+  bool last_ok = false;
+  for (const docv1::TableCell& cell : data.table_cells()) {
+    if (cell.text() == "first") {
+      first_ok = cell.start_row_offset_idx() == 0
+          && cell.start_col_offset_idx() == 0;
+    }
+    if (cell.text() == "7") {
+      last_ok = cell.start_row_offset_idx() == 1
+          && cell.start_col_offset_idx() == 1 && cell.value().number() == 7.0;
+    }
+  }
+  require(first_ok && last_ok, "cells sit at grid positions from the origin");
 }
 
 std::map<int, int> run_selection(const std::string& extension,
@@ -2186,9 +2261,10 @@ void verify_docling_mapping() {
               && document.tables(0).data().num_cols() == 2,
           "mapped table keeps its grid dimensions");
   require(document.pictures_size() >= 1
-              && document.pictures(0).image().uri()
-                     .starts_with("data:image/"),
-          "mapped picture carries a data URI");
+              && document.pictures(0).image().mimetype().starts_with("image/")
+              && !document.pictures(0).image().data().empty()
+              && document.pictures(0).image().uri().empty(),
+          "mapped picture carries its bytes in ImageRef.data");
   std::string wpg_ref;
   for (const docv1::GroupItem& group : document.groups()) {
     if (group.name() == "WPG1") wpg_ref = group.self_ref();
@@ -4345,10 +4421,10 @@ void verify_skip_hidden_keeps_sheet_ordinals() {
   require(document.pages().contains(1) && document.pages().contains(3),
           "the two painted sheets are pages 1 and 3");
   require(!document.pages().contains(2) ||
-              document.pages().at(2).image().uri().empty(),
+              document.pages().at(2).image().data().empty(),
           "the hidden sheet's page holds no image");
   const auto& last_page = document.pages().at(3);
-  require(!last_page.image().uri().empty(), "page 3 holds an image");
+  require(!last_page.image().data().empty(), "page 3 holds an image");
   require(last_page.size().width() ==
               static_cast<double>(run.info.page_rects(1).width_twips()) &&
               last_page.size().height() ==
@@ -5590,6 +5666,7 @@ int main() {
   verify_linked_resources_are_not_fetched();
   verify_picture_without_graphic_is_reported();
   verify_sheet_chart_is_one_picture();
+  verify_sheet_table_starts_at_used_range();
   verify_death_before_status_is_crash();
   verify_hung_worker_is_killed_at_deadline();
   verify_eof_without_exit_is_reaped();
