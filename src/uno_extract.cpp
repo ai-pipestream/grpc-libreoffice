@@ -4776,6 +4776,14 @@ bool emit_embedded_objects(const Reference<css::frame::XModel>& model,
         } catch (const css::beans::UnknownPropertyException&) {
           // Expected probe result: not every shape stores a class id.
         }
+        try {
+          rtl::OUString persist_name;
+          props->getPropertyValue("PersistName") >>= persist_name;
+          out->set_persist_name(utf8(persist_name));
+        } catch (const css::beans::UnknownPropertyException&) {
+          // Expected probe result: a foreign OLE shape may have no storage
+          // name.
+        }
         Reference<css::drawing::XShape> shape(props, UNO_QUERY);
         if (shape.is()) {
           css::awt::Point position = shape->getPosition();

@@ -879,6 +879,128 @@ const char kTypedFods[] = R"(<?xml version="1.0" encoding="UTF-8"?>
 </office:document>
 )";
 
+// A flat ODS whose first sheet carries a bar chart drawn from A1:B3 of
+// that sheet. Calc reports the chart twice, once as a sheet chart with its
+// source ranges and once as a draw-page OLE object with its typed data.
+const char kSheetChartFods[] = R"(<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ xmlns:chart="urn:oasis:names:tc:opendocument:xmlns:chart:1.0"
+ xmlns:xlink="http://www.w3.org/1999/xlink"
+ office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.spreadsheet">
+ <office:body><office:spreadsheet>
+  <table:table table:name="Data">
+   <table:shapes>
+    <draw:frame draw:name="Sales chart" svg:x="5cm" svg:y="1cm" svg:width="8cm" svg:height="5cm">
+     <draw:object draw:notify-on-update-of-ranges="Data.A1:Data.B3">
+      <office:document office:version="1.2" office:mimetype="application/vnd.oasis.opendocument.chart"><office:body><office:chart>
+       <chart:chart chart:class="chart:bar">
+        <chart:plot-area table:cell-range-address="Data.A1:Data.B3" chart:data-source-has-labels="both">
+         <chart:axis chart:dimension="x" chart:name="primary-x"><chart:categories table:cell-range-address="Data.A2:Data.A3"/></chart:axis>
+         <chart:axis chart:dimension="y" chart:name="primary-y"/>
+         <chart:series chart:values-cell-range-address="Data.B2:Data.B3" chart:label-cell-address="Data.B1"/>
+        </chart:plot-area>
+       </chart:chart>
+      </office:chart></office:body></office:document>
+     </draw:object>
+    </draw:frame>
+   </table:shapes>
+   <table:table-row>
+    <table:table-cell office:value-type="string"><text:p>Quarter</text:p></table:table-cell>
+    <table:table-cell office:value-type="string"><text:p>Sales</text:p></table:table-cell>
+   </table:table-row>
+   <table:table-row>
+    <table:table-cell office:value-type="string"><text:p>Q1</text:p></table:table-cell>
+    <table:table-cell office:value-type="float" office:value="10"><text:p>10</text:p></table:table-cell>
+   </table:table-row>
+   <table:table-row>
+    <table:table-cell office:value-type="string"><text:p>Q2</text:p></table:table-cell>
+    <table:table-cell office:value-type="float" office:value="20"><text:p>20</text:p></table:table-cell>
+   </table:table-row>
+  </table:table>
+ </office:spreadsheet></office:body>
+</office:document>
+)";
+
+// A chart on a sheet is one chart, so the folded Document holds one chart
+// picture carrying both where its data came from (ChartMeta) and the data
+// itself (the typed chart annotations), not two unlinked pictures.
+void verify_sheet_chart_is_one_picture() {
+  namespace docv1 = ai::pipestream::document::v1;
+  std::vector<std::string> payloads;
+  auto outcome = run("pages", "fods", kSheetChartFods, &payloads);
+  require(outcome.kind == grlibre::WorkerOutcome::Kind::kOk,
+          "sheet chart fods renders ok: " + outcome.detail);
+  grlibre::DoclingMapper mapper;
+  int sheet_charts = 0;
+  int chart_objects = 0;
+  for (const std::string& payload : payloads) {
+    officev1::StreamPagesResponse event;
+    require(event.ParseFromString(payload), "sheet chart event parses");
+    if (event.has_sheet_chart()) sheet_charts++;
+    if (event.has_embedded_object()
+        && event.embedded_object().kind()
+               == officev1::EMBEDDED_OBJECT_KIND_CHART) {
+      chart_objects++;
+      // The sheet's chart list names a chart by its storage name, not by
+      // the shape name the user sees, so the object reports both.
+      require(event.embedded_object().name() == "Sales chart"
+                  && !event.embedded_object().persist_name().empty(),
+              "the chart object carries its shape and storage names");
+    }
+    mapper.consume(event);
+  }
+  require(sheet_charts == 1 && chart_objects == 1,
+          "the worker reports the sheet chart and its OLE object, got "
+              + std::to_string(sheet_charts) + " and "
+              + std::to_string(chart_objects));
+  const auto& document = mapper.document();
+  std::vector<const docv1::PictureItem*> charts;
+  for (const docv1::PictureItem& picture : document.pictures()) {
+    if (picture.label() == docv1::DOC_ITEM_LABEL_CHART) {
+      charts.push_back(&picture);
+    }
+  }
+  require(charts.size() == 1,
+          "one sheet chart folds into one chart picture, got "
+              + std::to_string(charts.size()));
+  const docv1::PictureItem& chart = *charts.front();
+  require(chart.chart().sources_size() == 1
+              && chart.chart().sources(0).start().sheet() == "Data"
+              && chart.chart().sources(0).end().row() == 2
+              && chart.chart().sources(0).end().col() == 1,
+          "the chart picture names its source range");
+  bool has_bars = false;
+  bool has_tabular = false;
+  for (const auto& annotation : chart.annotations()) {
+    if (annotation.has_bar_chart()) has_bars = true;
+    if (annotation.has_tabular_chart()) has_tabular = true;
+  }
+  require(has_bars && has_tabular,
+          "the same chart picture carries the typed chart data");
+  require(chart.shape().name() == "Sales chart",
+          "the chart picture keeps the chart's shape name");
+  const docv1::GroupItem* sheet = nullptr;
+  for (const docv1::GroupItem& group : document.groups()) {
+    if (group.label() == docv1::GROUP_LABEL_SHEET && group.name() == "Data") {
+      sheet = &group;
+    }
+  }
+  require(sheet != nullptr && chart.parent().ref() == sheet->self_ref(),
+          "the chart picture hangs under its sheet");
+  int links = 0;
+  for (const auto& child : sheet->children()) {
+    if (child.ref() == chart.self_ref()) links++;
+  }
+  for (const auto& child : document.body().children()) {
+    if (child.ref() == chart.self_ref()) links++;
+  }
+  require(links == 1, "the chart picture is linked exactly once");
+}
+
 std::map<int, int> run_selection(const std::string& extension,
                                  const std::string& document,
                                  const std::string& parts_token,
@@ -5467,6 +5589,7 @@ int main() {
   verify_document_macros_never_run();
   verify_linked_resources_are_not_fetched();
   verify_picture_without_graphic_is_reported();
+  verify_sheet_chart_is_one_picture();
   verify_death_before_status_is_crash();
   verify_hung_worker_is_killed_at_deadline();
   verify_eof_without_exit_is_reaped();
