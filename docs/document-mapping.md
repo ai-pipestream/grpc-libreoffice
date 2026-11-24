@@ -73,7 +73,8 @@ now, and the map copies are gone.
 | Embedded object identity | `Document.attachments` (`SubDocumentRef`): id, name, media type, `class_id`, `kind`, and the item the payload became |
 | A picture's accessibility title | `PictureMeta.accessibility_title`, beside `description` |
 | Character style, highlight, overline | `InlineSpan.style_name`, `.highlight_color`, `Formatting.overline` |
-| Form field identity | `FieldItem.field_name`, `.options`, `.selected_index` (presence-tracked), `.span` (a `FineRef` into the item space), `.parameters` |
+| Form field identity | `FieldItem.field_name`, `.options`, `.selected_index` (presence-tracked), `.span` (a `FineRef` into the item space), `.typed_parameters` |
+| Slide layout and master page | `GroupItem.slide`: `layout_id` (the office core's autolayout number, presence-tracked) and `master_page_name` |
 | A permanently shown spreadsheet note | `CommentMeta.shown` |
 | An image, object, frame or shape anchored in a page header or footer (`in_header_footer`) | the furniture layer under `#/furniture` |
 | A paragraph that restarts page numbering (`Paragraph.page_number_offset`) | `PageItem.page_label` on the restart page and every page after it, until the next restart |
@@ -131,19 +132,18 @@ warning rather than silently dropped.
 
 A header or footer block still reports the page style it belongs to, which
 is a different fact: it says which pages the block repeats on, not which
-style a page uses. That name stays on the block item's `custom_fields`,
-where it was.
+style a page uses. That name is the block item's
+`TextItemBase.page_style_name`.
 
 ## Still without a typed home
 
 Nothing. Three shapes are worth naming because they are not losses but
 choices:
 
-- A `FieldItem.parameters` value is a string. Fieldmark parameters are an
-  open per-field vocabulary and the schema types the map that way; the wire
-  carries them typed, and a stored list keeps one entry per key
-  (`Entries[0]`, `Entries[1]`) rather than a joined string, so nothing has
-  to be split back apart.
+- Fieldmark parameters are an open per-field vocabulary, so they are a
+  list rather than fields: `FieldItem.typed_parameters`, one `FieldParameter`
+  per stored parameter in its stored type (bool, int64, double, string, or
+  a `StringList`). The text-only `FieldItem.parameters` map stays empty.
 - A draw-page form control and an in-text fieldmark are told apart by
   whether the field carries a `span`: a fieldmark anchors in the annotation
   text space, a control has only its box. The office wire's own boolean for
@@ -219,6 +219,6 @@ Fold side:
 
 A split cell's office name ("B7.1.2") starts with the base-grid cell it was
 split from, so the fold places it there with its merge spans. A cell name
-that parses to no position at all is the one case that still falls back to
-`TableItem.meta.custom_fields["cell:<name>"]`, which keeps the text rather
-than dropping it.
+that parses to no position at all is kept in `TableData.unplaced_cells`, a
+`TableCell` with its text and its office name in `source_name`, outside the
+grid. Every placed cell carries its office name in `source_name` too.

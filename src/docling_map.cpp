@@ -11,7 +11,6 @@
 #include <string>
 #include <string_view>
 
-#include <google/protobuf/struct.pb.h>
 #include <google/protobuf/timestamp.pb.h>
 
 namespace grlibre {
@@ -211,18 +210,6 @@ std::string mime_for_extension(const std::string& extension) {
   };
   auto found = kMimes.find(extension);
   return found != kMimes.end() ? found->second : "application/octet-stream";
-}
-
-google::protobuf::Value str_value(const std::string& text) {
-  google::protobuf::Value value;
-  value.set_string_value(text);
-  return value;
-}
-
-google::protobuf::Value num_value(double number) {
-  google::protobuf::Value value;
-  value.set_number_value(number);
-  return value;
 }
 
 std::string concat_runs(
@@ -904,13 +891,17 @@ void DoclingMapper::fold_table(const officev1::TableData& table,
       column = -1;
     }
     if (row < 0 || column < 0) {
-      (*item->mutable_meta()->mutable_custom_fields())["cell:" + cell.name()] =
-          str_value(cell.text());
+      // Kept as a cell under its own name, outside the grid, so a table
+      // consumer still sees its text.
+      docv1::TableCell* unplaced = data->add_unplaced_cells();
+      if (!cell.name().empty()) unplaced->set_source_name(cell.name());
+      unplaced->set_text(cell.text());
       continue;
     }
     int row_span = std::max(1, cell.row_span());
     int col_span = std::max(1, cell.column_span());
     docv1::TableCell* out = data->add_table_cells();
+    if (!cell.name().empty()) out->set_source_name(cell.name());
     out->set_start_row_offset_idx(row);
     out->set_end_row_offset_idx(row + row_span);
     out->set_start_col_offset_idx(column);
@@ -1373,8 +1364,9 @@ void DoclingMapper::on_header_footer(const officev1::HeaderFooter& block) {
     set_uniform_formatting(paragraph.runs(), handle.base);
     add_run_spans(paragraph.runs(), handle.base->mutable_spans(), handle.ref);
     apply_run_hyperlinks(paragraph.runs(), handle.base);
-    (*handle.base->mutable_meta()->mutable_custom_fields())["page_style"] =
-        str_value(block.page_style());
+    if (!block.page_style().empty()) {
+      handle.base->set_page_style_name(block.page_style());
+    }
   }
 }
 
@@ -1458,10 +1450,10 @@ void DoclingMapper::on_drawing_shape(const officev1::DrawingShape& shape) {
 void DoclingMapper::on_slide(const officev1::Slide& slide) {
   docv1::GroupItem* group = add_group("#/body", docv1::GROUP_LABEL_SLIDE,
                                       slide.name(), docv1::CONTENT_LAYER_BODY);
-  auto* fields = group->mutable_meta()->mutable_custom_fields();
-  (*fields)["layout"] = num_value(slide.layout());
+  docv1::SlideMeta* meta = group->mutable_slide();
+  meta->set_layout_id(slide.layout());
   if (!slide.master_page_name().empty()) {
-    (*fields)["master_page_name"] = str_value(slide.master_page_name());
+    meta->set_master_page_name(slide.master_page_name());
   }
   slide_group_[slide.index()] = group->self_ref();
 }
@@ -2306,36 +2298,33 @@ void DoclingMapper::on_form_field(const officev1::FormField& field) {
   if (field.selected_index() >= 0) {
     item->set_selected_index(field.selected_index());
   }
-  auto* parameters = item->mutable_parameters();
+  // Each parameter keeps its stored type; the text-only parameters map
+  // stays empty.
   for (const officev1::FormFieldParameter& parameter : field.parameters()) {
+    docv1::FieldParameter* out = item->add_typed_parameters();
+    out->set_name(parameter.name());
     switch (parameter.value_case()) {
       case officev1::FormFieldParameter::kBoolValue:
-        (*parameters)[parameter.name()] =
-            parameter.bool_value() ? "true" : "false";
+        out->set_bool_value(parameter.bool_value());
         break;
       case officev1::FormFieldParameter::kIntValue:
-        (*parameters)[parameter.name()] =
-            std::to_string(parameter.int_value());
+        out->set_int_value(parameter.int_value());
         break;
       case officev1::FormFieldParameter::kDoubleValue:
-        (*parameters)[parameter.name()] =
-            std::to_string(parameter.double_value());
+        out->set_double_value(parameter.double_value());
         break;
       case officev1::FormFieldParameter::kStringValue:
-        (*parameters)[parameter.name()] = parameter.string_value();
+        out->set_string_value(parameter.string_value());
         break;
-      case officev1::FormFieldParameter::VALUE_NOT_SET:
-        if (parameter.string_list().empty()) {
-          (*parameters)[parameter.name()] = std::string();
-          break;
-        }
-        // A list keeps one entry per key rather than a joined string, so no
-        // separator has to be guessed back out on the way in.
-        for (int entry = 0; entry < parameter.string_list_size(); entry++) {
-          (*parameters)[parameter.name() + "[" + std::to_string(entry) + "]"] =
-              parameter.string_list(entry);
+      case officev1::FormFieldParameter::VALUE_NOT_SET: {
+        // A list-of-text value, possibly empty; an empty list is still a
+        // list, never a missing value.
+        docv1::StringList* list = out->mutable_string_list();
+        for (const std::string& entry : parameter.string_list()) {
+          list->add_values(entry);
         }
         break;
+      }
     }
   }
   if (field.char_start() >= 0) {
