@@ -133,6 +133,10 @@ class DoclingMapper {
 
   ai::pipestream::document::v1::GroupItem* group_by_ref(const std::string& ref);
   void link_child(const std::string& parent_ref, const std::string& child_ref);
+  // Moves child_ref from the group or body it hangs under to parent_ref.
+  void relink_child(const std::string& old_parent_ref,
+                    const std::string& parent_ref,
+                    const std::string& child_ref);
   // Stamps the CollectorSource attribution ("libreoffice"/"lok") every text,
   // picture, and table item carries.
   void stamp_collector_source(
@@ -338,6 +342,16 @@ class DoclingMapper {
   std::map<int, std::string> sheet_comments_;
   std::map<int, std::string> sheet_name_;
   std::map<int, ai::pipestream::document::v1::ContentLayer> sheet_layer_;
+  // Calc reports a chart on a sheet twice: as a draw-page OLE object with
+  // its typed data and as a sheet chart with its source ranges. Both fold
+  // into one picture, found here by (sheet ordinal, the object's storage
+  // name, which is the sheet chart's name) whichever event arrives first:
+  // the picture's arena index, and whether the sheet chart made it.
+  struct SheetChartPicture {
+    int index = 0;
+    bool from_sheet_chart = false;
+  };
+  std::map<std::pair<int, std::string>, SheetChartPicture> sheet_charts_;
   std::map<int, std::string> slide_group_;
   // Draw group nesting: (page index, child group_path) to the group's ref,
   // so a shape attaches under the group its group_path names.

@@ -782,6 +782,90 @@ void verify_calc_stream() {
           "calc: the chart's source ranges leave the custom fields");
 }
 
+// Calc reports one chart twice: a draw-page OLE object with the typed data
+// and a sheet chart with the source ranges, joined by the object's storage
+// name. Either arrival order folds into one chart picture under its sheet.
+void verify_sheet_chart_and_object_fold_into_one_picture() {
+  for (bool object_first : {true, false}) {
+    const std::string what = object_first ? "object first" : "chart first";
+    grlibre::DoclingMapper mapper;
+    mapper.consume(info_event("spreadsheet", 1, 20000));
+    officev1::StreamPagesResponse object_event;
+    {
+      officev1::EmbeddedObject* object = object_event.mutable_embedded_object();
+      object->set_kind(officev1::EMBEDDED_OBJECT_KIND_CHART);
+      object->set_page_index(0);
+      object->set_name("Sales chart");
+      object->set_persist_name("Object 1");
+      object->mutable_position()->set_x(100);
+      object->mutable_position()->set_y(200);
+      object->set_width_twips(3000);
+      object->set_height_twips(2000);
+      officev1::EmbeddedChart* chart = object->mutable_chart();
+      chart->set_kind(officev1::EMBEDDED_CHART_KIND_BAR);
+      chart->add_categories("Q1");
+      officev1::EmbeddedChartSeries* series = chart->add_series();
+      series->set_label("Sales");
+      series->add_values_y(10);
+    }
+    officev1::StreamPagesResponse sheet_event;
+    {
+      officev1::Sheet* sheet = sheet_event.mutable_sheet();
+      sheet->set_index(0);
+      sheet->set_name("Data");
+      sheet->set_visible(true);
+      sheet->set_tab_color_rgb(-1);
+    }
+    officev1::StreamPagesResponse chart_event;
+    {
+      officev1::SheetChart* chart = chart_event.mutable_sheet_chart();
+      chart->set_sheet_index(0);
+      chart->set_name("Object 1");
+      chart->set_has_column_headers(true);
+      officev1::SheetRangeRef* range = chart->add_ranges();
+      range->set_end_row(1);
+      range->set_end_column(1);
+    }
+    if (object_first) {
+      mapper.consume(object_event);
+      mapper.consume(sheet_event);
+      mapper.consume(chart_event);
+    } else {
+      mapper.consume(sheet_event);
+      mapper.consume(chart_event);
+      mapper.consume(object_event);
+    }
+    mapper.consume(status_event(""));
+    require_integrity(mapper, "sheet chart " + what);
+    const docv1::Document& document = mapper.document();
+    require(document.pictures_size() == 1,
+            what + ": one chart folds into one picture, got "
+                + std::to_string(document.pictures_size()));
+    const docv1::PictureItem& picture = document.pictures(0);
+    require(picture.label() == docv1::DOC_ITEM_LABEL_CHART,
+            what + ": the picture is a chart");
+    require(picture.chart().sources_size() == 1
+                && picture.chart().sources(0).start().sheet() == "Data"
+                && picture.chart().has_column_headers(),
+            what + ": the picture names its source range");
+    bool has_bars = false;
+    for (const docv1::PictureAnnotation& annotation : picture.annotations()) {
+      if (annotation.has_bar_chart()) has_bars = true;
+    }
+    require(has_bars, what + ": the picture carries the typed chart data");
+    require(picture.shape().name() == "Sales chart",
+            what + ": the picture keeps the shape name");
+    require(picture.prov_size() == 1 && picture.prov(0).bbox().r() == 3100,
+            what + ": one provenance, the object's box on the sheet");
+    const docv1::GroupItem* sheet = nullptr;
+    for (const docv1::GroupItem& group : document.groups()) {
+      if (group.label() == docv1::GROUP_LABEL_SHEET) sheet = &group;
+    }
+    require(sheet != nullptr && picture.parent().ref() == sheet->self_ref(),
+            what + ": the picture hangs under its sheet");
+  }
+}
+
 void verify_impress_stream() {
   grlibre::DoclingMapper mapper;
   mapper.consume(info_event("presentation", 1, 21600));
@@ -2723,6 +2807,7 @@ int main() {
   verify_embedded_workbook_sheets();
   verify_typed_values_have_typed_homes();
   verify_wire_fields_reach_the_document();
+  verify_sheet_chart_and_object_fold_into_one_picture();
   std::println("docling_map_test passed");
   return 0;
 }

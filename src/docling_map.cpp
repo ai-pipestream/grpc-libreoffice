@@ -446,6 +446,20 @@ void DoclingMapper::link_child(const std::string& parent_ref,
   group_by_ref(parent_ref)->add_children()->set_ref(child_ref);
 }
 
+void DoclingMapper::relink_child(const std::string& old_parent_ref,
+                                 const std::string& parent_ref,
+                                 const std::string& child_ref) {
+  if (old_parent_ref == parent_ref) return;
+  auto* children = group_by_ref(old_parent_ref)->mutable_children();
+  for (int i = 0; i < children->size(); i++) {
+    if (children->Get(i).ref() == child_ref) {
+      children->DeleteSubrange(i, 1);
+      break;
+    }
+  }
+  link_child(parent_ref, child_ref);
+}
+
 void DoclingMapper::ensure_form_arena() {
   if (!field_region_ref_.empty()) return;
   docv1::FieldRegionItem* region = document_.add_field_regions();
@@ -1744,9 +1758,34 @@ void DoclingMapper::on_embedded_object(const officev1::EmbeddedObject& object) {
 
   bool is_chart = object.kind() == officev1::EMBEDDED_OBJECT_KIND_CHART;
   std::string picture_ref;
-  docv1::PictureItem* picture = add_picture(
-      is_chart ? docv1::DOC_ITEM_LABEL_CHART : docv1::DOC_ITEM_LABEL_PICTURE,
-      layer, root, &picture_ref);
+  docv1::PictureItem* picture = nullptr;
+  // A draw-page chart on a spreadsheet is the same chart as the sheet chart
+  // named by its storage name on that sheet: when the sheet chart came first, its
+  // picture takes the typed data, and its sheet-wide provenance gives way
+  // to this object's box.
+  const bool on_sheet = is_chart && page_local && !object.in_header_footer()
+      && document_type_ == "spreadsheet" && !object.persist_name().empty();
+  const std::pair<int, std::string> chart_key{object.page_index(),
+                                              object.persist_name()};
+  if (on_sheet) {
+    auto found = sheet_charts_.find(chart_key);
+    if (found != sheet_charts_.end() && found->second.from_sheet_chart) {
+      picture = document_.mutable_pictures(found->second.index);
+      picture_ref = picture->self_ref();
+      picture->clear_prov();
+      sheet_charts_.erase(found);
+    }
+  }
+  if (picture == nullptr) {
+    picture = add_picture(
+        is_chart ? docv1::DOC_ITEM_LABEL_CHART : docv1::DOC_ITEM_LABEL_PICTURE,
+        layer, root, &picture_ref);
+    if (on_sheet) {
+      sheet_charts_.emplace(chart_key,
+                            SheetChartPicture{document_.pictures_size() - 1,
+                                              false});
+    }
+  }
   if (!object.name().empty()) picture->mutable_shape()->set_name(object.name());
   register_embedded_object(object, picture_ref);
   if (!object.replacement_image().empty()) {
@@ -2105,9 +2144,38 @@ void DoclingMapper::on_sheet_chart(const officev1::SheetChart& chart) {
       sheet_layer != sheet_layer_.end()) {
     layer = sheet_layer->second;
   }
-  docv1::PictureItem* picture = add_picture(docv1::DOC_ITEM_LABEL_CHART, layer,
-                                            sheet_ref, nullptr);
-  if (!chart.name().empty()) picture->mutable_shape()->set_name(chart.name());
+  // The draw-page object for this chart may already have folded its typed
+  // data into a picture: that picture moves under its sheet and takes the
+  // source ranges, so one chart stays one picture.
+  docv1::PictureItem* picture = nullptr;
+  bool merged = false;
+  const std::pair<int, std::string> chart_key{chart.sheet_index(),
+                                              chart.name()};
+  if (!chart.name().empty()) {
+    auto found = sheet_charts_.find(chart_key);
+    if (found != sheet_charts_.end() && !found->second.from_sheet_chart) {
+      picture = document_.mutable_pictures(found->second.index);
+      relink_child(picture->parent().ref(), sheet_ref, picture->self_ref());
+      picture->mutable_parent()->set_ref(sheet_ref);
+      picture->set_content_layer(layer);
+      sheet_charts_.erase(found);
+      merged = true;
+    }
+  }
+  if (picture == nullptr) {
+    picture = add_picture(docv1::DOC_ITEM_LABEL_CHART, layer, sheet_ref,
+                          nullptr);
+    if (!chart.name().empty()) {
+      sheet_charts_.emplace(chart_key,
+                            SheetChartPicture{document_.pictures_size() - 1,
+                                              true});
+    }
+  }
+  // A merged picture keeps the object's shape name; the sheet chart's name
+  // is the object's storage name.
+  if (!merged && !chart.name().empty()) {
+    picture->mutable_shape()->set_name(chart.name());
+  }
   // Where the chart's data came from, as grid spans on the sheet it sits on.
   docv1::ChartMeta* provenance = picture->mutable_chart();
   const std::string sheet = sheet_label(chart.sheet_index());
@@ -2116,6 +2184,8 @@ void DoclingMapper::on_sheet_chart(const officev1::SheetChart& chart) {
   }
   provenance->set_has_column_headers(chart.has_column_headers());
   provenance->set_has_row_headers(chart.has_row_headers());
+  // A merged picture already holds the object's box on the sheet.
+  if (merged) return;
   add_prov(picture->mutable_prov(), chart.sheet_index(), true, 0, 0, 0, 0, 0,
            0);
 }

@@ -78,8 +78,9 @@ now, and the map copies are gone.
 | A permanently shown spreadsheet note | `CommentMeta.shown` |
 | An image, object, frame or shape anchored in a page header or footer (`in_header_footer`) | the furniture layer under `#/furniture` |
 | A paragraph that restarts page numbering (`Paragraph.page_number_offset`) | `PageItem.page_label` on the restart page and every page after it, until the next restart |
-| A chart's data sources | `PictureItem.chart` (`ChartMeta`): source `GridSpan`s and the two header flags |
+| A chart's data sources | `PictureItem.chart` (`ChartMeta`): source `GridSpan`s and the two header flags. On a spreadsheet the sheet chart and its draw-page object (joined by `EmbeddedObject.persist_name`, the storage name the sheet's chart list uses) fold into one chart picture under the sheet, carrying both `ChartMeta` and the typed chart annotations |
 | A name defined as a formula | `NamedRange.expression`, with `range` unset |
+| Render and fold warnings (font substitution, unresolved names, anything read with a loss) | `Document.warnings` (`CollectorWarning`, collector `libreoffice`, model `lok`), as well as `ToDocumentResponse.status` |
 | Form fields | the schema's own form subtree, below |
 
 ### The form subtree
@@ -203,17 +204,11 @@ Fold side:
   "<name> (x)", "<name> (y)", "<name> (size)"). Bubble sizes ride
   `ChartPoint.size`, and every tabular value cell carries its exact
   number in `CellValue.number` beside its text.
-- **A spreadsheet chart still mints two pictures**, one carrying the source
-  ranges in `ChartMeta` and one carrying the typed chart data, and nothing
-  links them.
 - **List markers and nesting depth.** `ListItem.marker`, `.enumerated`, and
   the nesting level are unset, so nested lists flatten.
 - **A sheet's used-range origin.** Only the end bounds become `num_rows` and
   `num_cols`, so a sheet whose data starts at M50 reports a mostly empty
   50 by 13 table.
-- **Render warnings** stay beside the document in `ToDocumentResponse.status`
-  rather than inside it, so a consumer holding only a `Document` cannot see
-  that fonts were substituted.
 
 ## Cell names that anchor nowhere
 
