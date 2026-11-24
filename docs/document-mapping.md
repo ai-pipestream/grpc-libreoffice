@@ -17,12 +17,12 @@ value rides `custom_fields` any more.
 |---|---|
 | Resolved text of a field (page number, date, cross-reference, caption number, index or mail-merge result) | inline in `TextItemBase.text`, with an `InlineSpan.field_code` over its range |
 | A cross-reference's destination | `InlineSpan.target`, a `FineRef` into the item the named anchor sits in |
-| Every hyperlink, not just the first | one `InlineSpan.hyperlink` per run over its own range; `TextItemBase.hyperlink` still names the first |
+| Every hyperlink, not just the first | one `InlineSpan.hyperlink` per run over its own range, with `hyperlink_target_frame` and `hyperlink_name` when the link has them; `TextItemBase.hyperlink` still names the first |
 | Per-run character formatting | `TextItemBase.spans` / `TableCell.spans`: `formatting` (bold, italic, underline, strikethrough, monospace, small caps, overline, script), `font_family`, `font_size_pt`, `color`, `language`, `style_name`, `highlight_color` |
 | Uniform character formatting | `TextItemBase.formatting`, unchanged, now including `script` |
 | Paragraph style name | `TextItemBase.style_name`, verbatim |
 | Comments | items under a `GROUP_LABEL_COMMENT_SECTION` group, back-linked from the annotated item's `comments` `FineRef` with the annotated range |
-| Tracked changes | `Document.changes`, each a `ChangeRecord` targeting the item range it touches |
+| Tracked changes | `Document.changes`, each a `ChangeRecord` targeting the item range it touches, with its `comment` and, for a change stacked on another, that change as `successor` (kind, author, timestamp, comment) |
 | Bookmarks | `Document.anchors`, each a `NamedAnchor` targeting the item range it names |
 | Spreadsheet cell values | `TableCell.value`: number, boolean, civil date and time, or error literal, with `number_format`. A formula cell carries its source in `formula_source` and its computed result in the same typed arms (a text result stays in the cell text); the legacy `formula` arm is used only when the wire states no result |
 | Sheet column widths | `TableData.columns[].width` (twips), one entry per used column |
@@ -67,7 +67,7 @@ now, and the map copies are gone.
 | Index attribution | `TextItemBase.index_meta`: the source's index service name and title |
 | The property block | `DocumentMeta`: subject, `modified_by`, printed instant and printer, template, editing cycles and duration, `DocumentStatistics`, typed `UserProperty` values |
 | Page styles | `Document.page_styles` (`PageStyle`): name, size, four margins, column count |
-| Named and database ranges | `Document.named_ranges` (`NamedRange`): name, `GridSpan`, header and totals flags, kind |
+| Named and database ranges | `Document.named_ranges` (`NamedRange`): name, `GridSpan`, header and totals flags, kind; a defined name's NamedRangeFlag bits as `filter_criteria`, `print_area`, `repeat_columns`, `repeat_rows`, `hidden`; a database range's `auto_filter` |
 | Pivot tables | `Document.pivots` (`PivotSpec`): name, source and output `GridSpan`, the four axis field lists |
 | Sheet attributes | `GroupItem.sheet` (`SheetMeta`): index, visibility, tab color, print areas as grid spans |
 | Embedded object identity | `Document.attachments` (`SubDocumentRef`): id, name, media type, `class_id`, `kind`, and the item the payload became |

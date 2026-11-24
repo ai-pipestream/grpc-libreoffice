@@ -2593,6 +2593,112 @@ void verify_typed_values_have_typed_homes() {
           "typed: a list stays one list");
 }
 
+// Wire fields the worker extracts reach the Document in typed fields: a
+// tracked change's comment and the change it superseded, a defined name's
+// NamedRangeFlag bits, a database range's auto filter, and a hyperlink's
+// target frame and name.
+void verify_wire_fields_reach_the_document() {
+  grlibre::DoclingMapper mapper;
+  mapper.consume(info_event("text", 1, 15840));
+  {
+    officev1::StreamPagesResponse event;
+    officev1::Paragraph* paragraph = event.mutable_paragraph();
+    paragraph->set_index(0);
+    paragraph->set_page_index(0);
+    add_run(paragraph, "Go ", 0LL);
+    add_run(paragraph, "home", 3LL);
+    officev1::TextRun* link = paragraph->mutable_runs(1);
+    link->set_hyperlink_url("https://example.com/");
+    link->set_hyperlink_target("_blank");
+    link->set_hyperlink_name("Home");
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::TrackedChange* change = event.mutable_tracked_change();
+    change->set_index(0);
+    change->set_kind(officev1::TRACKED_CHANGE_KIND_FORMAT);
+    change->set_kind_name("Format");
+    change->set_author("Bob");
+    change->set_comment("bolded it");
+    change->set_char_start(3);
+    change->set_char_end(7);
+    officev1::TrackedChangeSuccessor* successor = change->mutable_successor();
+    successor->set_kind(officev1::TRACKED_CHANGE_KIND_INSERT);
+    successor->set_kind_name("Insert");
+    successor->set_author("Alice");
+    successor->set_epoch_ms(-86400000);
+    successor->set_comment("added it");
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::SheetNamedRange* range = event.mutable_sheet_named_range();
+    range->set_name("Everything");
+    range->set_content("$Data.$A$1:$B$3");
+    // FILTER_CRITERIA, PRINT_AREA, COLUMN_HEADER, ROW_HEADER, HIDDEN.
+    range->set_type_flags(1 | 2 | 4 | 8 | 16);
+    range->set_sheet_index(-1);
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::SheetNamedRange* range = event.mutable_sheet_named_range();
+    range->set_name("Plain");
+    range->set_content("$Data.$A$1");
+    range->set_type_flags(0);
+    range->set_sheet_index(-1);
+    mapper.consume(event);
+  }
+  {
+    officev1::StreamPagesResponse event;
+    officev1::SheetDatabaseRange* range = event.mutable_sheet_database_range();
+    range->set_name("Orders");
+    range->set_sheet_index(-1);
+    range->set_auto_filter(true);
+    mapper.consume(event);
+  }
+  mapper.consume(status_event(""));
+  const docv1::Document& document = mapper.document();
+
+  const docv1::InlineSpan* link = nullptr;
+  for (const docv1::BaseTextItem& item : document.texts()) {
+    for (const docv1::InlineSpan& span : base_of(item).spans()) {
+      if (span.has_hyperlink()) link = &span;
+    }
+  }
+  require(link != nullptr && link->hyperlink_target_frame() == "_blank"
+              && link->hyperlink_name() == "Home",
+          "wire: a hyperlink keeps its target frame and name");
+
+  require(document.changes_size() == 1, "wire: one change record");
+  const docv1::ChangeRecord& change = document.changes(0);
+  require(change.has_comment() && change.comment() == "bolded it",
+          "wire: a tracked change keeps its comment");
+  require(change.has_successor() && change.successor().kind() == "insert"
+              && change.successor().author() == "Alice"
+              && change.successor().has_timestamp()
+              && change.successor().timestamp().seconds() == -86400
+              && change.successor().comment() == "added it",
+          "wire: a tracked change keeps the change it superseded");
+
+  std::map<std::string, const docv1::NamedRange*> ranges;
+  for (const docv1::NamedRange& range : document.named_ranges()) {
+    ranges[range.name()] = &range;
+  }
+  const docv1::NamedRange* all = ranges["Everything"];
+  require(all != nullptr && all->filter_criteria() && all->print_area()
+              && all->repeat_columns() && all->repeat_rows() && all->hidden(),
+          "wire: a defined name keeps its flag bits");
+  const docv1::NamedRange* plain = ranges["Plain"];
+  require(plain != nullptr && !plain->filter_criteria() && !plain->print_area()
+              && !plain->repeat_columns() && !plain->repeat_rows()
+              && !plain->hidden(),
+          "wire: a name without flags sets none");
+  require(ranges["Orders"] != nullptr && ranges["Orders"]->auto_filter(),
+          "wire: a database range keeps its auto filter");
+}
+
 int main() {
   verify_writer_stream();
   verify_calc_stream();
@@ -2616,6 +2722,7 @@ int main() {
   verify_chart_series_kept();
   verify_embedded_workbook_sheets();
   verify_typed_values_have_typed_homes();
+  verify_wire_fields_reach_the_document();
   std::println("docling_map_test passed");
   return 0;
 }
