@@ -866,6 +866,120 @@ void verify_sheet_chart_and_object_fold_into_one_picture() {
   }
 }
 
+// Each typed bar, pie and scatter annotation holds one series and names it.
+void verify_chart_series_are_named() {
+  const officev1::EmbeddedChartKind kinds[] = {
+      officev1::EMBEDDED_CHART_KIND_BAR, officev1::EMBEDDED_CHART_KIND_PIE,
+      officev1::EMBEDDED_CHART_KIND_SCATTER};
+  for (officev1::EmbeddedChartKind kind : kinds) {
+    const std::string what = officev1::EmbeddedChartKind_Name(kind);
+    grlibre::DoclingMapper mapper;
+    mapper.consume(info_event("text", 1, 15840));
+    officev1::StreamPagesResponse event;
+    officev1::EmbeddedObject* object = event.mutable_embedded_object();
+    object->set_kind(officev1::EMBEDDED_OBJECT_KIND_CHART);
+    object->set_page_index(0);
+    officev1::EmbeddedChart* chart = object->mutable_chart();
+    chart->set_kind(kind);
+    chart->add_categories("Q1");
+    for (const char* label : {"Alpha", ""}) {
+      officev1::EmbeddedChartSeries* series = chart->add_series();
+      series->set_label(label);
+      series->add_values_x(1);
+      series->add_values_y(10);
+    }
+    mapper.consume(event);
+    mapper.consume(status_event(""));
+    std::vector<std::pair<bool, std::string>> names;
+    for (const docv1::PictureAnnotation& annotation :
+         mapper.document().pictures(0).annotations()) {
+      if (annotation.has_bar_chart()) {
+        names.emplace_back(annotation.bar_chart().has_series_name(),
+                           annotation.bar_chart().series_name());
+      } else if (annotation.has_pie_chart()) {
+        names.emplace_back(annotation.pie_chart().has_series_name(),
+                           annotation.pie_chart().series_name());
+      } else if (annotation.has_scatter_chart()) {
+        names.emplace_back(annotation.scatter_chart().has_series_name(),
+                           annotation.scatter_chart().series_name());
+      }
+    }
+    require(names.size() == 2, what + ": one typed annotation per series");
+    require(names[0].first && names[0].second == "Alpha",
+            what + ": a named series names its annotation");
+    require(!names[1].first,
+            what + ": an unnamed series leaves series_name unset");
+  }
+}
+
+// A sheet whose used range starts at M50 folds into a grid of the used
+// range only, with the origin saying where grid cell (0, 0) sits.
+void verify_sheet_grid_starts_at_its_origin() {
+  grlibre::DoclingMapper mapper;
+  mapper.consume(info_event("spreadsheet", 2, 20000));
+  auto sheet_event = [](int index, const std::string& name, int start_row,
+                        int start_col, int end_row, int end_col) {
+    officev1::StreamPagesResponse event;
+    officev1::Sheet* sheet = event.mutable_sheet();
+    sheet->set_index(index);
+    sheet->set_name(name);
+    sheet->set_visible(true);
+    sheet->set_tab_color_rgb(-1);
+    sheet->set_used_start_row(start_row);
+    sheet->set_used_start_column(start_col);
+    sheet->set_used_end_row(end_row);
+    sheet->set_used_end_column(end_col);
+    for (int column = 0; column <= end_col; column++) {
+      sheet->add_column_widths_twips(1000 + column);
+    }
+    return event;
+  };
+  auto row_event = [](int sheet, int row, int column, const std::string& text) {
+    officev1::StreamPagesResponse event;
+    officev1::SheetRow* out = event.mutable_sheet_row();
+    out->set_sheet_index(sheet);
+    out->set_row(row);
+    officev1::SheetCell* cell = out->add_cells();
+    cell->set_column(column);
+    cell->set_type(officev1::SHEET_CELL_TYPE_TEXT);
+    cell->set_display(text);
+    return event;
+  };
+  mapper.consume(sheet_event(0, "Offset", 49, 12, 51, 13));
+  mapper.consume(row_event(0, 49, 12, "first"));
+  mapper.consume(row_event(0, 51, 13, "last"));
+  mapper.consume(sheet_event(1, "Plain", 0, 0, 1, 1));
+  mapper.consume(row_event(1, 0, 0, "a1"));
+  mapper.consume(status_event(""));
+  require_integrity(mapper, "sheet origin");
+  const docv1::Document& document = mapper.document();
+  require(document.tables_size() == 2, "sheet origin: one table per sheet");
+  const docv1::TableData& offset = document.tables(0).data();
+  require(offset.num_rows() == 3 && offset.num_cols() == 2,
+          "sheet origin: the grid covers the used range only, got "
+              + std::to_string(offset.num_rows()) + " by "
+              + std::to_string(offset.num_cols()));
+  require(offset.has_origin() && offset.origin().row() == 49
+              && offset.origin().col() == 12,
+          "sheet origin: the origin is M50");
+  require(offset.table_cells_size() == 2
+              && offset.table_cells(0).start_row_offset_idx() == 0
+              && offset.table_cells(0).start_col_offset_idx() == 0
+              && offset.table_cells(0).text() == "first"
+              && offset.table_cells(1).start_row_offset_idx() == 2
+              && offset.table_cells(1).end_col_offset_idx() == 2,
+          "sheet origin: cells sit at grid positions relative to the origin");
+  require(offset.columns_size() == 2 && offset.columns(0).name() == "M"
+              && offset.columns(0).width() == 1012.0,
+          "sheet origin: the column schema starts at the origin column");
+  require(offset.row_prov_size() == 2 && offset.row_prov(0).grid().row() == 49
+              && offset.row_prov(0).grid().col() == 12,
+          "sheet origin: row provenance keeps sheet coordinates");
+  const docv1::TableData& plain = document.tables(1).data();
+  require(!plain.has_origin() && plain.num_rows() == 2,
+          "sheet origin: a sheet starting at A1 has no origin");
+}
+
 void verify_impress_stream() {
   grlibre::DoclingMapper mapper;
   mapper.consume(info_event("presentation", 1, 21600));
@@ -2808,6 +2922,8 @@ int main() {
   verify_typed_values_have_typed_homes();
   verify_wire_fields_reach_the_document();
   verify_sheet_chart_and_object_fold_into_one_picture();
+  verify_chart_series_are_named();
+  verify_sheet_grid_starts_at_its_origin();
   std::println("docling_map_test passed");
   return 0;
 }

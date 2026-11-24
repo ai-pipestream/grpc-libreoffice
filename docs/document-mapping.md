@@ -79,6 +79,8 @@ now, and the map copies are gone.
 | An image, object, frame or shape anchored in a page header or footer (`in_header_footer`) | the furniture layer under `#/furniture` |
 | A paragraph that restarts page numbering (`Paragraph.page_number_offset`) | `PageItem.page_label` on the restart page and every page after it, until the next restart |
 | A chart's data sources | `PictureItem.chart` (`ChartMeta`): source `GridSpan`s and the two header flags. On a spreadsheet the sheet chart and its draw-page object (joined by `EmbeddedObject.persist_name`, the storage name the sheet's chart list uses) fold into one chart picture under the sheet, carrying both `ChartMeta` and the typed chart annotations |
+| A chart series' name | `series_name` on each typed `PictureBarChartData`, `PicturePieChartData` and `PictureScatterChartData` (one annotation per series, in series order; unset for an unnamed series) and `ChartLine.label`; the same names head the tabular projection's columns (scatter and bubble columns read "<name> (x)", "<name> (y)", "<name> (size)"), whose value cells carry their exact number in `CellValue.number`. Bubble sizes ride `ChartPoint.size` |
+| A sheet's used range | the sheet table's grid covers the used range only; `TableData.origin` is the sheet coordinate of grid cell (0, 0), unset when the range starts at A1. Row provenance keeps sheet coordinates |
 | A name defined as a formula | `NamedRange.expression`, with `range` unset |
 | Render and fold warnings (font substitution, unresolved names, anything read with a loss) | `Document.warnings` (`CollectorWarning`, collector `libreoffice`, model `lok`), as well as `ToDocumentResponse.status` |
 | Form fields | the schema's own form subtree, below |
@@ -196,19 +198,8 @@ Extraction side:
 
 Fold side:
 
-- **Chart series names on the typed annotations.** Bar, column, pie and
-  scatter charts get one typed annotation per series, in series order,
-  because the dialect's bar, pie and scatter data hold one series each;
-  the series name has no slot there and heads the matching column of the
-  tabular projection instead (scatter and bubble columns read
-  "<name> (x)", "<name> (y)", "<name> (size)"). Bubble sizes ride
-  `ChartPoint.size`, and every tabular value cell carries its exact
-  number in `CellValue.number` beside its text.
 - **List markers and nesting depth.** `ListItem.marker`, `.enumerated`, and
   the nesting level are unset, so nested lists flatten.
-- **A sheet's used-range origin.** Only the end bounds become `num_rows` and
-  `num_cols`, so a sheet whose data starts at M50 reports a mostly empty
-  50 by 13 table.
 
 ## Cell names that anchor nowhere
 

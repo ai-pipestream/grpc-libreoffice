@@ -342,6 +342,9 @@ class DoclingMapper {
   std::map<int, std::string> sheet_comments_;
   std::map<int, std::string> sheet_name_;
   std::map<int, ai::pipestream::document::v1::ContentLayer> sheet_layer_;
+  // Each sheet's used-range origin (first row, first column): its table's
+  // grid cell (0, 0).
+  std::map<int, std::pair<int, int>> sheet_origin_;
   // Calc reports a chart on a sheet twice: as a draw-page OLE object with
   // its typed data and as a sheet chart with its source ranges. Both fold
   // into one picture, found here by (sheet ordinal, the object's storage

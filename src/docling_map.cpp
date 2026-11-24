@@ -1804,8 +1804,9 @@ void DoclingMapper::on_embedded_object(const officev1::EmbeddedObject& object) {
   const auto& series = chart.series();
   switch (chart.kind()) {
     // The bar, pie and scatter dialects hold one series each, so a chart
-    // with several gets one annotation per series, in series order; the
-    // series names head the tabular projection's columns in that order.
+    // with several gets one annotation per series, in series order, each
+    // naming its series in series_name; the same names head the tabular
+    // projection's columns in that order.
     case officev1::EMBEDDED_CHART_KIND_BAR:
     case officev1::EMBEDDED_CHART_KIND_COLUMN: {
       for (const officev1::EmbeddedChartSeries& one : series) {
@@ -1815,6 +1816,7 @@ void DoclingMapper::on_embedded_object(const officev1::EmbeddedObject& object) {
         bars->set_title(chart.title());
         bars->set_x_axis_label(chart.x_axis_title());
         bars->set_y_axis_label(chart.y_axis_title());
+        if (!one.label().empty()) bars->set_series_name(one.label());
         for (int i = 0; i < one.values_y_size(); i++) {
           docv1::ChartBar* bar = bars->add_bars();
           bar->set_label(i < chart.categories_size() ? chart.categories(i)
@@ -1850,6 +1852,7 @@ void DoclingMapper::on_embedded_object(const officev1::EmbeddedObject& object) {
             picture->add_annotations()->mutable_pie_chart();
         pie->set_kind("pie_chart_data");
         pie->set_title(chart.title());
+        if (!one.label().empty()) pie->set_series_name(one.label());
         for (int i = 0; i < one.values_y_size(); i++) {
           docv1::ChartSlice* slice = pie->add_slices();
           slice->set_label(i < chart.categories_size() ? chart.categories(i)
@@ -1868,6 +1871,7 @@ void DoclingMapper::on_embedded_object(const officev1::EmbeddedObject& object) {
         scatter->set_title(chart.title());
         scatter->set_x_axis_label(chart.x_axis_title());
         scatter->set_y_axis_label(chart.y_axis_title());
+        if (!one.label().empty()) scatter->set_series_name(one.label());
         int points = std::min(one.values_x_size(), one.values_y_size());
         for (int i = 0; i < points; i++) {
           docv1::ChartPoint* point = scatter->add_points();
@@ -1941,16 +1945,27 @@ void DoclingMapper::on_sheet(const officev1::Sheet& sheet) {
   sheet_group_[sheet.index()] = group->self_ref();
   sheet_name_[sheet.index()] = sheet.name();
 
-  // The sheet's cell grid folds into one TableItem in absolute row and
-  // column offsets, so cell addresses survive the mapping.
+  // The sheet's cell grid folds into one TableItem covering the used range
+  // only. Grid cell (0, 0) is the range's first cell; when that is not A1
+  // the table's origin says where it sits, so every cell address survives
+  // the mapping as grid position plus origin.
   sheet_table_[sheet.index()] = document_.tables_size();
+  const int start_row = std::max(0, sheet.used_start_row());
+  const int start_col = std::max(0, sheet.used_start_column());
+  sheet_origin_[sheet.index()] = {start_row, start_col};
   docv1::TableItem* table = add_table(layer, group->self_ref(), nullptr);
   docv1::TableData* data = table->mutable_data();
-  data->set_num_rows(sheet.used_end_row() + 1);
-  data->set_num_cols(sheet.used_end_column() + 1);
+  data->set_num_rows(std::max(0, sheet.used_end_row() - start_row + 1));
+  data->set_num_cols(std::max(0, sheet.used_end_column() - start_col + 1));
+  if (start_row > 0 || start_col > 0) {
+    docv1::GridCell* origin = data->mutable_origin();
+    origin->set_row(start_row);
+    origin->set_col(start_col);
+  }
   // The sheet's columns are its schema: each one names its spreadsheet
   // column and carries the declared width in the page unit.
-  for (int column = 0; column < sheet.column_widths_twips_size(); column++) {
+  for (int column = start_col; column < sheet.column_widths_twips_size();
+       column++) {
     docv1::TableColumnSchema* schema = data->add_columns();
     schema->set_name(column_name(column));
     schema->set_width(
@@ -1980,12 +1995,17 @@ void DoclingMapper::on_sheet_row(const officev1::SheetRow& row) {
       grid->set_sheet(name->second);
     }
   }
+  // Cells sit at grid positions relative to the sheet's origin; the row
+  // provenance above keeps the sheet's own coordinates.
+  const auto [origin_row, origin_col] = sheet_origin_[row.sheet_index()];
+  const int grid_row = row.row() - origin_row;
   for (const officev1::SheetCell& cell : row.cells()) {
+    const int grid_col = cell.column() - origin_col;
     docv1::TableCell* out = data->add_table_cells();
-    out->set_start_row_offset_idx(row.row());
-    out->set_end_row_offset_idx(row.row() + std::max(1, cell.merged_rows()));
-    out->set_start_col_offset_idx(cell.column());
-    out->set_end_col_offset_idx(cell.column()
+    out->set_start_row_offset_idx(grid_row);
+    out->set_end_row_offset_idx(grid_row + std::max(1, cell.merged_rows()));
+    out->set_start_col_offset_idx(grid_col);
+    out->set_end_col_offset_idx(grid_col
                                 + std::max(1, cell.merged_columns()));
     out->set_row_span(std::max(1, cell.merged_rows()));
     out->set_col_span(std::max(1, cell.merged_columns()));
