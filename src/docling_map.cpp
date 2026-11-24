@@ -155,6 +155,8 @@ struct RunKey {
   int escapement = 0;
   std::string language;
   std::string hyperlink;
+  std::string hyperlink_target;
+  std::string hyperlink_name;
   std::string field_code;
   std::string field_target;
 
@@ -178,6 +180,8 @@ RunKey run_key(const officev1::TextRun& run) {
   key.escapement = run.escapement();
   key.language = run.language();
   key.hyperlink = run.hyperlink_url();
+  key.hyperlink_target = run.hyperlink_target();
+  key.hyperlink_name = run.hyperlink_name();
   key.field_code = run.field_code();
   key.field_target = run.field_target();
   return key;
@@ -612,7 +616,15 @@ void DoclingMapper::add_run_spans(
     if (key.size_pt > 0) span->set_font_size_pt(key.size_pt);
     if (!color.empty()) span->set_color(color);
     if (language_differs) span->set_language(key.language);
-    if (!key.hyperlink.empty()) span->set_hyperlink(key.hyperlink);
+    if (!key.hyperlink.empty()) {
+      span->set_hyperlink(key.hyperlink);
+      if (!key.hyperlink_target.empty()) {
+        span->set_hyperlink_target_frame(key.hyperlink_target);
+      }
+      if (!key.hyperlink_name.empty()) {
+        span->set_hyperlink_name(key.hyperlink_name);
+      }
+    }
     if (!key.field_code.empty()) span->set_field_code(key.field_code);
     if (!key.field_target.empty() && !owner_ref.empty()) {
       // The anchor the reference names may not have streamed yet, so the
@@ -1997,6 +2009,18 @@ void DoclingMapper::on_sheet_named_range(
   docv1::NamedRange* out = document_.add_named_ranges();
   out->set_name(range.name());
   out->set_kind("named");
+  // The office core's NamedRangeFlag bits (com.sun.star.sheet).
+  constexpr int32_t kFilterCriteria = 1;
+  constexpr int32_t kPrintArea = 2;
+  constexpr int32_t kColumnHeader = 4;
+  constexpr int32_t kRowHeader = 8;
+  constexpr int32_t kHidden = 16;
+  const int32_t flags = range.type_flags();
+  out->set_filter_criteria((flags & kFilterCriteria) != 0);
+  out->set_print_area((flags & kPrintArea) != 0);
+  out->set_repeat_columns((flags & kColumnHeader) != 0);
+  out->set_repeat_rows((flags & kRowHeader) != 0);
+  out->set_hidden((flags & kHidden) != 0);
   // A name pointing at cells resolves to a span; a name holding an
   // expression has no rectangle and keeps only its name. Workbook-scoped
   // names arrive before any sheet header, so the sheet is named later.
@@ -2023,6 +2047,7 @@ void DoclingMapper::on_sheet_database_range(
   }
   out->set_has_headers(range.contains_header());
   out->set_has_totals(range.totals_row());
+  out->set_auto_filter(range.auto_filter());
 }
 
 void DoclingMapper::on_sheet_cell_comment(
@@ -2199,6 +2224,22 @@ void DoclingMapper::on_tracked_change(const officev1::TrackedChange& change) {
   }
   if (!change.changed_text().empty()) {
     record->set_content(change.changed_text());
+  }
+  if (!change.comment().empty()) record->set_comment(change.comment());
+  if (change.has_successor()) {
+    // The change this one was stacked on (an attribute change over an
+    // insertion): its own kind, author, time and comment.
+    const officev1::TrackedChangeSuccessor& successor = change.successor();
+    docv1::ChangeRecord* out = record->mutable_successor();
+    std::string successor_kind = successor.kind_name();
+    std::ranges::transform(successor_kind, successor_kind.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+    out->set_kind(successor_kind);
+    out->set_author(successor.author());
+    if (successor.has_epoch_ms()) {
+      set_instant(successor.epoch_ms(), out->mutable_timestamp());
+    }
+    if (!successor.comment().empty()) out->set_comment(successor.comment());
   }
   pending_changes_.push_back({index, change.char_start(), change.char_end()});
 }
